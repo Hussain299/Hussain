@@ -121,11 +121,18 @@ class DatabaseService {
           parsed.synthesizedStrategies = this.generateSeedSynthesizedGenes();
         }
         if (Array.isArray(parsed.signals)) {
-          // Keep persistent trade history while filtering out removed pairs or test artifacts
+          // Strictly keep only signals generated within the last 24 hours (erasing older win/losses daily)
+          const nowMs = Date.now();
+          const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
           parsed.signals = parsed.signals.filter((s: any) => {
             if (s.symbol === 'USD/CHF' || s.symbol === 'NZD/USD') return false;
             if (typeof s.candleOpenTimeIst === 'string' && s.candleOpenTimeIst.includes('19:35:00 IST')) return false;
             if (s.ruleFamily?.startsWith('test_')) return false;
+            const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
+            if (nowMs - timeMs > TWENTY_FOUR_HOURS_MS) return false;
+            if (['WAITING_FOR_ENTRY', 'ACTIVE', 'ENTRY_TRIGGERED', 'EXIT_PENDING'].includes(s.lifecycleState)) {
+              if (nowMs - timeMs > 60 * 60 * 1000) return false;
+            }
             return true;
           });
           // Backfill forensic autopsy on historical losses if missing
@@ -442,16 +449,64 @@ class DatabaseService {
     }
   }
 
+  /**
+   * Automatic 24-Hour Rollover & Signal Purge:
+   * 1. Erases completed/closed/expired/invalidated trades older than 24 hours
+   *    so daily win/loss statistics and history automatically reset every 24 hours.
+   * 2. Erases any zombie active/waiting signals whose creation exceeds 1 hour.
+   */
+  public purgeSignalsOlderThan24Hours(): { purgedCount: number } {
+    const nowMs = Date.now();
+    const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+    const initial = this.state.signals.length;
+
+    this.state.signals = this.state.signals.filter(s => {
+      // Never purge unit-test fixture signals here (purged separately)
+      if (s.ruleFamily?.startsWith('test_')) return true;
+
+      const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
+      const ageMs = nowMs - timeMs;
+
+      // 1. Automatically erase all trades older than 24 hours
+      if (ageMs > TWENTY_FOUR_HOURS_MS) {
+        return false;
+      }
+
+      // 2. Automatically expire/erase zombie active trades older than 1 hour
+      if (['WAITING_FOR_ENTRY', 'ACTIVE', 'ENTRY_TRIGGERED', 'EXIT_PENDING'].includes(s.lifecycleState)) {
+        if (ageMs > ONE_HOUR_MS) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+
+    if (this.state.signals.length !== initial) {
+      this.scheduleSave();
+    }
+
+    return { purgedCount: initial - this.state.signals.length };
+  }
+
   public getSignals(includeTest: boolean = false): ResearchSignal[] {
+    this.purgeSignalsOlderThan24Hours();
     if (includeTest) return this.state.signals;
     return this.state.signals.filter(s => !s.ruleFamily?.startsWith('test_'));
   }
 
   public getActiveSignals(includeTest: boolean = false): ResearchSignal[] {
     const list = this.getSignals(includeTest);
-    return list.filter(s =>
-      ['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE', 'EXIT_PENDING'].includes(s.lifecycleState)
-    );
+    const nowMs = Date.now();
+    return list.filter(s => {
+      if (!['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE', 'EXIT_PENDING'].includes(s.lifecycleState)) {
+        return false;
+      }
+      // Never consider a trade active if it was created more than 1 hour ago
+      const ageMs = s.predictionTimeUtc ? nowMs - Date.parse(s.predictionTimeUtc) : Infinity;
+      return ageMs <= 60 * 60 * 1000;
+    });
   }
 
   public purgeTestSignals() {
@@ -559,9 +614,13 @@ class DatabaseService {
    */
   public getSessionAccuracyBreakdown(): MarketSessionInfo[] {
     const currentSession = getSessionFromTimestamp(new Date());
-    const closedSignals = this.getSignals().filter(
-      s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-    );
+    const nowMs = Date.now();
+    const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+    const closedSignals = this.getSignals().filter(s => {
+      if (s.lifecycleState !== 'CLOSED' || !['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)) return false;
+      const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
+      return nowMs - timeMs <= TWENTY_FOUR_HOURS_MS;
+    });
 
     const sessions: Array<{
       id: MarketSessionId;

@@ -529,25 +529,25 @@ export class EntryExitEngine {
         ? Date.parse(signal.candleOpenTimeUtc)
         : Date.parse(signal.predictionTimeUtc);
 
-      if (exitTimeMs > 0 && nowMs - exitTimeMs > 60 * 60 * 1000) {
+      if (exitTimeMs > 0 && nowMs - exitTimeMs > 15 * 60 * 1000) {
         signal.lifecycleState = 'EXPIRED';
         signal.outcomeResult = 'CANCELLED';
         signal.lifecycleHistory.push({
           timestamp: new Date().toISOString(),
           fromState: signal.lifecycleState,
           toState: 'EXPIRED',
-          reason: `Market closed or session ended before exit candle could be captured in real time (${signal.plannedExitTimeUtc}). Safely expired.`,
+          reason: `Signal passed planned expiry window without candle settlement (${signal.plannedExitTimeUtc}). Safely expired.`,
         });
         db.updateSignal(signal);
         updated.push(signal);
-      } else if (signal.lifecycleState === 'WAITING_FOR_ENTRY' && nowMs - entryTimeMs > 60 * 60 * 1000) {
+      } else if (signal.lifecycleState === 'WAITING_FOR_ENTRY' && nowMs - entryTimeMs > 10 * 60 * 1000) {
         signal.lifecycleState = 'EXPIRED';
         signal.outcomeResult = 'CANCELLED';
         signal.lifecycleHistory.push({
           timestamp: new Date().toISOString(),
           fromState: 'WAITING_FOR_ENTRY',
           toState: 'EXPIRED',
-          reason: `Entry window expired without execution during market closure.`,
+          reason: `5M candle open entry window elapsed without fill. Safely expired.`,
         });
         db.updateSignal(signal);
         updated.push(signal);

@@ -135,6 +135,11 @@ export class AutonomousScheduler {
         };
       }
 
+      // Continuous 24-Hour Signal History Purge & Stale Active Sweep:
+      // Automatically erases completed/closed trades older than 24 hours so daily stats reset cleanly.
+      db.purgeSignalsOlderThan24Hours();
+      entryExitEngine.sweepStaleActiveSignals();
+
       const candlesMap: Record<ForexSymbol, Candle[]> = {} as any;
       let totalCandlesFetched = 0;
 

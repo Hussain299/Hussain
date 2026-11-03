@@ -291,11 +291,25 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
     dayOfWeek === 6 ||
     (dayOfWeek === 0 && currentUtcHour < 21);
 
-  // Overall Accuracy & Metrics
-  const historySignals = signals.filter(s =>
+  // Strict 24-Hour Rolling Filter:
+  // Trades older than 24 hours are automatically erased from daily accuracy and active history
+  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+  const recent24hSignals = signals.filter(s => {
+    const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
+    const ageMs = nowMs - timeMs;
+    if (ageMs > TWENTY_FOUR_HOURS_MS) return false;
+    // Don't show zombie active trades older than 1 hour as active
+    if (['WAITING_FOR_ENTRY', 'ACTIVE', 'ENTRY_TRIGGERED', 'EXIT_PENDING'].includes(s.lifecycleState)) {
+      if (ageMs > 60 * 60 * 1000) return false;
+    }
+    return true;
+  });
+
+  // Overall Accuracy & Metrics strictly computed for Today (Rolling 24 Hours)
+  const historySignals = recent24hSignals.filter(s =>
     ['CLOSED', 'EXPIRED', 'INVALIDATED'].includes(s.lifecycleState)
   );
-  const completedSignals = signals.filter(
+  const completedSignals = recent24hSignals.filter(
     s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
   );
   const closedSignals = completedSignals.filter(s => ['WIN', 'LOSS'].includes(s.outcomeResult));
@@ -304,16 +318,16 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
   const calculatedWinRate =
     closedSignals.length > 0
       ? ((totalWins / closedSignals.length) * 100).toFixed(1)
-      : 'No scored forward outcomes';
+      : 'No scored outcomes today';
   const totalNetPips = Number(
     completedSignals.reduce((acc, s) => acc + (s.netReturnPips || 0), 0).toFixed(1)
   );
 
-  const activeSignals = signals.filter(s =>
+  const activeSignals = recent24hSignals.filter(s =>
     ['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE', 'EXIT_PENDING'].includes(s.lifecycleState)
   );
 
-  const filteredSignals = signals.filter(s => {
+  const filteredSignals = recent24hSignals.filter(s => {
     if (filterState === 'ACTIVE') {
       return ['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE', 'EXIT_PENDING'].includes(
         s.lifecycleState
@@ -410,10 +424,10 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
           <div className="px-2.5 py-1 rounded-lg bg-emerald-950/80 border border-emerald-800/80 flex items-center gap-2">
             <Target className="w-3.5 h-3.5 text-emerald-400" />
             <span className="text-xs font-bold text-emerald-300 font-mono">
-              {closedSignals.length ? `${calculatedWinRate}% Forward signal win rate` : 'No completed forward outcomes'}
+              {closedSignals.length ? `${calculatedWinRate}% Today's 24H Win Rate` : 'No completed trades in last 24h'}
             </span>
             <span className="text-[10px] text-neutral-400 font-mono hidden sm:inline">
-              ({totalWins}W / {totalLosses}L · n={closedSignals.length})
+              ({totalWins}W / {totalLosses}L · Auto-resets daily)
             </span>
           </div>
 
@@ -506,7 +520,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 : 'text-neutral-400 hover:text-white'
             }`}
           >
-            <span>All ({signals.length})</span>
+            <span>All 24H ({recent24hSignals.length})</span>
           </button>
 
           <button
@@ -516,8 +530,9 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 ? 'bg-neutral-800 text-white font-bold'
                 : 'text-neutral-400 hover:text-white'
             }`}
+            title="Today's completed trade outcomes (erased automatically every 24 hours)"
           >
-            <span>History ({historySignals.length})</span>
+            <span>Today's History ({historySignals.length})</span>
           </button>
         </div>
 
@@ -528,10 +543,10 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
               onClick={() => setShowClearConfirm(true)}
               disabled={isClearingHistory}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 border border-rose-800/60 text-xs text-rose-300 font-medium transition-colors disabled:opacity-50"
-              title="Clear completed trade history"
+              title="Clear today's completed trade history (also auto-erases every 24 hours)"
             >
               <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-              <span>{isClearingHistory ? 'Clearing...' : 'Clear History'}</span>
+              <span>{isClearingHistory ? 'Clearing...' : 'Clear 24H History'}</span>
             </button>
           )}
 
