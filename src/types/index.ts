@@ -153,6 +153,12 @@ export interface ResearchSignal {
   actualExitTimeUtc: string | null;
   actualExitPrice: number | null;
   
+  // Prediction-time online-learning context (frozen before any outcome is known).
+  marketFeatureVector?: number[];
+  onlineLearnerPrediction?: number;
+  onlineLearnerSampleSize?: number;
+  onlineLearnerVersion?: string;
+
   // Confidence & Verification
   confidence: number; // 0.0 - 1.0
   calibrationStatus: 'CALIBRATED' | 'UNCALIBRATED' | 'OVERCONFIDENT';
