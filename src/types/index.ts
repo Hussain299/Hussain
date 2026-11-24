@@ -3,49 +3,72 @@
  * Complete schemas for forex feeds, causal execution, ML research, and D1 export.
  */
 
+/**
+ * Olymp Trade observation ranking, 10:30–22:30 IST, minimum payout 80%.
+ * Order reflects the six-day historical audit supplied on 2026-11-24.
+ * It is a starting universe, not a claim of permanent/live availability.
+ */
 export type ForexSymbol =
-  | 'EUR/USD'
-  | 'GBP/USD'
-  | 'USD/JPY'
-  | 'EUR/JPY'
-  | 'AUD/USD'
-  | 'USD/CAD'
-  | 'EUR/GBP'
-  | 'AUD/CAD'
-  | 'AUD/CHF'
+  | 'USD/MXN'
   | 'AUD/JPY'
-  | 'AUD/NZD'
+  | 'AUD/USD'
   | 'EUR/AUD'
-  | 'EUR/CAD'
-  | 'EUR/CHF'
+  | 'EUR/JPY'
   | 'EUR/NZD'
-  | 'GBP/AUD'
+  | 'EUR/USD'
   | 'GBP/CAD'
-  | 'GBP/CHF'
   | 'GBP/JPY'
-  | 'GBP/NZD';
+  | 'GBP/NZD'
+  | 'NZD/CAD'
+  | 'USD/CAD'
+  | 'USD/CHF'
+  | 'EUR/CAD'
+  | 'NZD/JPY'
+  | 'CHF/JPY'
+  | 'NZD/USD'
+  | 'AUD/CHF'
+  | 'AUD/NZD'
+  | 'EUR/GBP'
+  | 'GBP/USD'
+  | 'EUR/CHF'
+  | 'NZD/CHF'
+  | 'AUD/CAD'
+  | 'USD/JPY'
+  | 'GBP/AUD'
+  | 'GBP/CHF'
+  | 'CAD/JPY'
+  | 'CAD/CHF';
 
 export const FOREX_PAIRS: ForexSymbol[] = [
-  'EUR/USD',
-  'GBP/USD',
-  'USD/JPY',
-  'EUR/JPY',
-  'AUD/USD',
-  'USD/CAD',
-  'EUR/GBP',
-  'AUD/CAD',
-  'AUD/CHF',
+  'USD/MXN',
   'AUD/JPY',
-  'AUD/NZD',
+  'AUD/USD',
   'EUR/AUD',
-  'EUR/CAD',
-  'EUR/CHF',
+  'EUR/JPY',
   'EUR/NZD',
-  'GBP/AUD',
+  'EUR/USD',
   'GBP/CAD',
-  'GBP/CHF',
   'GBP/JPY',
   'GBP/NZD',
+  'NZD/CAD',
+  'USD/CAD',
+  'USD/CHF',
+  'EUR/CAD',
+  'NZD/JPY',
+  'CHF/JPY',
+  'NZD/USD',
+  'AUD/CHF',
+  'AUD/NZD',
+  'EUR/GBP',
+  'GBP/USD',
+  'EUR/CHF',
+  'NZD/CHF',
+  'AUD/CAD',
+  'USD/JPY',
+  'GBP/AUD',
+  'GBP/CHF',
+  'CAD/JPY',
+  'CAD/CHF',
 ];
 
 export type MarketSessionId = 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEW_YORK' | 'WEEKEND_CLOSED';

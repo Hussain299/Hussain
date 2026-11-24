@@ -38,6 +38,18 @@ export class DataFeedEngine {
     'GBP/CHF': 1.1340,
     'GBP/JPY': 198.20,
     'GBP/NZD': 2.1460,
+    // Seed prices for the nine pairs added from the Olymp Trade availability audit.
+    // These values are used only by the synthetic continuity generator; synthetic
+    // candles are filtered out before live signal generation and settlement.
+    'USD/MXN': 18.15,
+    'USD/CHF': 0.8000,
+    'NZD/CAD': 0.7910,
+    'NZD/JPY': 86.88,
+    'CHF/JPY': 190.53,
+    'NZD/USD': 0.5700,
+    'NZD/CHF': 0.4560,
+    'CAD/JPY': 109.70,
+    'CAD/CHF': 0.5760,
   };
 
   /**

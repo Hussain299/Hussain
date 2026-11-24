@@ -4,7 +4,7 @@
  * Research Trinity Audits, and System State.
  */
 
-import { Candle, ForexSymbol, ResearchSignal, VerificationTestResult } from '../types/index.js';
+import { Candle, ForexSymbol, FOREX_PAIRS, ResearchSignal, VerificationTestResult } from '../types/index.js';
 import { dataFeedEngine } from './dataFeeds.js';
 import { db } from './db.js';
 import { entryExitEngine } from './entryExitEngine.js';
@@ -17,6 +17,8 @@ import {
   learnOnlineOutcome,
   predictOnlineOutcome,
   replayOnlineLearnerHistory,
+  normalizeOnlineLearnerState,
+  ONLINE_LEARNER_FEATURE_DIMENSIONS,
 } from './onlineLearning.js';
 
 const makeM1TestCandles = (symbol: ForexSymbol, count: number): Candle[] =>
@@ -63,6 +65,56 @@ export async function runAllVerificationTests(): Promise<{
       });
     }
   };
+
+  await runTest('DATA', 'Olymp Trade-ranked universe contains 29 qualifying pairs and excludes low-payout candidates', () => {
+    const requiredPairs = [
+      'USD/MXN', 'AUD/JPY', 'AUD/USD', 'EUR/AUD', 'EUR/JPY', 'EUR/NZD',
+      'EUR/USD', 'GBP/CAD', 'GBP/JPY', 'GBP/NZD', 'NZD/CAD', 'USD/CAD',
+      'USD/CHF', 'EUR/CAD', 'NZD/JPY', 'CHF/JPY', 'NZD/USD', 'AUD/CHF',
+      'AUD/NZD', 'EUR/GBP', 'GBP/USD', 'EUR/CHF', 'NZD/CHF', 'AUD/CAD',
+      'USD/JPY', 'GBP/AUD', 'GBP/CHF', 'CAD/JPY', 'CAD/CHF',
+    ];
+    if (FOREX_PAIRS.length !== 29 ||
+        new Set(FOREX_PAIRS).size !== 29 ||
+        requiredPairs.some(pair => !FOREX_PAIRS.includes(pair as ForexSymbol)) ||
+        FOREX_PAIRS.includes('USD/NOK' as ForexSymbol) ||
+        FOREX_PAIRS.includes('USD/SGD' as ForexSymbol)) {
+      throw new Error('The scanner pair universe does not match the 29 qualifying audit pairs.');
+    }
+  });
+
+  await runTest('ML', 'Legacy 20-pair shadow learner weights migrate into the 29-pair layout', () => {
+    const oldZ = Array(47).fill(0);
+    const oldN = Array(47).fill(0);
+    oldZ[0] = 0.11;       // intercept
+    oldZ[1] = 0.12;       // first market feature
+    oldZ[20] = 0.20;      // legacy EUR/USD pair flag
+    oldZ[40] = 0.40;      // direction flag
+    oldZ[41] = 0.41;      // first strategy family flag
+    oldN[20] = 4;
+    oldN[40] = 5;
+    const migrated = normalizeOnlineLearnerState({
+      ...createInitialOnlineLearnerState(),
+      z: oldZ,
+      n: oldN,
+      sampleCount: 12,
+      wins: 8,
+      losses: 4,
+    });
+    const eurUsdIndex = 20 + 6; // EUR/USD's position in the new ranked 29-pair one-hot block.
+    const directionIndex = 20 + 29;
+    const strategyIndex = directionIndex + 1;
+    if (ONLINE_LEARNER_FEATURE_DIMENSIONS !== 56 ||
+        migrated.z.length !== 56 || migrated.n.length !== 56 ||
+        migrated.z[0] !== 0.11 || migrated.z[1] !== 0.12 ||
+        migrated.z[eurUsdIndex] !== 0.20 || migrated.n[eurUsdIndex] !== 4 ||
+        migrated.z[directionIndex] !== 0.40 || migrated.n[directionIndex] !== 5 ||
+        migrated.z[strategyIndex] !== 0.41 ||
+        migrated.z[20] !== 0 ||
+        migrated.sampleCount !== 12 || migrated.wins !== 8 || migrated.losses !== 4) {
+      throw new Error('Existing learner weights/statistics were not preserved during pair-universe migration.');
+    }
+  });
 
   await runTest('ML', 'FTRL learner starts neutral, updates only from verified WIN/LOSS and stays shadow-only', () => {
     const context = {

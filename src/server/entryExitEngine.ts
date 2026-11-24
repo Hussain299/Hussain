@@ -71,6 +71,16 @@ export class EntryExitEngine {
     'GBP/CHF': 2.1,
     'GBP/JPY': 2.0,
     'GBP/NZD': 2.4,
+    // Conservative indicative spread estimates for newly added pairs.
+    'USD/MXN': 35.0,
+    'USD/CHF': 1.5,
+    'NZD/CAD': 2.0,
+    'NZD/JPY': 2.2,
+    'CHF/JPY': 2.2,
+    'NZD/USD': 1.5,
+    'NZD/CHF': 2.0,
+    'CAD/JPY': 2.1,
+    'CAD/CHF': 2.0,
   };
 
   /**
