@@ -328,7 +328,7 @@ export class AutonomousScheduler {
       const candlesMap: Record<ForexSymbol, Candle[]> = {} as any;
       let totalCandlesFetched = 0;
 
-      // 1. Autonomous Market Sensing across all 20 forex pairs in bounded concurrency batches of 5
+      // 1. Autonomous Market Sensing across all configured ranked forex pairs in bounded concurrency batches of 5
       // Prevents socket/memory/CPU spikes while still fetching all fresh real candles BEFORE sweeping or evaluating trades.
       const FETCH_BATCH_SIZE = 5;
       for (let i = 0; i < FOREX_PAIRS.length; i += FETCH_BATCH_SIZE) {
