@@ -113,6 +113,13 @@ export function getDefaultManualControls(): ManualControlsState {
   };
 }
 
+const LEGACY_DEFAULT_PAIRS: ForexSymbol[] = [
+  'EUR/USD', 'GBP/USD', 'USD/JPY', 'EUR/JPY', 'AUD/USD', 'USD/CAD',
+  'EUR/GBP', 'AUD/CAD', 'AUD/CHF', 'AUD/JPY', 'AUD/NZD', 'EUR/AUD',
+  'EUR/CAD', 'EUR/CHF', 'EUR/NZD', 'GBP/AUD', 'GBP/CAD', 'GBP/CHF',
+  'GBP/JPY', 'GBP/NZD',
+];
+
 export function loadManualControls(): ManualControlsState {
   if (typeof window === 'undefined') return getDefaultManualControls();
   try {
@@ -121,14 +128,25 @@ export function loadManualControls(): ManualControlsState {
     const parsed = JSON.parse(raw);
     const defaults = getDefaultManualControls();
     const botConfig = parsed.bot || parsed.bots?.bot_1 || defaults.bot;
+    const storedPairs = Array.isArray(botConfig.allowedPairs)
+      ? botConfig.allowedPairs.filter((pair: unknown): pair is ForexSymbol =>
+          typeof pair === 'string' && FOREX_PAIRS.includes(pair as ForexSymbol))
+      : [...FOREX_PAIRS];
+    const isLegacyDefaultUniverse =
+      storedPairs.length === LEGACY_DEFAULT_PAIRS.length &&
+      LEGACY_DEFAULT_PAIRS.every(pair => storedPairs.includes(pair));
+    // Migrate the untouched old 20-pair default to the new Olymp Trade-ranked universe.
+    // Preserve intentional user-created subsets, filtering out unsupported symbols.
+    const allowedPairs = isLegacyDefaultUniverse ? [...FOREX_PAIRS] : storedPairs;
+    const migratedBotConfig = { ...defaults.bot, ...botConfig, allowedPairs };
     return {
       ...defaults,
       ...parsed,
-      bot: { ...defaults.bot, ...botConfig },
+      bot: migratedBotConfig,
       bots: {
-        bot_1: { ...defaults.bot, ...botConfig },
-        bot_2: { ...defaults.bot, ...botConfig },
-        bot_3: { ...defaults.bot, ...botConfig },
+        bot_1: { ...migratedBotConfig },
+        bot_2: { ...migratedBotConfig },
+        bot_3: { ...migratedBotConfig },
       },
     };
   } catch (err) {
