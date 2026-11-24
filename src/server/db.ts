@@ -207,7 +207,6 @@ class DatabaseService {
           const uniqueMap = new Map<string, any>();
           parsed.signals.forEach((s: any) => {
             if (!s || !s.id) return;
-            if (s.symbol === 'USD/CHF' || s.symbol === 'NZD/USD') return;
             if (typeof s.candleOpenTimeIst === 'string' && s.candleOpenTimeIst.includes('19:35:00 IST')) return;
             if (s.ruleFamily?.startsWith('test_')) return;
             const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
@@ -337,10 +336,6 @@ class DatabaseService {
           if (parsed.signals.length > 1000) {
             parsed.signals = parsed.signals.slice(0, 1000);
           }
-        }
-        if (parsed.candles) {
-          delete parsed.candles['USD/CHF'];
-          delete parsed.candles['NZD/USD'];
         }
         if (!parsed.telegramConfig || typeof parsed.telegramConfig !== 'object') {
           parsed.telegramConfig = {
