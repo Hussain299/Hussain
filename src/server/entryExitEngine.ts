@@ -19,6 +19,38 @@ import { getSessionFromTimestamp } from './dataFeeds.js';
 import { agiSelfLearningEngine } from './agiEngine.js';
 import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
 
+/** Maximum delay to wait for a provider to deliver the exact 5-minute entry bar. */
+export const LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS = 5 * 60_000;
+export const LIVE_ENTRY_BAR_TIMESTAMP_TOLERANCE_MS = 1_000;
+
+/**
+ * Select only the M1 candle that opens at the scheduled M5 boundary.
+ * A nearby or newest candle is never a substitute for the missing entry bar.
+ */
+export function findExactEntryCandle(
+  candles: readonly Candle[],
+  symbol: ForexSymbol,
+  candleOpenMs: number,
+  toleranceMs: number = LIVE_ENTRY_BAR_TIMESTAMP_TOLERANCE_MS,
+): Candle | null {
+  if (!Number.isFinite(candleOpenMs) || !Number.isFinite(toleranceMs) || toleranceMs < 0) return null;
+
+  return candles
+    .filter(candle =>
+      candle &&
+      candle.symbol === symbol &&
+      (candle.source === 'biquote' || candle.source === 'dukascopy' || candle.source === 'yahoo') &&
+      Number.isFinite(candle.timestampMs) &&
+      Math.abs(candle.timestampMs - candleOpenMs) <= toleranceMs &&
+      Number.isFinite(candle.open) &&
+      candle.open > 0
+    )
+    .sort((a, b) =>
+      Math.abs(a.timestampMs - candleOpenMs) - Math.abs(b.timestampMs - candleOpenMs) ||
+      a.timestampMs - b.timestampMs
+    )[0] || null;
+}
+
 export interface SignalCreationParams {
   symbol: ForexSymbol;
   direction: SignalDirection;
@@ -409,34 +441,48 @@ export class EntryExitEngine {
             }
           }
         } else if (signal.candleOpenTimeUtc) {
-          // B. Strict Live 5-Minute Candle Opening Trigger (Trades strictly open on 5M candle open!)
+          // B. Strict live paper entry: only the exact scheduled M5-open candle is eligible.
+          // Providers may deliver that minute late, so wait up to one full M5 window for the
+          // matching timestamp. Never substitute a nearby/latest candle or its close.
           const candleOpenMs = Date.parse(signal.candleOpenTimeUtc);
-          const newestCandle = candles[candles.length - 1];
+          if (Number.isFinite(candleOpenMs) && nowMs >= candleOpenMs) {
+            const allCandles = [
+              ...candles,
+              ...db.getCandles(signal.symbol, 200).filter(c => c.source !== 'synthetic'),
+            ];
+            const entryCandle = findExactEntryCandle(allCandles, signal.symbol, candleOpenMs);
 
-          // Once the candle open time has arrived or passed, execute entry immediately using REAL market candles only
-          if (nowMs >= candleOpenMs) {
-            const allCandles = candles.concat(db.getCandles(signal.symbol, 200).filter(c => c.source !== 'synthetic'));
-            const entryCandle = allCandles.find(c => Math.abs(c.timestampMs - candleOpenMs) <= 180_000) || newestCandle;
-            const entryFillPrice = entryCandle?.open || entryCandle?.close || signal.triggerPrice;
-            const entryTimeUtc = signal.candleOpenTimeUtc;
-            const plannedExitMs = candleOpenMs + (signal.expiryMinutes || 5) * 60 * 1000;
-            const plannedExitTimeUtc = signal.candleCloseTimeUtc || new Date(plannedExitMs).toISOString();
+            if (entryCandle) {
+              const entryFillPrice = entryCandle.open;
+              const entryTimeUtc = new Date(candleOpenMs).toISOString();
+              const plannedExitMs = candleOpenMs + (signal.expiryMinutes || 5) * 60 * 1000;
+              const plannedExitTimeUtc = signal.candleCloseTimeUtc || new Date(plannedExitMs).toISOString();
 
-            signal.actualEntryTimeUtc = entryTimeUtc;
-            signal.actualEntryPrice = entryFillPrice;
-            signal.entrySource = entryCandle?.source || 'yahoo';
-            signal.plannedExitTimeUtc = plannedExitTimeUtc;
-            signal.lifecycleState = 'ACTIVE';
+              signal.actualEntryTimeUtc = entryTimeUtc;
+              signal.actualEntryPrice = entryFillPrice;
+              signal.entrySource = entryCandle.source;
+              signal.plannedExitTimeUtc = plannedExitTimeUtc;
+              signal.lifecycleState = 'ACTIVE';
 
-            signal.lifecycleHistory.push({
-              timestamp: new Date().toISOString(),
-              fromState: 'WAITING_FOR_ENTRY',
-              toState: 'ACTIVE',
-              reason: `Trade opened on the 5M candle boundary (${signal.candleOpenTimeIst || entryTimeUtc}) at price ${entryFillPrice}. Expiry: ${signal.expiryMinutes} minutes (${signal.candleCloseTimeIst || plannedExitTimeUtc}).`,
-              price: entryFillPrice,
-            });
-
-            changed = true;
+              signal.lifecycleHistory.push({
+                timestamp: new Date().toISOString(),
+                fromState: 'WAITING_FOR_ENTRY',
+                toState: 'ACTIVE',
+                reason: `Paper entry matched the exact 5M candle open (${signal.candleOpenTimeIst || entryTimeUtc}) at the candle open price ${entryFillPrice}. Feed arrival was allowed within ${LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS / 60_000} minutes; no adjacent candle was substituted. Expiry: ${signal.expiryMinutes} minutes (${signal.candleCloseTimeIst || plannedExitTimeUtc}).`,
+                price: entryFillPrice,
+              });
+              changed = true;
+            } else if (nowMs >= candleOpenMs + LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS) {
+              signal.lifecycleState = 'EXPIRED';
+              signal.outcomeResult = 'CANCELLED';
+              signal.lifecycleHistory.push({
+                timestamp: new Date().toISOString(),
+                fromState: 'WAITING_FOR_ENTRY',
+                toState: 'EXPIRED',
+                reason: `The exact 5M entry candle at ${signal.candleOpenTimeUtc} was not delivered within the ${LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS / 60_000}-minute feed-arrival window. No nearby or latest candle was substituted; no contract was filled.`,
+              });
+              changed = true;
+            }
           }
         }
 

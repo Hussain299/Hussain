@@ -45,6 +45,8 @@ interface DatabaseSchema {
   feedHealth: Record<string, ProviderHealth>;
   signals: ResearchSignal[];
   experiments: ResearchExperiment[];
+  /** Append-only canonical paper-outcome ledger, retained independently of capped research history. */
+  forwardObservations: ResearchExperiment[];
   reviews: AgentReview[];
   generations: EvolutionGeneration[];
   autopilotLogs: AutopilotLog[];
@@ -97,6 +99,42 @@ interface DatabaseSchema {
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'signalforge.db.json');
 
+const RETRYABLE_RENAME_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
+const SYNC_RENAME_RETRIES = 3;
+
+function isRetryableRenameError(error: any): boolean {
+  return RETRYABLE_RENAME_CODES.has(String(error?.code || ''));
+}
+
+function sleepSync(milliseconds: number): void {
+  // Used only after transient Windows file-sharing errors in a synchronous critical save.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function renameSyncWithRetry(source: string, destination: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(source, destination);
+      return;
+    } catch (error: any) {
+      if (!isRetryableRenameError(error) || attempt >= SYNC_RENAME_RETRIES) throw error;
+      sleepSync(50 * (attempt + 1));
+    }
+  }
+}
+
+async function renameAsyncWithRetry(source: string, destination: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fs.promises.rename(source, destination);
+      return;
+    } catch (error: any) {
+      if (!isRetryableRenameError(error) || attempt >= SYNC_RENAME_RETRIES) throw error;
+      await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
+}
+
 class DatabaseService {
   private state: DatabaseSchema;
   private saveTimeout: NodeJS.Timeout | null = null;
@@ -132,6 +170,24 @@ class DatabaseService {
             }
           }
         }
+        // Migrate forward outcomes out of the capped experiment feed before applying its history limit.
+        // This preserves the complete paper ledger even when backtests continue to be added.
+        const legacyForwardRows = Array.isArray(parsed.experiments)
+          ? parsed.experiments.filter((item: any) => item?.experimentType === 'FORWARD_OBSERVATION' && item?.id?.startsWith('exp_forward_'))
+          : [];
+        const forwardRows = [
+          ...(Array.isArray(parsed.forwardObservations) ? parsed.forwardObservations : []),
+          ...legacyForwardRows,
+        ];
+        const uniqueForwardRows = new Map<string, any>();
+        for (const row of forwardRows) {
+          if (row?.id && !uniqueForwardRows.has(row.id)) uniqueForwardRows.set(row.id, row);
+        }
+        parsed.forwardObservations = Array.from(uniqueForwardRows.values());
+        if (Array.isArray(parsed.experiments)) {
+          parsed.experiments = parsed.experiments.filter((item: any) => item?.experimentType !== 'FORWARD_OBSERVATION');
+        }
+
         if (!parsed.autopilotLogs) parsed.autopilotLogs = [];
         if (Array.isArray(parsed.autopilotLogs) && parsed.autopilotLogs.length > 120) {
           parsed.autopilotLogs = parsed.autopilotLogs.slice(0, 120);
@@ -152,11 +208,8 @@ class DatabaseService {
           .flatMap((record: any) => Array.isArray(record?.signalIds)
             ? record.signalIds.filter((id: any) => typeof id === 'string')
             : []);
-        const legacyForwardSignalIds = (Array.isArray(parsed.experiments) ? parsed.experiments : [])
-          .filter((experiment: any) =>
-            experiment?.experimentType === 'FORWARD_OBSERVATION' &&
-            typeof experiment.id === 'string' &&
-            experiment.id.startsWith('exp_forward_'))
+        const legacyForwardSignalIds = (Array.isArray(parsed.forwardObservations) ? parsed.forwardObservations : [])
+          .filter((experiment: any) => typeof experiment?.id === 'string' && experiment.id.startsWith('exp_forward_'))
           .map((experiment: any) => experiment.id.slice('exp_forward_'.length));
         parsed.processedOutcomeIds = [...new Set([
           ...(Array.isArray(parsed.processedOutcomeIds) ? parsed.processedOutcomeIds : []),
@@ -364,6 +417,7 @@ class DatabaseService {
       feedHealth: {},
       signals: [],
       experiments: [],
+      forwardObservations: [],
       reviews: [],
       generations: [],
       autopilotLogs: [],
@@ -525,13 +579,17 @@ class DatabaseService {
       this.saveTimeout = null;
     }
     this.pendingPriority = 'none';
+    let tempFile = '';
     try {
       this.ensureDataDir();
-      const tempFile = `${DB_FILE}.${process.pid}.sync.tmp`;
+      tempFile = `${DB_FILE}.${process.pid}.${Date.now()}.sync.tmp`;
       fs.writeFileSync(tempFile, JSON.stringify(this.buildPersistedState()), 'utf-8');
-      fs.renameSync(tempFile, DB_FILE);
+      renameSyncWithRetry(tempFile, DB_FILE);
       this.lastWriteAtMs = Date.now();
     } catch (err: any) {
+      if (tempFile) {
+        try { fs.rmSync(tempFile, { force: true }); } catch { /* preserve the last valid DB snapshot */ }
+      }
       console.error('[DB] Synchronous state save failed:', err?.message || err);
     }
   }
@@ -547,14 +605,18 @@ class DatabaseService {
     }
     this.isWriting = true;
     this.pendingPriority = 'none';
+    let tempFile = '';
     try {
       this.ensureDataDir();
       const payload = JSON.stringify(this.buildPersistedState());
-      const tempFile = `${DB_FILE}.${process.pid}.tmp`;
+      tempFile = `${DB_FILE}.${process.pid}.tmp`;
       await fs.promises.writeFile(tempFile, payload, 'utf-8');
-      await fs.promises.rename(tempFile, DB_FILE);
+      await renameAsyncWithRetry(tempFile, DB_FILE);
       this.lastWriteAtMs = Date.now();
     } catch (err: any) {
+      if (tempFile) {
+        try { await fs.promises.rm(tempFile, { force: true }); } catch { /* preserve the last valid DB snapshot */ }
+      }
       console.error('[DB] Async state save failed:', err?.message || err);
     } finally {
       this.isWriting = false;
@@ -882,7 +944,8 @@ class DatabaseService {
       throw new Error('Forward observations require a filled, CLOSED contract with a verified settlement, price, and payout.');
     }
     if (!Array.isArray(this.state.recordedForwardObservationIds)) this.state.recordedForwardObservationIds = [];
-    const existing = this.state.experiments.find(exp => exp.id === `exp_forward_${sig.id}`);
+    const existing = (this.state.forwardObservations || []).find(exp => exp.id === `exp_forward_${sig.id}`)
+      || this.state.experiments.find(exp => exp.id === `exp_forward_${sig.id}`);
     if (existing) {
       if (!this.state.recordedForwardObservationIds.includes(sig.id)) {
         this.state.recordedForwardObservationIds.push(sig.id);
@@ -892,7 +955,9 @@ class DatabaseService {
     }
     // A lifetime ledger may outlive the bounded display row. In that case
     // return the reconstructed record without inserting or counting it again.
-    const netPips = sig.netReturnPips ?? 0;
+    const netPips = typeof sig.netReturnPips === 'number' && Number.isFinite(sig.netReturnPips)
+      ? sig.netReturnPips
+      : null;
     const netReturnUnits = sig.netReturnUnits ?? 0;
     const sessionName = sig.marketSessionName || 'Market Session';
     const strategyName = sig.strategyName || 'Algorithmic Strategy';
@@ -901,7 +966,7 @@ class DatabaseService {
       id: `exp_forward_${sig.id}`,
       experimentType: 'FORWARD_OBSERVATION',
       liveOutcome: sig.outcomeResult === 'CANCELLED' || sig.outcomeResult === 'PENDING' ? 'SCRATCH' : sig.outcomeResult,
-      observedNetPips: netPips,
+      ...(netPips !== null ? { observedNetPips: netPips } : {}),
       observedNetReturnUnits: netReturnUnits,
       observedPayoutPct: sig.payoutPct ?? 0,
       generation: this.state.generations.length + 1,
@@ -916,7 +981,7 @@ class DatabaseService {
         expiryMinutes: sig.expiryMinutes,
         marketSession: sig.marketSession || 'ASIA',
         confluenceScore: sig.confluenceScore ?? 0,
-        observedNetPips: netPips,
+        ...(netPips !== null ? { observedNetPips: netPips } : {}),
         observedNetReturnUnits: netReturnUnits,
         observedPayoutPct: sig.payoutPct ?? 0,
         observedOutcome: sig.outcomeResult,
@@ -1051,6 +1116,27 @@ class DatabaseService {
 
   // Experiments
   public addExperiment(exp: ResearchExperiment): boolean {
+    const isForwardObservation = exp.experimentType === 'FORWARD_OBSERVATION' && exp.id.startsWith('exp_forward_');
+    if (isForwardObservation) {
+      if (!Array.isArray(this.state.forwardObservations)) this.state.forwardObservations = [];
+      const existingForward = this.state.forwardObservations.find(item => item.id === exp.id);
+      if (existingForward) {
+        const signalId = exp.id.slice('exp_forward_'.length);
+        if (!this.state.recordedForwardObservationIds.includes(signalId)) {
+          this.state.recordedForwardObservationIds.push(signalId);
+          this.scheduleSave('high');
+        }
+        return false;
+      }
+      this.state.forwardObservations.unshift(exp);
+      const signalId = exp.id.slice('exp_forward_'.length);
+      if (!this.state.recordedForwardObservationIds.includes(signalId)) {
+        this.state.recordedForwardObservationIds.push(signalId);
+      }
+      this.scheduleSave('high');
+      return true;
+    }
+
     const existing = this.state.experiments.find(item => item.id === exp.id);
     if (existing) {
       if (exp.experimentType === 'FORWARD_OBSERVATION' && exp.id.startsWith('exp_forward_')) {
@@ -1078,7 +1164,12 @@ class DatabaseService {
   }
 
   public getExperiments(): ResearchExperiment[] {
-    return this.state.experiments;
+    const forward = Array.isArray(this.state.forwardObservations) ? this.state.forwardObservations : [];
+    return [...this.state.experiments, ...forward].sort((a, b) => {
+      const ta = Date.parse(a.createdAt || '') || 0;
+      const tb = Date.parse(b.createdAt || '') || 0;
+      return tb - ta || b.id.localeCompare(a.id);
+    });
   }
 
   // Synthesized Genetic Strategies (Infinite Non-Human Combinations)
@@ -1426,8 +1517,29 @@ class DatabaseService {
     const forwardIds = new Set(this.state.recordedForwardObservationIds || []);
     const outcomeIds = new Set(this.state.processedOutcomeIds || []);
     const recoverable = closed.filter(signal => this.isRecoverableSettledSignal(signal));
+    const forwardRows = Array.isArray(this.state.forwardObservations) ? this.state.forwardObservations : [];
+    const forwardRowSignalIds = new Set(forwardRows
+      .filter(row => row.id?.startsWith('exp_forward_'))
+      .map(row => row.id.slice('exp_forward_'.length)));
+    const forwardOutcomeCounts = countBy(forwardRows.map(row => row.liveOutcome || 'UNKNOWN'));
+    const forwardNetUnits = forwardRows.reduce((sum, row) =>
+      sum + (typeof row.observedNetReturnUnits === 'number' && Number.isFinite(row.observedNetReturnUnits)
+        ? row.observedNetReturnUnits
+        : 0), 0);
+    const forwardMissingUnits = forwardRows.filter(row =>
+      typeof row.observedNetReturnUnits !== 'number' || !Number.isFinite(row.observedNetReturnUnits)
+    ).length;
     return {
       generatedAt: new Date().toISOString(),
+      ledger: {
+        forwardObservationRecords: forwardRows.length,
+        forwardOutcomeCounts,
+        forwardNetReturnUnits: Number(forwardNetUnits.toFixed(2)),
+        forwardRecordsMissingReturnUnits: forwardMissingUnits,
+        forwardRecordsWithoutRetainedSignal: forwardRows.filter(row =>
+          row.id?.startsWith('exp_forward_') && !signals.some(signal => signal.id === row.id.slice('exp_forward_'.length))
+        ).length,
+      },
       signals: {
         total: signals.length,
         lifecycleCounts: countBy(signals.map(signal => signal.lifecycleState)),

@@ -21,6 +21,7 @@ import { ResearchSignal, FOREX_PAIRS, ForexSymbol } from '../../types/index.js';
 import { getBotForSignal, BotId, BOT_DEFINITIONS } from '../../utils/botControls.js';
 import { TradeAuditModal } from '../common/TradeAuditModal.tsx';
 import { useFirebase } from '../../contexts/FirebaseContext.tsx';
+import { isExpiredUnfilledSetup, isTerminalUnfilledSetup, summarizeSignalAccounting } from '../../utils/tradeAccounting.js';
 
 interface HistoryViewProps {
   signals: ResearchSignal[];
@@ -28,7 +29,7 @@ interface HistoryViewProps {
 }
 
 type DateLayer = 'ALL' | 'TODAY' | 'YESTERDAY';
-type StatusFilter = 'ALL' | 'WIN' | 'LOSS' | 'SCRATCH';
+type StatusFilter = 'ALL' | 'WIN' | 'LOSS' | 'SCRATCH' | 'EXPIRED';
 type DirectionFilter = 'ALL' | 'BUY' | 'SELL';
 
 export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) => {
@@ -104,8 +105,10 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
       }
 
       // Status filter
-      if (statusFilter !== 'ALL') {
-        if (signal.outcomeResult !== statusFilter) return false;
+      if (statusFilter === 'EXPIRED') {
+        if (!isExpiredUnfilledSetup(signal)) return false;
+      } else if (statusFilter !== 'ALL' && signal.outcomeResult !== statusFilter) {
+        return false;
       }
 
       // Pair filter
@@ -122,36 +125,11 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
     });
   }, [baseSignals, searchQuery, strategyFilter, statusFilter, pairFilter, directionFilter]);
 
-  // Calculate Performance Metrics for the filtered slice
-  const stats = useMemo(() => {
-    const completed = filteredSignals.filter(
-      s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-    );
-    const wins = completed.filter(s => s.outcomeResult === 'WIN').length;
-    const losses = completed.filter(s => s.outcomeResult === 'LOSS').length;
-    const scratches = completed.filter(s => s.outcomeResult === 'SCRATCH').length;
-    const unentered = filteredSignals.filter(s => s.actualEntryPrice === null).length;
-    const scored = wins + losses;
-    const winRate = scored > 0 ? Number(((wins / scored) * 100).toFixed(1)) : null;
-    const netUnits = Number(
-      completed.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2)
-    );
-    const grossPips = Number(
-      completed.reduce((acc, s) => acc + (s.grossReturnPips || 0), 0).toFixed(1)
-    );
-
-    return {
-      total: filteredSignals.length,
-      completed: completed.length,
-      wins,
-      losses,
-      scratches,
-      unentered,
-      winRate,
-      netUnits,
-      grossPips,
-    };
-  }, [filteredSignals]);
+  // All scorecard fields share the same explicit signal/fill/settlement definitions.
+  const stats = useMemo(
+    () => summarizeSignalAccounting(filteredSignals),
+    [filteredSignals]
+  );
 
   // CSV Export Handler
   const handleExportCSV = () => {
@@ -167,7 +145,6 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
       'Expiry Time (IST)',
       'Entry Price',
       'Exit Price',
-      'Displacement Pips',
       'Outcome',
       'Net Return Units',
       'Payout Pct',
@@ -186,10 +163,9 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
         `"${s.candleCloseTimeIst || ''}"`,
         s.actualEntryPrice ?? s.triggerPrice ?? '',
         s.actualExitPrice ?? '',
-        s.grossReturnPips ?? '',
         `"${s.outcomeResult || s.lifecycleState}"`,
         s.netReturnUnits ?? '',
-        s.payoutPct ?? 85,
+        s.payoutPct ?? '',
       ].join(',');
     });
 
@@ -245,7 +221,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
                     : 'text-[#AAB4BF] hover:text-[#E8E5DE]'
                 }`}
               >
-                <span>All Trades</span>
+                <span>Signal Setups</span>
                 <span className="ml-1.5 px-1.5 py-0.2 rounded-full text-[10px] bg-[#243040] text-[#AAB4BF]">
                   {signals.length}
                 </span>
@@ -324,45 +300,47 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
             </div>
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4">
             <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Realized Win Rate</span>
+              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Win Rate</span>
               <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">
                 {stats.winRate !== null ? `${stats.winRate}%` : '—'}
               </div>
               <span className="text-[10px] text-[#72A98B] font-bold block mt-1">
-                {stats.wins} Wins · {stats.losses} Losses
+                {stats.wins}W · {stats.losses}L · {stats.scratches}S
               </span>
             </div>
 
             <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Executed Fills</span>
-              <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">
-                {stats.completed}
-              </div>
-              <span className="text-[10px] text-[#AAB4BF] block mt-1">
-                {stats.unentered} unentered signals
-              </span>
+              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Signal Setups</span>
+              <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">{stats.signalSetups}</div>
+              <span className="text-[10px] text-[#AAB4BF] block mt-1">Unique recorded signals</span>
             </div>
 
             <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Net Stake Units</span>
-              <div className={`text-2xl sm:text-3xl font-black mt-1 tabular-nums ${stats.netUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                {stats.netUnits >= 0 ? `+${stats.netUnits}` : stats.netUnits} U
-              </div>
-              <span className="text-[10px] text-[#AAB4BF] block mt-1">
-                Audited payout units
-              </span>
+              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Filled Contracts</span>
+              <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">{stats.filledContracts}</div>
+              <span className="text-[10px] text-[#AAB4BF] block mt-1">{stats.pendingFilledContracts} awaiting settlement</span>
             </div>
 
             <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Gross Displacement</span>
-              <div className={`text-2xl sm:text-3xl font-black mt-1 tabular-nums ${stats.grossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                {stats.grossPips >= 0 ? `+${stats.grossPips}` : stats.grossPips} pips
+              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Settled Outcomes</span>
+              <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">{stats.settledContracts}</div>
+              <span className="text-[10px] text-[#AAB4BF] block mt-1">{stats.scoredOutcomes} scored · {stats.scratches} scratches</span>
+            </div>
+
+            <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
+              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Expired Unfilled</span>
+              <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">{stats.expiredUnfilledSetups}</div>
+              <span className="text-[10px] text-[#AAB4BF] block mt-1">Not counted as trades</span>
+            </div>
+
+            <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
+              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Net Stake Return</span>
+              <div className={`text-2xl sm:text-3xl font-black mt-1 tabular-nums ${stats.netReturnUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                {stats.netReturnUnits >= 0 ? `+${stats.netReturnUnits}` : stats.netReturnUnits} U
               </div>
-              <span className="text-[10px] text-[#AAB4BF] block mt-1">
-                Cumulative market move
-              </span>
+              <span className="text-[10px] text-[#AAB4BF] block mt-1">{stats.missingReturnCount ? `${stats.missingReturnCount} missing return values` : 'Recorded binary payout units'}</span>
             </div>
           </div>
         </div>
@@ -431,7 +409,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
             <div className="flex items-center gap-1.5">
               <span className="text-[#AAB4BF]">Outcome:</span>
               <div className="flex items-center bg-[#121820] border border-[#243040] p-0.5 rounded">
-                {(['ALL', 'WIN', 'LOSS', 'SCRATCH'] as StatusFilter[]).map(st => (
+                {(['ALL', 'WIN', 'LOSS', 'SCRATCH', 'EXPIRED'] as StatusFilter[]).map(st => (
                   <button
                     key={st}
                     onClick={() => setStatusFilter(st)}
@@ -516,7 +494,6 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
                     <th className="py-3 px-4 text-right">Entry Price</th>
                     <th className="py-3 px-4 text-right">Exit Price</th>
                     <th className="py-3 px-4 text-right">Net Return</th>
-                    <th className="py-3 px-4 text-right">Displacement</th>
                     <th className="py-3 px-4 text-right">Action</th>
                   </tr>
                 </thead>
@@ -528,6 +505,11 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
                     const isLost = trade.outcomeResult === 'LOSS';
                     const isScratch = trade.outcomeResult === 'SCRATCH';
                     const isPending = trade.outcomeResult === 'PENDING' || !trade.outcomeResult;
+                    const isExpiredUnfilled = isExpiredUnfilledSetup(trade);
+                    const isTerminalUnfilled = isTerminalUnfilledSetup(trade);
+                    const auditReason = [...(trade.lifecycleHistory || [])].reverse().find(event =>
+                      ['EXPIRED', 'INVALIDATED', 'AMBIGUOUS'].includes(event.toState)
+                    )?.reason || 'No entry fill was recorded; this setup is excluded from contract outcomes.';
 
                     return (
                       <tr
@@ -554,7 +536,13 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
                               SCRATCH
                             </span>
                           )}
-                          {!isWon && !isLost && !isScratch && isPending && (
+                          {isTerminalUnfilled ? (
+                            <div className="max-w-[260px] space-y-1 rounded-md border border-[#C4A574]/50 bg-[#C4A574]/10 p-2 text-left">
+                              <span className="block text-[10px] font-black text-[#C4A574]">AUDIT: UNSETTLED / NO ENTRY</span>
+                              <span className="block text-[10px] font-bold text-[#E8E5DE]">{isExpiredUnfilled ? 'EXPIRED' : trade.lifecycleState}</span>
+                              <span className="block whitespace-normal text-[10px] leading-relaxed text-[#AAB4BF]">{auditReason}</span>
+                            </div>
+                          ) : !isWon && !isLost && !isScratch && (
                             <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] bg-[#C4A574]/15 text-[#C4A574] border border-[#C4A574]/30">
                               {trade.lifecycleState}
                             </span>
@@ -620,25 +608,6 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
                               }`}
                             >
                               {trade.netReturnUnits > 0 ? `+${trade.netReturnUnits.toFixed(2)}` : trade.netReturnUnits.toFixed(2)} U
-                            </span>
-                          ) : (
-                            <span className="text-[#AAB4BF]">—</span>
-                          )}
-                        </td>
-
-                        {/* Displacement Pips */}
-                        <td className="py-3 px-4 whitespace-nowrap text-right tabular-nums">
-                          {trade.grossReturnPips !== null && trade.grossReturnPips !== undefined ? (
-                            <span
-                              className={`font-bold ${
-                                trade.grossReturnPips > 0
-                                  ? 'text-[#72A98B]'
-                                  : trade.grossReturnPips < 0
-                                  ? 'text-[#B7797D]'
-                                  : 'text-[#AAB4BF]'
-                              }`}
-                            >
-                              {trade.grossReturnPips > 0 ? `+${trade.grossReturnPips}` : trade.grossReturnPips} p
                             </span>
                           ) : (
                             <span className="text-[#AAB4BF]">—</span>

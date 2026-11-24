@@ -173,8 +173,17 @@ export const ExperimentHistoryView: React.FC<ExperimentHistoryViewProps> = ({ ex
             {(selectedExp.experimentType === 'LIVE_TRADE' || selectedExp.experimentType === 'FORWARD_OBSERVATION') && (
               <div className="bg-[#17212D] p-3 rounded-lg border border-[#354251] space-y-1">
                 <div className="text-[#E8E5DE] font-semibold">Observed forward paper outcome: {selectedExp.liveOutcome || 'RECORDED'}</div>
-                <div className="text-[#AAB4BF]">One completed candle-based paper observation only. This record is not a broker fill, historical backtest or strategy win-rate estimate.</div>
-                <div className="text-[#72A98B]">Net result: {(selectedExp.observedNetPips ?? 0) > 0 ? '+' : ''}{(selectedExp.observedNetPips ?? 0).toFixed(1)} pips</div>
+                <div className="text-[#AAB4BF]">Candle-based paper observation only. This record is not a broker fill, historical backtest or strategy win-rate estimate.</div>
+                <div className="text-[#72A98B]">
+                  Net binary return: {typeof selectedExp.observedNetReturnUnits === 'number' && Number.isFinite(selectedExp.observedNetReturnUnits)
+                    ? `${selectedExp.observedNetReturnUnits > 0 ? '+' : ''}${selectedExp.observedNetReturnUnits.toFixed(2)} U`
+                    : 'Not recorded'}
+                </div>
+                <div className="text-[#AAB4BF]">
+                  Saved payout: {typeof selectedExp.observedPayoutPct === 'number' && selectedExp.observedPayoutPct > 0
+                    ? `${selectedExp.observedPayoutPct}%`
+                    : 'Not recorded'}
+                </div>
               </div>
             )}
             <div>

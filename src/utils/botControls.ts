@@ -4,6 +4,7 @@
  */
 
 import { ForexSymbol, FOREX_PAIRS, MarketSessionId, ResearchSignal } from '../types/index.js';
+import { isFilledContract, isSettledContract, summarizeSignalAccounting } from './tradeAccounting.js';
 
 export type BotId = 'signalforge_bot' | 'bot_1' | 'bot_2' | 'bot_3';
 
@@ -188,9 +189,14 @@ export function getBotForSignal(_signal?: ResearchSignal | null): BotMetadata {
 
 export interface BotPerformanceSummary {
   totalSignals: number;
+  /** Number of unique signals with a recorded entry fill. */
   executedTrades: number;
+  filledContracts: number;
+  pendingFilledContracts: number;
+  expiredUnfilledSetups: number;
   activeCount: number;
   verifyingCount: number;
+  /** Number of filled contracts with a closed binary outcome. */
   completedTrades: number;
   wins: number;
   losses: number;
@@ -216,32 +222,26 @@ export function computeBotPerformance(
     : [];
 
   const safeSignals = signals.filter(Boolean);
-
+  const accounting = summarizeSignalAccounting(safeSignals);
   const nowMs = Date.now();
   const activeTrades = safeSignals.filter(s => {
-    if (s.lifecycleState !== 'ACTIVE' || s.actualEntryPrice === null) return false;
+    if (s.lifecycleState !== 'ACTIVE' || !isFilledContract(s)) return false;
     const exitMs = s.plannedExitTimeUtc ? Date.parse(s.plannedExitTimeUtc) : 0;
     return exitMs === 0 || nowMs < exitMs;
   });
   const verifyingTrades = safeSignals.filter(s => {
-    if (s.actualEntryPrice === null || s.outcomeResult !== 'PENDING') return false;
+    if (!isFilledContract(s) || s.outcomeResult !== 'PENDING') return false;
     const exitMs = s.plannedExitTimeUtc ? Date.parse(s.plannedExitTimeUtc) : 0;
     const isPastExpiry = exitMs > 0 && nowMs >= exitMs;
     return s.lifecycleState === 'EXIT_PENDING' || (s.lifecycleState === 'ACTIVE' && isPastExpiry);
   });
-  const completedTrades = safeSignals.filter(
-    s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-  );
+  const completedTrades = safeSignals.filter(isSettledContract);
 
-  const wins = completedTrades.filter(s => s.outcomeResult === 'WIN').length;
-  const losses = completedTrades.filter(s => s.outcomeResult === 'LOSS').length;
-  const scratches = completedTrades.filter(s => s.outcomeResult === 'SCRATCH').length;
-  const scored = wins + losses;
-  const winRate = scored > 0 ? Number(((wins / scored) * 100).toFixed(1)) : null;
-
-  const netUnits = Number(
-    completedTrades.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2)
-  );
+  const wins = accounting.wins;
+  const losses = accounting.losses;
+  const scratches = accounting.scratches;
+  const winRate = accounting.winRate;
+  const netUnits = accounting.netReturnUnits;
   const grossPips = Number(
     completedTrades.reduce((acc, s) => acc + (s.grossReturnPips || 0), 0).toFixed(1)
   );
@@ -258,11 +258,14 @@ export function computeBotPerformance(
   const profitFactor = grossLoss > 0 ? Number((grossProfit / grossLoss).toFixed(2)) : grossProfit > 0 ? 9.99 : null;
 
   return {
-    totalSignals: safeSignals.length,
-    executedTrades: activeTrades.length + verifyingTrades.length + completedTrades.length,
+    totalSignals: accounting.signalSetups,
+    executedTrades: accounting.filledContracts,
+    filledContracts: accounting.filledContracts,
+    pendingFilledContracts: accounting.pendingFilledContracts,
+    expiredUnfilledSetups: accounting.expiredUnfilledSetups,
     activeCount: activeTrades.length,
     verifyingCount: verifyingTrades.length,
-    completedTrades: completedTrades.length,
+    completedTrades: accounting.settledContracts,
     wins,
     losses,
     scratches,
