@@ -28,10 +28,6 @@ export function isExpiredUnfilledSetup(signal: ResearchSignal): boolean {
   return !isFilledContract(signal) && signal.lifecycleState === 'EXPIRED';
 }
 
-export function isTerminalUnfilledSetup(signal: ResearchSignal): boolean {
-  return !isFilledContract(signal) && TERMINAL_UNFILLED_STATES.has(signal.lifecycleState);
-}
-
 export function getForwardObservations(experiments: ResearchExperiment[]): ResearchExperiment[] {
   const unique = new Map<string, ResearchExperiment>();
   for (const experiment of experiments) {
