@@ -599,8 +599,9 @@ export async function runAllVerificationTests(): Promise<{
 
   await runTest('SYSTEM', 'Telegram Bot Configuration & Signal Dispatch Engine', () => {
     const cfg = db.getTelegramConfig();
-    if (!cfg.botToken || !cfg.botToken.startsWith('8386549882:')) {
-      throw new Error(`Invalid Telegram bot token configuration: ${cfg.botToken}`);
+    const expectedToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    if ((cfg.botToken || '').trim() !== expectedToken) {
+      throw new Error('Telegram credential must come from host configuration, not a hard-coded or committed fallback.');
     }
     if (cfg.minConfidence < 0.5 || cfg.minConfidence > 1.0) {
       throw new Error(`Invalid Telegram minConfidence threshold: ${cfg.minConfidence}`);
