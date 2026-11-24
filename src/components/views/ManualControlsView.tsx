@@ -592,7 +592,7 @@ export const ManualControlsView: React.FC<ManualControlsViewProps> = ({ onContro
                   onClick={selectAllPairs}
                   className="px-2.5 py-1 rounded bg-[#121820] hover:bg-[#243040] text-[#72A98B] border border-[#243040] text-[11px] font-semibold cursor-pointer"
                 >
-                  Select All 20 Pairs
+                  Select All {FOREX_PAIRS.length} Pairs
                 </button>
                 <button
                   onClick={deselectAllPairs}
