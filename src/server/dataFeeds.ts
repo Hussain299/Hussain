@@ -1,6 +1,6 @@
 /**
  * SignalForge ML — Multi-Source Forex Data Ingestion Engine
- * Implements strict fallback order: Biquote -> Dukascopy -> Yahoo Finance.
+ * Provider order: Yahoo Finance public chart API -> Biquote.io public M1 endpoint -> Dukascopy data via the zapi.ink proxy.
  * Includes gap detection, duplicate elimination, UTC normalization, and health scoring.
  */
 
@@ -14,6 +14,46 @@ interface RawCandle {
   low: number;
   close: number;
   volume?: number;
+}
+
+/**
+ * Live scanner freshness policy for one-minute market candles.
+ * Candle timestamps mark the minute's open, so a 90-second age limit allows
+ * normal provider finalization and the scheduler's 25-second polling cadence.
+ * Only recognized external feed sources are eligible; imported, fixture, and
+ * synthetic candles must never drive live signal discovery.
+ */
+export const LIVE_CANDLE_MAX_AGE_MS = 90_000;
+const LIVE_CANDLE_FUTURE_SKEW_TOLERANCE_MS = 5_000;
+const LIVE_FEED_SOURCES = new Set<Candle['source']>(['biquote', 'dukascopy', 'yahoo']);
+
+export function filterFreshRealCandles(
+  candles: readonly Candle[],
+  symbol: ForexSymbol,
+  nowMs: number = Date.now(),
+  maxAgeMs: number = LIVE_CANDLE_MAX_AGE_MS
+): Candle[] {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+    return [];
+  }
+
+  return candles
+    .filter(candle => {
+      if (!candle || candle.symbol !== symbol || !LIVE_FEED_SOURCES.has(candle.source)) {
+        return false;
+      }
+      if (!Number.isFinite(candle.timestampMs)) return false;
+
+      const parsedTimestampMs = Date.parse(candle.timestamp);
+      if (!Number.isFinite(parsedTimestampMs) ||
+          Math.abs(parsedTimestampMs - candle.timestampMs) > 1_000) {
+        return false;
+      }
+
+      const ageMs = nowMs - candle.timestampMs;
+      return ageMs <= maxAgeMs && ageMs >= -LIVE_CANDLE_FUTURE_SKEW_TOLERANCE_MS;
+    })
+    .sort((a, b) => a.timestampMs - b.timestampMs);
 }
 
 export class DataFeedEngine {
@@ -60,7 +100,7 @@ export class DataFeedEngine {
     let candles: Candle[] = [];
     let activeSource = 'none';
 
-    // 1. Try Yahoo Finance First (Ultra-low latency ~150ms and 100% reliable)
+    // 1. Try the Yahoo Finance public chart API first.
     try {
       const start = Date.now();
       const yahooSymbol = `${cleanSymbol}=X`;
@@ -83,7 +123,7 @@ export class DataFeedEngine {
             latencyMs: Date.now() - start,
             lastSuccess: new Date().toISOString(),
             consecutiveFailures: 0,
-            attribution: 'Yahoo Finance Institutional Feed (Primary)',
+            attribution: 'Yahoo Finance public chart API',
           });
         }
       }
@@ -95,7 +135,7 @@ export class DataFeedEngine {
         latencyMs: 3000,
         lastSuccess: 'Pending',
         consecutiveFailures: 1,
-        attribution: 'Yahoo Finance (Fallback triggered)',
+        attribution: 'Yahoo Finance public chart API (fallback attempted)',
         errorMessage: err.message,
       });
     }
@@ -123,7 +163,7 @@ export class DataFeedEngine {
               latencyMs: Date.now() - start,
               lastSuccess: new Date().toISOString(),
               consecutiveFailures: 0,
-              attribution: 'Biquote.io Public M1 Feed',
+              attribution: 'Biquote.io public M1 endpoint',
             });
           }
         }
@@ -135,7 +175,7 @@ export class DataFeedEngine {
           latencyMs: 2000,
           lastSuccess: 'Pending',
           consecutiveFailures: 1,
-          attribution: 'Biquote.io (Fallback triggered)',
+          attribution: 'Biquote.io public M1 endpoint (fallback attempted)',
           errorMessage: err.message,
         });
       }
@@ -163,7 +203,7 @@ export class DataFeedEngine {
               latencyMs: Date.now() - start,
               lastSuccess: new Date().toISOString(),
               consecutiveFailures: 0,
-              attribution: 'Dukascopy Secondary M1 Feed',
+              attribution: 'Dukascopy data via zapi.ink proxy (M1)',
             });
           }
         }
@@ -175,13 +215,13 @@ export class DataFeedEngine {
           latencyMs: 2000,
           lastSuccess: 'Pending',
           consecutiveFailures: 1,
-          attribution: 'Dukascopy (Fallback triggered)',
+          attribution: 'Dukascopy data via zapi.ink proxy (fallback attempted)',
           errorMessage: err.message,
         });
       }
     }
 
-    // 4. If all public endpoints fail or are closed (weekend/rate limit), use realistic high-fidelity continuity generator
+    // 4. If public endpoints fail or are closed, generate synthetic continuity candles for display only; live scanning rejects them.
     if (candles.length === 0) {
       const stored = db.getCandles(symbol, limit);
       if (stored.length > 0) {
