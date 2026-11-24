@@ -541,6 +541,30 @@ apiRouter.get('/evolution/state', (_req: Request, res: Response) => {
   });
 });
 
+// Detailed entry and learning audit. This endpoint is read-only.
+apiRouter.get('/evolution/diagnostics', (_req: Request, res: Response) => {
+  res.json(db.getEvolutionDiagnostics());
+});
+
+// Rebuild and reconcile learning state safely. Both operations are idempotent.
+apiRouter.post('/evolution/reconcile', (_req: Request, res: Response) => {
+  try {
+    const onlineReplay = db.rebuildOnlineLearnerFromHistory();
+    const outcomeRecovery = db.reconcileClosedSignalLearning();
+    return res.json({
+      onlineReplay,
+      outcomeRecovery,
+      diagnostics: db.getEvolutionDiagnostics(),
+    });
+  } catch (error: any) {
+    console.error('[Learning] Manual reconciliation failed:', error);
+    return res.status(500).json({
+      error: 'Learning reconciliation failed.',
+      details: error?.message || String(error),
+    });
+  }
+});
+
 // GET /api/research/history
 apiRouter.get('/research/history', (_req: Request, res: Response) => {
   res.json({
