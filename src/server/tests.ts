@@ -5,7 +5,7 @@
  */
 
 import { Candle, ForexSymbol, FOREX_PAIRS, ResearchSignal, VerificationTestResult } from '../types/index.js';
-import { dataFeedEngine } from './dataFeeds.js';
+import { dataFeedEngine, filterFreshRealCandles, LIVE_CANDLE_MAX_AGE_MS } from './dataFeeds.js';
 import { db } from './db.js';
 import { entryExitEngine } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
@@ -280,6 +280,62 @@ export async function runAllVerificationTests(): Promise<{
   // ==========================================
   // 1. DATA TESTS
   // ==========================================
+  await runTest('DATA', 'Live scanner rejects stale, synthetic, imported, mismatched and invalid-time candles', () => {
+    const nowMs = Date.UTC(2026, 10, 24, 10, 0, 0);
+    const makeCandle = (
+      symbol: ForexSymbol,
+      ageMs: number,
+      source: Candle['source'] = 'yahoo',
+      timestampOffsetMs: number = 0
+    ): Candle => {
+      const timestampMs = nowMs - ageMs;
+      return {
+        symbol,
+        timestamp: new Date(timestampMs + timestampOffsetMs).toISOString(),
+        timestampMs,
+        open: 1.0850,
+        high: 1.0860,
+        low: 1.0840,
+        close: 1.0855,
+        volume: 100,
+        source,
+      };
+    };
+
+    const boundaryFresh = makeCandle('EUR/USD', LIVE_CANDLE_MAX_AGE_MS);
+    const recentFresh = makeCandle('EUR/USD', 30_000, 'biquote');
+    const smallFutureSkew = makeCandle('EUR/USD', -5_000, 'dukascopy');
+    const stale = makeCandle('EUR/USD', LIVE_CANDLE_MAX_AGE_MS + 1);
+    const excessiveFuture = makeCandle('EUR/USD', -5_001);
+    const synthetic = makeCandle('EUR/USD', 1_000, 'synthetic');
+    const imported = makeCandle('EUR/USD', 1_000, 'imported');
+    const fixture = makeCandle('EUR/USD', 1_000, 'test_fixture');
+    const wrongPair = makeCandle('GBP/USD', 1_000);
+    const inconsistentTimestamp = makeCandle('EUR/USD', 1_000, 'yahoo', 2_000);
+
+    const accepted = filterFreshRealCandles([
+      stale,
+      excessiveFuture,
+      synthetic,
+      imported,
+      fixture,
+      wrongPair,
+      inconsistentTimestamp,
+      recentFresh,
+      smallFutureSkew,
+      boundaryFresh,
+    ], 'EUR/USD', nowMs);
+
+    const expected = [boundaryFresh, recentFresh, smallFutureSkew]
+      .sort((a, b) => a.timestampMs - b.timestampMs);
+    if (accepted.length !== expected.length ||
+        accepted.some((candle, index) => candle.timestampMs !== expected[index].timestampMs)) {
+      throw new Error(
+        `Live freshness filter accepted/rejected the wrong candles. Expected ${expected.length}, got ${accepted.length}.`
+      );
+    }
+  });
+
   await runTest('DATA', 'Provider Fallback & Continuity Generation', async () => {
     // Test that requesting candles never returns empty list even if remote APIs are offline
     const res = await dataFeedEngine.fetchCandles('EUR/USD', 50);

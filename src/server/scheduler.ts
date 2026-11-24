@@ -13,7 +13,7 @@ import {
   ResearchExperiment,
   RuleFamily,
 } from '../types/index.js';
-import { dataFeedEngine, getSessionFromTimestamp, isForexMarketOpen } from './dataFeeds.js';
+import { dataFeedEngine, filterFreshRealCandles, getSessionFromTimestamp, isForexMarketOpen } from './dataFeeds.js';
 import { db } from './db.js';
 import { entryExitEngine } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
@@ -337,10 +337,18 @@ export class AutonomousScheduler {
           batch.map(async (symbol) => {
             try {
               const res = await dataFeedEngine.fetchCandles(symbol, 100);
-              // Strictly use verified real market candles (never settle live trades on synthetic continuity data)
-              const realCandles = res.candles.filter(c => c.source !== 'synthetic');
-              const storedReal = db.getCandles(symbol, 100).filter(c => c.source !== 'synthetic');
-              candlesMap[symbol] = realCandles.length > 0 ? realCandles : storedReal;
+              // Only recent, timestamp-consistent external feed candles may reach live discovery
+              // or entry/exit evaluation. Old persisted candles must not become a fallback signal source.
+              const nowMs = Date.now();
+              const freshStored = filterFreshRealCandles(db.getCandles(symbol, 100), symbol, nowMs);
+              const freshFetched = filterFreshRealCandles(res.candles, symbol, nowMs);
+              const byTimestamp = new Map<number, Candle>();
+              for (const candle of freshStored) byTimestamp.set(candle.timestampMs, candle);
+              // Prefer this cycle's provider candle if it shares a timestamp with persisted data.
+              for (const candle of freshFetched) byTimestamp.set(candle.timestampMs, candle);
+              candlesMap[symbol] = Array.from(byTimestamp.values())
+                .sort((a, b) => a.timestampMs - b.timestampMs)
+                .slice(-100);
               totalCandlesFetched += candlesMap[symbol].length;
             } catch (err: any) {
               console.error(`[Autopilot] Sensing failed for ${symbol}:`, err.message);
