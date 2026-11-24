@@ -248,6 +248,45 @@ export class EntryExitEngine {
       paperOnly: params.paperOnly ?? false,
     };
 
+    // Freeze the new shadow model's prediction at signal creation using only real
+    // candles available at that time. Never reconstruct these features at settlement.
+    const predictionCandleMs = params.signalCandle.timestampMs;
+    if (params.signalCandle.source !== 'synthetic' &&
+        Number.isFinite(predictionCandleMs) &&
+        predictionCandleMs > 0) {
+      const causalByTimestamp = new Map<number, Candle>();
+      for (const candle of db.getCandles(params.symbol, 500)) {
+        if (candle && candle.source !== 'synthetic' &&
+            Number.isFinite(candle.timestampMs) &&
+            candle.timestampMs <= predictionCandleMs) {
+          causalByTimestamp.set(candle.timestampMs, candle);
+        }
+      }
+      causalByTimestamp.set(predictionCandleMs, params.signalCandle);
+      const predictionHistory = Array.from(causalByTimestamp.values())
+        .sort((a, b) => a.timestampMs - b.timestampMs)
+        .slice(-500);
+      if (predictionHistory.length >= 20 &&
+          predictionHistory[predictionHistory.length - 1].timestampMs === predictionCandleMs) {
+        const marketFeatureVector = agiSelfLearningEngine.extractFeatureVector(
+          params.signalCandle,
+          predictionHistory,
+        );
+        if (marketFeatureVector.length === 19 && marketFeatureVector.every(Number.isFinite)) {
+          const prediction = db.predictOnlineOutcome({
+            symbol: params.symbol,
+            direction: params.direction,
+            ruleFamily: params.ruleFamily,
+            marketFeatureVector,
+          });
+          signal.marketFeatureVector = [...marketFeatureVector];
+          signal.onlineLearnerPrediction = prediction.probability;
+          signal.onlineLearnerSampleSize = prediction.sampleSize;
+          signal.onlineLearnerVersion = prediction.version;
+        }
+      }
+    }
+
     return db.addSignal(signal);
   }
 
@@ -470,7 +509,7 @@ export class EntryExitEngine {
           });
 
           // Continuous AGI & Online Neural Closed-Loop Learning (strictly causal entry-time features)
-          this.triggerClosedLoopLearning(signal, candles);
+          
 
           changed = true;
         } else if (isTest && newestCandle.timestampMs + 60_000 > plannedExitMs) {
@@ -518,7 +557,7 @@ export class EntryExitEngine {
               price: exitPrice,
             });
 
-            this.triggerClosedLoopLearning(signal, candles);
+            
             changed = true;
           } else if (signal.lifecycleState === 'ACTIVE') {
             signal.lifecycleState = 'EXIT_PENDING';
@@ -566,14 +605,20 @@ export class EntryExitEngine {
               price: exitPrice,
             });
 
-            this.triggerClosedLoopLearning(signal, candles);
+            
             changed = true;
           }
         }
       }
 
       if (changed) {
+        // updateSignal synchronously persists a newly CLOSED result before any
+        // downstream model, bandit, or episodic-memory update can run.
         db.updateSignal(signal);
+        if (signal.lifecycleState === 'CLOSED' &&
+            (signal.outcomeResult === 'WIN' || signal.outcomeResult === 'LOSS')) {
+          this.triggerClosedLoopLearning(signal, candles);
+        }
         updatedSignals.push(signal);
       }
     }

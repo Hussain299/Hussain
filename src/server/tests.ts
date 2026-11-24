@@ -11,6 +11,13 @@ import { entryExitEngine } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { telegramService } from './telegramService.js';
+import {
+  createInitialOnlineLearnerState,
+  getOnlineLearnerSummary,
+  learnOnlineOutcome,
+  predictOnlineOutcome,
+  replayOnlineLearnerHistory,
+} from './onlineLearning.js';
 
 const makeM1TestCandles = (symbol: ForexSymbol, count: number): Candle[] =>
   dataFeedEngine.generateRealisticHistoricalCandles(symbol, count).map(c => {
@@ -56,6 +63,148 @@ export async function runAllVerificationTests(): Promise<{
       });
     }
   };
+
+  await runTest('ML', 'FTRL learner starts neutral, updates only from verified WIN/LOSS and stays shadow-only', () => {
+    const context = {
+      symbol: 'EUR/USD',
+      direction: 'BUY' as const,
+      ruleFamily: 'momentum_5',
+      marketFeatureVector: Array(19).fill(0.1),
+    };
+    let model = createInitialOnlineLearnerState();
+    const first = predictOnlineOutcome(model, context);
+    if (first.probability !== 0.5 || first.sampleSize !== 0 ||
+        first.status !== 'WARMUP' || first.isActionable !== false) {
+      throw new Error('A fresh learner must start neutral, in warmup, and non-actionable.');
+    }
+    for (let index = 0; index < 100; index++) {
+      const prediction = predictOnlineOutcome(model, context);
+      model = learnOnlineOutcome(
+        model,
+        context,
+        'WIN',
+        prediction.probability,
+        new Date(Date.UTC(2026, 10, 1, 0, index)).toISOString(),
+      );
+    }
+    const learned = predictOnlineOutcome(model, context);
+    const summary = getOnlineLearnerSummary(model);
+    if (!(learned.probability > first.probability) || learned.sampleSize !== 100 ||
+        learned.status !== 'SHADOW_ONLY' || learned.isActionable !== false ||
+        summary.mode !== 'SHADOW_ONLY' || summary.isUsedForTradeSelection !== false ||
+        summary.sampleCount !== 100 || !Number.isFinite(summary.meanBrierScore) ||
+        !(summary.brierSkillVs50Baseline! > 0)) {
+      throw new Error('Verified outcomes should update telemetry without making the learner actionable.');
+    }
+    let scratchRejected = false;
+    try {
+      learnOnlineOutcome(model, context, 'SCRATCH' as any, 0.5);
+    } catch {
+      scratchRejected = true;
+    }
+    if (!scratchRejected) throw new Error('SCRATCH must not become a directional online-learning label.');
+  });
+
+  await runTest('ML', 'Online learner detects sustained prequential error drift without changing trade behavior', () => {
+    const context = {
+      symbol: 'GBP/USD',
+      direction: 'SELL' as const,
+      ruleFamily: 'wick_reversal',
+      marketFeatureVector: Array(19).fill(-0.1),
+    };
+    let model = createInitialOnlineLearnerState();
+    for (let index = 0; index < 40; index++) {
+      model = learnOnlineOutcome(
+        model, context, 'WIN', 0.99,
+        new Date(Date.UTC(2026, 10, 2, 0, index)).toISOString(),
+      );
+    }
+    for (let index = 40; index < 90; index++) {
+      model = learnOnlineOutcome(
+        model, context, 'LOSS', 0.99,
+        new Date(Date.UTC(2026, 10, 2, 0, index)).toISOString(),
+      );
+    }
+    const summary = getOnlineLearnerSummary(model);
+    if (summary.driftEvents < 1 || !summary.lastDriftAt ||
+        summary.mode !== 'SHADOW_ONLY' || summary.isUsedForTradeSelection !== false) {
+      throw new Error('Sustained prequential error should raise drift telemetry only.');
+    }
+  });
+
+  await runTest('ML', 'Chronological learner replay prevents overlapping-trade lookahead leakage', () => {
+    const context = {
+      symbol: 'EUR/USD',
+      direction: 'BUY' as const,
+      ruleFamily: 'momentum_5',
+      marketFeatureVector: Array(19).fill(0.15),
+    };
+    const replay = replayOnlineLearnerHistory([
+      {
+        signalId: 'replay-a',
+        predictionTimeUtc: '2026-11-03T00:00:00.000Z',
+        outcomeTimeUtc: '2026-11-03T00:10:00.000Z',
+        outcome: 'WIN',
+        context,
+      },
+      {
+        signalId: 'replay-b',
+        predictionTimeUtc: '2026-11-03T00:05:00.000Z',
+        outcomeTimeUtc: '2026-11-03T00:15:00.000Z',
+        outcome: 'LOSS',
+        context,
+      },
+      {
+        signalId: 'replay-c',
+        predictionTimeUtc: '2026-11-03T00:10:00.000Z',
+        outcomeTimeUtc: '2026-11-03T00:20:00.000Z',
+        outcome: 'WIN',
+        context,
+      },
+      {
+        signalId: 'replay-d',
+        predictionTimeUtc: '2026-11-03T00:11:00.000Z',
+        outcomeTimeUtc: '2026-11-03T00:21:00.000Z',
+        outcome: 'WIN',
+        context,
+      },
+    ]);
+    const a = replay.decisionProbabilities.get('replay-a');
+    const b = replay.decisionProbabilities.get('replay-b');
+    const c = replay.decisionProbabilities.get('replay-c');
+    const d = replay.decisionProbabilities.get('replay-d');
+    if (a !== 0.5 || b !== 0.5 || c !== 0.5 || !(d! > 0.5)) {
+      throw new Error('A later or same-time settlement leaked into an earlier prediction.');
+    }
+    if (replay.state.sampleCount !== 4 || replay.processedSignalIds.length !== 4 ||
+        replay.reconstructedPredictions !== 4) {
+      throw new Error('Replay did not process every verified outcome exactly once.');
+    }
+  });
+
+  await runTest('SYSTEM', 'Unfilled and cancelled setups cannot enter the forward outcome ledger', () => {
+    let rejected = false;
+    try {
+      db.recordForwardObservation({
+        id: 'test_unfilled_forward_observation',
+        lifecycleState: 'EXPIRED',
+        outcomeResult: 'CANCELLED',
+      } as ResearchSignal);
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw new Error('An expired unfilled setup was accepted as a forward trade observation.');
+  });
+
+  await runTest('SYSTEM', 'Learning diagnostics expose recovery state without raw feature vectors', () => {
+    const diagnostics = db.getEvolutionDiagnostics();
+    if (!diagnostics.signals || !diagnostics.learning ||
+        !diagnostics.learning.onlineLearner ||
+        diagnostics.learning.onlineLearner.mode !== 'SHADOW_ONLY' ||
+        diagnostics.learning.onlineLearner.isUsedForTradeSelection !== false) {
+      throw new Error('Learning diagnostics are missing required shadow-mode health fields.');
+    }
+  });
 
   await runTest('DATA', 'Binary payout settlement (win, loss, push and payout floor)', () => {
     const win = calculateBinarySettlement('BUY', 1.10000, 1.10010, 80);
@@ -450,8 +599,9 @@ export async function runAllVerificationTests(): Promise<{
 
   await runTest('SYSTEM', 'Telegram Bot Configuration & Signal Dispatch Engine', () => {
     const cfg = db.getTelegramConfig();
-    if (!cfg.botToken || !cfg.botToken.startsWith('8386549882:')) {
-      throw new Error(`Invalid Telegram bot token configuration: ${cfg.botToken}`);
+    const expectedToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    if ((cfg.botToken || '').trim() !== expectedToken) {
+      throw new Error('Telegram credential must come from host configuration, not a hard-coded or committed fallback.');
     }
     if (cfg.minConfidence < 0.5 || cfg.minConfidence > 1.0) {
       throw new Error(`Invalid Telegram minConfidence threshold: ${cfg.minConfidence}`);

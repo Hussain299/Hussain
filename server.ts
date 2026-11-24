@@ -4,14 +4,13 @@
  */
 
 import express from 'express';
-import dotenv from 'dotenv';
+import 'dotenv/config';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { apiRouter } from './src/server/api.js';
 import { autonomousScheduler } from './src/server/scheduler.js';
 import { db } from './src/server/db.js';
 
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -115,6 +114,16 @@ async function startServer() {
       res.status(500).json({ error: err?.message || 'Internal server error' });
     }
   });
+
+  // Recover completed learning work before new scheduler decisions can run.
+  const outcomeRecovery = db.reconcileClosedSignalLearning();
+  const onlineReplay = db.rebuildOnlineLearnerFromHistory();
+  console.info(
+    '[Learning] Startup recovery complete: ' +
+    onlineReplay.replayedOutcomes + ' shadow outcomes replayed; ' +
+    outcomeRecovery.forwardObservationsRecovered + ' forward observations and ' +
+    outcomeRecovery.strategyOutcomesRecovered + ' strategy outcomes recovered.',
+  );
 
   // Open HTTP port immediately so health checks, /api/cron/tick, and Nginx proxy connections succeed right away
   app.listen(PORT, HOST, () => {

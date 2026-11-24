@@ -28,6 +28,17 @@ import {
   TelegramSubscriber,
 } from '../types/index.js';
 import { getSessionFromTimestamp } from './dataFeeds.js';
+import {
+  createInitialOnlineLearnerState,
+  getOnlineLearnerSummary,
+  learnOnlineOutcome,
+  normalizeOnlineLearnerState,
+  predictOnlineOutcome as scoreOnlineOutcome,
+  replayOnlineLearnerHistory,
+  ONLINE_LEARNER_VERSION,
+  type OnlineLearningContext,
+  type OnlineLearnerState,
+} from './onlineLearning.js';
 
 interface DatabaseSchema {
   candles: Record<string, Candle[]>;
@@ -40,6 +51,14 @@ interface DatabaseSchema {
   synthesizedStrategies: SynthesizedStrategyGene[];
   lossAutopsies: LossAutopsy[];
   strategyPerformance: Record<string, StrategyPerformanceRecord>;
+  /** Lifetime idempotency ledger, independent of bounded UI/history arrays. */
+  processedOutcomeIds: string[];
+  /** Lifetime forward-observation ledger, independent of the 120-row experiment display. */
+  recordedForwardObservationIds: string[];
+  /** Signals already used to update the shadow-only online classifier. */
+  onlineLearnerProcessedSignalIds: string[];
+  /** Prequential FTRL model; never connected to trade selection or execution. */
+  onlineLearner: OnlineLearnerState;
   behaviouralMemory?: BehavioralMemoryRecord[];
   botHealthState?: BotSelfMonitoringState;
   shadowComparison?: ShadowModeComparison;
@@ -127,6 +146,28 @@ class DatabaseService {
         if (!Array.isArray(parsed.lossAutopsies)) parsed.lossAutopsies = [];
         if (!Array.isArray(parsed.behaviouralMemory)) parsed.behaviouralMemory = [];
         if (!parsed.strategyPerformance || typeof parsed.strategyPerformance !== 'object') parsed.strategyPerformance = {};
+        // Backfill lifetime idempotency ledgers from records already persisted by older versions.
+        // This prevents re-counting outcomes that are already present in strategyPerformance or experiments.
+        const legacyStrategySignalIds = Object.values(parsed.strategyPerformance || {})
+          .flatMap((record: any) => Array.isArray(record?.signalIds)
+            ? record.signalIds.filter((id: any) => typeof id === 'string')
+            : []);
+        const legacyForwardSignalIds = (Array.isArray(parsed.experiments) ? parsed.experiments : [])
+          .filter((experiment: any) =>
+            experiment?.experimentType === 'FORWARD_OBSERVATION' &&
+            typeof experiment.id === 'string' &&
+            experiment.id.startsWith('exp_forward_'))
+          .map((experiment: any) => experiment.id.slice('exp_forward_'.length));
+        parsed.processedOutcomeIds = [...new Set([
+          ...(Array.isArray(parsed.processedOutcomeIds) ? parsed.processedOutcomeIds : []),
+          ...legacyStrategySignalIds,
+        ])];
+        parsed.recordedForwardObservationIds = [...new Set([
+          ...(Array.isArray(parsed.recordedForwardObservationIds) ? parsed.recordedForwardObservationIds : []),
+          ...legacyForwardSignalIds,
+        ])];
+        if (!Array.isArray(parsed.onlineLearnerProcessedSignalIds)) parsed.onlineLearnerProcessedSignalIds = [];
+        parsed.onlineLearner = normalizeOnlineLearnerState(parsed.onlineLearner);
         // Historical versions wrote fabricated strategy accuracy values. Never trust them
         // without stored untouched-test evidence; quarantine all such legacy candidates.
         if (Array.isArray(parsed.synthesizedStrategies)) {
@@ -304,7 +345,7 @@ class DatabaseService {
         if (!parsed.telegramConfig || typeof parsed.telegramConfig !== 'object') {
           parsed.telegramConfig = {
             enabled: true,
-            botToken: process.env.TELEGRAM_BOT_TOKEN || '8386549882:AAGoRrh5Uynquu1Qk0oLpZiL6EpZwHuhnkA',
+            botToken: process.env.TELEGRAM_BOT_TOKEN || '',
             botUsername: 'Forex_new_calender_bot',
             botFirstName: 'Forex news',
             subscribers: [],
@@ -312,6 +353,10 @@ class DatabaseService {
             notifyOnSettlement: true,
             minConfidence: 0.70,
           };
+        }
+        // Telegram credentials must come from host secrets, never a committed database snapshot.
+        if (parsed.telegramConfig) {
+          parsed.telegramConfig.botToken = process.env.TELEGRAM_BOT_TOKEN || '';
         }
         return parsed;
       }
@@ -330,9 +375,13 @@ class DatabaseService {
       synthesizedStrategies: this.generateSeedSynthesizedGenes(),
       lossAutopsies: [],
       strategyPerformance: {},
+      processedOutcomeIds: [],
+      recordedForwardObservationIds: [],
+      onlineLearnerProcessedSignalIds: [],
+      onlineLearner: createInitialOnlineLearnerState(),
       telegramConfig: {
         enabled: true,
-        botToken: process.env.TELEGRAM_BOT_TOKEN || '8386549882:AAGoRrh5Uynquu1Qk0oLpZiL6EpZwHuhnkA',
+        botToken: process.env.TELEGRAM_BOT_TOKEN || '',
         botUsername: 'Forex_new_calender_bot',
         botFirstName: 'Forex news',
         subscribers: [],
@@ -608,6 +657,21 @@ class DatabaseService {
     );
   }
 
+  /** Only a real filled and fully resolved contract may enter forward-learning ledgers. */
+  private isRecoverableSettledSignal(signal?: ResearchSignal | null): boolean {
+    return Boolean(
+      this.isSettledSignal(signal) &&
+      typeof signal!.actualEntryTimeUtc === 'string' &&
+      Number.isFinite(Date.parse(signal!.actualEntryTimeUtc!)) &&
+      Number.isFinite(signal!.actualEntryPrice) &&
+      typeof signal!.actualExitTimeUtc === 'string' &&
+      Number.isFinite(Date.parse(signal!.actualExitTimeUtc!)) &&
+      Number.isFinite(signal!.actualExitPrice) &&
+      Number.isFinite(signal!.netReturnUnits) &&
+      Number.isFinite(signal!.payoutPct)
+    );
+  }
+
   private mergeImmutableSettledSignal(existing: ResearchSignal, incoming: ResearchSignal): ResearchSignal {
     // Once a signal is CLOSED with WIN/LOSS/SCRATCH, all settlement fields are permanently locked.
     // Only allow attaching forensic lossAutopsy and telegramAuditSentAt metadata if not yet recorded.
@@ -692,9 +756,10 @@ class DatabaseService {
       const existing = this.state.signals[idx];
       const merged = this.mergeImmutableSettledSignal(existing, signal);
       this.state.signals[idx] = merged;
-      // Atomically flush asynchronously whenever a trade settles without blocking the event loop
+      // The CLOSED signal is the source of truth for every derived learner.
+      // Persist it synchronously before any model or strategy-ledger updates occur.
       if (this.isSettledSignal(merged) && !this.isSettledSignal(existing)) {
-        void this.flushAsync();
+        this.saveStateSync();
       } else {
         this.scheduleSave('high');
       }
@@ -818,6 +883,20 @@ class DatabaseService {
    * independently validate a strategy or train model weights.
    */
   public recordForwardObservation(sig: ResearchSignal): ResearchExperiment {
+    if (!this.isRecoverableSettledSignal(sig)) {
+      throw new Error('Forward observations require a filled, CLOSED contract with a verified settlement, price, and payout.');
+    }
+    if (!Array.isArray(this.state.recordedForwardObservationIds)) this.state.recordedForwardObservationIds = [];
+    const existing = this.state.experiments.find(exp => exp.id === `exp_forward_${sig.id}`);
+    if (existing) {
+      if (!this.state.recordedForwardObservationIds.includes(sig.id)) {
+        this.state.recordedForwardObservationIds.push(sig.id);
+        this.scheduleSave('high');
+      }
+      return existing;
+    }
+    // A lifetime ledger may outlive the bounded display row. In that case
+    // return the reconstructed record without inserting or counting it again.
     const netPips = sig.netReturnPips ?? 0;
     const netReturnUnits = sig.netReturnUnits ?? 0;
     const sessionName = sig.marketSessionName || 'Market Session';
@@ -976,12 +1055,31 @@ class DatabaseService {
   }
 
   // Experiments
-  public addExperiment(exp: ResearchExperiment) {
+  public addExperiment(exp: ResearchExperiment): boolean {
+    const existing = this.state.experiments.find(item => item.id === exp.id);
+    if (existing) {
+      if (exp.experimentType === 'FORWARD_OBSERVATION' && exp.id.startsWith('exp_forward_')) {
+        const signalId = exp.id.slice('exp_forward_'.length);
+        if (!Array.isArray(this.state.recordedForwardObservationIds)) this.state.recordedForwardObservationIds = [];
+        if (!this.state.recordedForwardObservationIds.includes(signalId)) {
+          this.state.recordedForwardObservationIds.push(signalId);
+          this.scheduleSave('high');
+        }
+      }
+      return false;
+    }
+    if (exp.experimentType === 'FORWARD_OBSERVATION' && exp.id.startsWith('exp_forward_')) {
+      const signalId = exp.id.slice('exp_forward_'.length);
+      if (!Array.isArray(this.state.recordedForwardObservationIds)) this.state.recordedForwardObservationIds = [];
+      if (this.state.recordedForwardObservationIds.includes(signalId)) return false;
+      this.state.recordedForwardObservationIds.push(signalId);
+    }
     this.state.experiments.unshift(exp);
     if (this.state.experiments.length > 120) {
       this.state.experiments = this.state.experiments.slice(0, 120);
     }
     this.scheduleSave('low');
+    return true;
   }
 
   public getExperiments(): ResearchExperiment[] {
@@ -1092,6 +1190,17 @@ class DatabaseService {
     existing.negativeReturnUnits = Number.isFinite(existing.negativeReturnUnits) ? existing.negativeReturnUnits! : 0;
     existing.minimumPayoutPct = Number.isFinite(existing.minimumPayoutPct) ? existing.minimumPayoutPct! : 100;
 
+    if (!this.isRecoverableSettledSignal(signal)) return { ...existing };
+    if (!Array.isArray(this.state.processedOutcomeIds)) this.state.processedOutcomeIds = [];
+    if (this.state.processedOutcomeIds.includes(signal.id)) return { ...existing };
+    if (existing.signalIds.includes(signal.id)) {
+      // Repair the global ledger if a legacy per-strategy ledger already contains this outcome.
+      this.state.processedOutcomeIds.push(signal.id);
+      this.scheduleSave('high');
+      return { ...existing };
+    }
+    this.state.processedOutcomeIds.push(signal.id);
+
     // Only settled binary outcomes count. Legacy pip-only observations are not
     // eligible for the new payout-aware forward approval gate.
     if (!['WIN', 'LOSS', 'SCRATCH'].includes(signal.outcomeResult) ||
@@ -1101,7 +1210,6 @@ class DatabaseService {
     }
 
     // A duplicate lifecycle update must never inflate the trade sample.
-    if (existing.signalIds.includes(signal.id)) return { ...existing };
     existing.signalIds.push(signal.id);
     if (existing.signalIds.length > 600) existing.signalIds = existing.signalIds.slice(-600);
 
@@ -1132,6 +1240,35 @@ class DatabaseService {
     }
     existing.updatedAt = new Date().toISOString();
     this.state.strategyPerformance[strategyId] = existing;
+
+    // Train the separate FTRL model only from the frozen prediction and a verified
+    // filled WIN/LOSS. SCRATCH is tracked in strategy metrics but is not a class label.
+    if ((signal.outcomeResult === 'WIN' || signal.outcomeResult === 'LOSS') &&
+        !this.state.onlineLearnerProcessedSignalIds.includes(signal.id) &&
+        signal.onlineLearnerVersion === ONLINE_LEARNER_VERSION &&
+        Number.isFinite(signal.onlineLearnerPrediction) &&
+        signal.onlineLearnerPrediction! >= 0 && signal.onlineLearnerPrediction! <= 1 &&
+        Array.isArray(signal.marketFeatureVector) &&
+        signal.marketFeatureVector.length === 19 &&
+        signal.marketFeatureVector.every(Number.isFinite)) {
+      const context: OnlineLearningContext = {
+        symbol: signal.symbol,
+        direction: signal.direction,
+        ruleFamily: signal.ruleFamily,
+        marketFeatureVector: signal.marketFeatureVector,
+      };
+      const observedAt = signal.actualExitTimeUtc || signal.plannedExitTimeUtc || '';
+      if (Number.isFinite(Date.parse(observedAt))) {
+        this.state.onlineLearner = learnOnlineOutcome(
+          this.state.onlineLearner,
+          context,
+          signal.outcomeResult,
+          signal.onlineLearnerPrediction!,
+          observedAt,
+        );
+        this.state.onlineLearnerProcessedSignalIds.push(signal.id);
+      }
+    }
 
     const gene = this.getSynthesizedStrategyById(strategyId);
     if (gene && gene.status !== 'REJECTED') {
@@ -1199,6 +1336,127 @@ class DatabaseService {
 
   public getStrategyPerformance(): StrategyPerformanceRecord[] {
     return Object.values(this.state.strategyPerformance || {}).sort((a, b) => b.trades - a.trades);
+  }
+
+  public predictOnlineOutcome(context: OnlineLearningContext) {
+    return scoreOnlineOutcome(this.state.onlineLearner, context);
+  }
+
+  /** Rebuild the shadow learner by event time, never by array order or settlement order. */
+  public rebuildOnlineLearnerFromHistory() {
+    const candidates = this.getSignals().filter(signal =>
+      this.isRecoverableSettledSignal(signal) &&
+      (signal.outcomeResult === 'WIN' || signal.outcomeResult === 'LOSS') &&
+      Array.isArray(signal.marketFeatureVector) &&
+      signal.marketFeatureVector.length === 19 &&
+      signal.marketFeatureVector.every(Number.isFinite) &&
+      Number.isFinite(Date.parse(signal.predictionTimeUtc)) &&
+      Date.parse(signal.actualEntryTimeUtc!) >= Date.parse(signal.predictionTimeUtc) &&
+      Date.parse(signal.actualExitTimeUtc!) > Date.parse(signal.predictionTimeUtc)
+    );
+
+    const replay = replayOnlineLearnerHistory(candidates.map(signal => ({
+      signalId: signal.id,
+      predictionTimeUtc: signal.predictionTimeUtc,
+      outcomeTimeUtc: signal.actualExitTimeUtc!,
+      outcome: signal.outcomeResult as 'WIN' | 'LOSS',
+      context: {
+        symbol: signal.symbol,
+        direction: signal.direction,
+        ruleFamily: signal.ruleFamily,
+        marketFeatureVector: signal.marketFeatureVector!,
+      },
+      storedPrediction: signal.onlineLearnerPrediction,
+      storedVersion: signal.onlineLearnerVersion,
+    })));
+
+    this.state.onlineLearner = replay.state;
+    this.state.onlineLearnerProcessedSignalIds = replay.processedSignalIds;
+    this.saveStateSync();
+    return {
+      replayedOutcomes: replay.processedSignalIds.length,
+      reconstructedPredictions: replay.reconstructedPredictions,
+      learner: getOnlineLearnerSummary(replay.state),
+      completedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Repair CLOSED filled outcomes whose derived ledgers were interrupted by a process crash. */
+  public reconcileClosedSignalLearning() {
+    const closedSignals = this.getSignals()
+      .filter(signal => this.isRecoverableSettledSignal(signal))
+      .sort((a, b) =>
+        Date.parse(a.actualExitTimeUtc || '') - Date.parse(b.actualExitTimeUtc || '') ||
+        a.id.localeCompare(b.id)
+      );
+
+    let forwardObservationsRecovered = 0;
+    let strategyOutcomesRecovered = 0;
+
+    for (const signal of closedSignals) {
+      if (!this.state.recordedForwardObservationIds.includes(signal.id)) {
+        this.recordForwardObservation(signal);
+        if (this.state.recordedForwardObservationIds.includes(signal.id)) forwardObservationsRecovered++;
+      }
+      if (!this.state.processedOutcomeIds.includes(signal.id)) {
+        this.recordStrategyOutcome(signal);
+        if (this.state.processedOutcomeIds.includes(signal.id)) strategyOutcomesRecovered++;
+      }
+    }
+
+    if (forwardObservationsRecovered > 0 || strategyOutcomesRecovered > 0) this.saveStateSync();
+    return {
+      scannedClosedSignals: closedSignals.length,
+      forwardObservationsRecovered,
+      strategyOutcomesRecovered,
+      onlineLearnerProcessedSignals: this.state.onlineLearnerProcessedSignalIds.length,
+      alreadyProcessed: closedSignals.filter(signal => this.state.processedOutcomeIds.includes(signal.id)).length,
+      completedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Compact operational diagnostics; raw feature vectors and credentials are never returned. */
+  public getEvolutionDiagnostics() {
+    const signals = this.getSignals();
+    const countBy = (values: string[]) => values.reduce<Record<string, number>>((counts, value) => {
+      counts[value] = (counts[value] || 0) + 1;
+      return counts;
+    }, {});
+    const closed = signals.filter(signal => this.isSettledSignal(signal));
+    const filled = signals.filter(signal => Boolean(signal.actualEntryTimeUtc) && Number.isFinite(signal.actualEntryPrice));
+    const terminalUnfilled = signals.filter(signal =>
+      ['EXPIRED', 'INVALIDATED', 'AMBIGUOUS'].includes(signal.lifecycleState) &&
+      !signal.actualEntryTimeUtc && !Number.isFinite(signal.actualEntryPrice)
+    );
+    const forwardIds = new Set(this.state.recordedForwardObservationIds || []);
+    const outcomeIds = new Set(this.state.processedOutcomeIds || []);
+    const recoverable = closed.filter(signal => this.isRecoverableSettledSignal(signal));
+    return {
+      generatedAt: new Date().toISOString(),
+      signals: {
+        total: signals.length,
+        lifecycleCounts: countBy(signals.map(signal => signal.lifecycleState)),
+        outcomeCounts: countBy(signals.map(signal => signal.outcomeResult)),
+        filledSignals: filled.length,
+        terminalUnfilledSignals: terminalUnfilled.length,
+        entryFillRatePct: filled.length + terminalUnfilled.length
+          ? Number((filled.length / (filled.length + terminalUnfilled.length) * 100).toFixed(2))
+          : null,
+        closedSettled: closed.length,
+        recoverableClosedFilled: recoverable.length,
+      },
+      learning: {
+        processedOutcomeIds: outcomeIds.size,
+        forwardObservationIds: forwardIds.size,
+        closedMissingForwardObservation: recoverable.filter(signal => !forwardIds.has(signal.id)).length,
+        closedMissingStrategyUpdate: recoverable.filter(signal => !outcomeIds.has(signal.id)).length,
+        episodicMemoryTrades: (this.state.episodicMemories || []).length,
+        onlineLearner: {
+          ...getOnlineLearnerSummary(this.state.onlineLearner),
+          processedSignalCount: this.state.onlineLearnerProcessedSignalIds.length,
+        },
+      },
+    };
   }
 
   // Autonomous Forensic Loss Autopsies & Self-Learning
@@ -1692,7 +1950,7 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
     if (!this.state.telegramConfig) {
       this.state.telegramConfig = {
         enabled: true,
-        botToken: process.env.TELEGRAM_BOT_TOKEN || '8386549882:AAGoRrh5Uynquu1Qk0oLpZiL6EpZwHuhnkA',
+        botToken: process.env.TELEGRAM_BOT_TOKEN || '',
         botUsername: 'Forex_new_calender_bot',
         botFirstName: 'Forex news',
         subscribers: [],

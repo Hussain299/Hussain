@@ -101,7 +101,7 @@ export class TelegramService {
 
   private getBotToken(): string {
     const config = db.getTelegramConfig();
-    return (config.botToken || process.env.TELEGRAM_BOT_TOKEN || '8386549882:AAGoRrh5Uynquu1Qk0oLpZiL6EpZwHuhnkA').trim();
+    return (config.botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
   }
 
   private getApiUrl(method: string): string {
