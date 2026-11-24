@@ -128,7 +128,7 @@ export const ConfigurationView: React.FC = () => {
           <span>Local JSON persistence · Public market-data feeds</span>
         </div>
         <p className="text-[#AAB4BF] leading-relaxed text-[11px]">
-          Cloudflare D1 is optional. Live prices depend on configured public market-data providers. Historical research requires imported one-minute candles; these are stored locally in monthly JSON partitions, separately from the rolling live-feed cache. The configured universe contains 20 currency pairs.
+          Cloudflare D1 is optional. Live prices depend on configured public market-data providers. Historical research requires imported one-minute candles; these are stored locally in monthly JSON partitions, separately from the rolling live-feed cache. The configured universe contains 29 Olymp Trade-ranked currency pairs (80% minimum payout observation sample).
         </p>
       </div>
 
