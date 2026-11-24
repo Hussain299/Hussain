@@ -6,17 +6,28 @@
  * It is permanently shadow-only: its score is telemetry, never a trade gate.
  */
 
-export const ONLINE_LEARNER_VERSION = 'ftrl-logistic-shadow-v1';
+export const ONLINE_LEARNER_VERSION = 'ftrl-logistic-shadow-v2-olymp-29-pairs';
 export const ONLINE_LEARNER_MIN_REPORTING_SAMPLE = 100;
-export const ONLINE_LEARNER_FEATURE_DIMENSIONS = 47;
+export const ONLINE_LEARNER_FEATURE_DIMENSIONS = 56;
 
 const MARKET_FEATURE_COUNT = 19;
 const SYMBOLS = [
+  'USD/MXN', 'AUD/JPY', 'AUD/USD', 'EUR/AUD', 'EUR/JPY', 'EUR/NZD',
+  'EUR/USD', 'GBP/CAD', 'GBP/JPY', 'GBP/NZD', 'NZD/CAD', 'USD/CAD',
+  'USD/CHF', 'EUR/CAD', 'NZD/JPY', 'CHF/JPY', 'NZD/USD', 'AUD/CHF',
+  'AUD/NZD', 'EUR/GBP', 'GBP/USD', 'EUR/CHF', 'NZD/CHF', 'AUD/CAD',
+  'USD/JPY', 'GBP/AUD', 'GBP/CHF', 'CAD/JPY', 'CAD/CHF',
+] as const;
+
+// Previous 20-pair feature layout, retained solely to migrate saved v1 weights.
+const LEGACY_SYMBOLS = [
   'EUR/USD', 'GBP/USD', 'USD/JPY', 'EUR/JPY', 'AUD/USD', 'USD/CAD',
   'EUR/GBP', 'AUD/CAD', 'AUD/CHF', 'AUD/JPY', 'AUD/NZD', 'EUR/AUD',
   'EUR/CAD', 'EUR/CHF', 'EUR/NZD', 'GBP/AUD', 'GBP/CAD', 'GBP/CHF',
   'GBP/JPY', 'GBP/NZD',
 ] as const;
+const LEGACY_FEATURE_DIMENSIONS = 47;
+
 const RULE_FAMILIES = [
   'momentum_5',
   'mean_reversion_20',
@@ -25,7 +36,6 @@ const RULE_FAMILIES = [
   'volatility_squeeze',
   'order_flow_imbalance',
 ] as const;
-
 const FTRL_ALPHA = 0.05;
 const FTRL_BETA = 1;
 const FTRL_L1 = 0.0001;
@@ -116,12 +126,36 @@ export function normalizeOnlineLearnerState(value: unknown): OnlineLearnerState 
   const initial = createInitialOnlineLearnerState();
   if (!value || typeof value !== 'object') return initial;
   const candidate = value as Partial<OnlineLearnerState>;
-  const validVector = (vector: unknown): vector is number[] =>
-    Array.isArray(vector) &&
-    vector.length === ONLINE_LEARNER_FEATURE_DIMENSIONS &&
-    vector.every(item => Number.isFinite(item));
-  const z = validVector(candidate.z) ? [...candidate.z] : initial.z;
-  const n = validVector(candidate.n) ? candidate.n.map(item => Math.max(0, item)) : initial.n;
+  const migrateVector = (value: unknown): number[] => {
+    if (!Array.isArray(value) || !value.every(item => Number.isFinite(item))) {
+      return [...initial.z];
+    }
+    if (value.length === ONLINE_LEARNER_FEATURE_DIMENSIONS) return [...value];
+
+    // Expand the old layout without losing learned weights:
+    // [bias, 19 market features, 20 pair flags, direction, 6 strategy flags]
+    // becomes [bias, 19 market features, 29 pair flags, direction, 6 strategy flags].
+    if (value.length === LEGACY_FEATURE_DIMENSIONS) {
+      const migrated = [...initial.z];
+      for (let index = 0; index < 1 + MARKET_FEATURE_COUNT; index++) {
+        migrated[index] = value[index];
+      }
+      LEGACY_SYMBOLS.forEach((symbol, legacyIndex) => {
+        const currentIndex = SYMBOLS.indexOf(symbol as typeof SYMBOLS[number]);
+        if (currentIndex >= 0) migrated[1 + MARKET_FEATURE_COUNT + currentIndex] = value[1 + MARKET_FEATURE_COUNT + legacyIndex];
+      });
+      const currentDirectionIndex = 1 + MARKET_FEATURE_COUNT + SYMBOLS.length;
+      const legacyDirectionIndex = 1 + MARKET_FEATURE_COUNT + LEGACY_SYMBOLS.length;
+      migrated[currentDirectionIndex] = value[legacyDirectionIndex];
+      for (let index = 0; index < RULE_FAMILIES.length; index++) {
+        migrated[currentDirectionIndex + 1 + index] = value[legacyDirectionIndex + 1 + index];
+      }
+      return migrated;
+    }
+    return [...initial.z];
+  };
+  const z = migrateVector(candidate.z);
+  const n = migrateVector(candidate.n).map(item => Math.max(0, item));
   const recentBrierErrors = Array.isArray(candidate.recentBrierErrors)
     ? candidate.recentBrierErrors.filter(item => Number.isFinite(item) && item >= 0 && item <= 1).slice(-MAX_RECENT_ERRORS)
     : [];
