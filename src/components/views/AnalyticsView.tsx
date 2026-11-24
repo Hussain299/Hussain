@@ -24,6 +24,7 @@ import {
   BOT_DEFINITION,
   computeBotPerformance,
 } from '../../utils/botControls.js';
+import { getForwardObservations, summarizeForwardObservations } from '../../utils/tradeAccounting.js';
 
 interface AnalyticsViewProps {
   signals: ResearchSignal[];
@@ -33,72 +34,61 @@ interface AnalyticsViewProps {
 export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experiments }) => {
   const [assetSortKey, setAssetSortKey] = useState<'winRate' | 'trades' | 'netUnits'>('winRate');
 
-  // Completed trades
-  const completedSignals = useMemo(() => {
-    return signals.filter(
-      s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-    );
-  }, [signals]);
+  // The append-only forward journal is the canonical all-time paper-outcome source.
+  const forwardObservations = useMemo(() => getForwardObservations(experiments), [experiments]);
+  const forwardStats = useMemo(() => summarizeForwardObservations(forwardObservations), [forwardObservations]);
+  const wins = forwardStats.wins;
+  const losses = forwardStats.losses;
+  const scratches = forwardStats.scratches;
+  const winRate = forwardStats.winRate;
+  const totalNetUnits = forwardStats.netReturnUnits;
 
-  const scoredSignals = useMemo(() => {
-    return completedSignals.filter(s => s.outcomeResult === 'WIN' || s.outcomeResult === 'LOSS');
-  }, [completedSignals]);
-
-  const wins = scoredSignals.filter(s => s.outcomeResult === 'WIN').length;
-  const losses = scoredSignals.filter(s => s.outcomeResult === 'LOSS').length;
-  const winRate = scoredSignals.length > 0 ? Number(((wins / scoredSignals.length) * 100).toFixed(1)) : null;
-  const totalNetUnits = Number(
-    completedSignals.reduce((sum, s) => sum + (s.netReturnUnits || 0), 0).toFixed(2)
-  );
-  const totalNetPips = Number(
-    completedSignals.reduce((sum, s) => sum + (s.grossReturnPips || 0), 0).toFixed(1)
-  );
-
-  // Unified Autonomous Bot performance metrics
+  // Operational counts such as currently active fills still come from the signal stream.
   const botStats = computeBotPerformance(signals);
 
-  // Cumulative Equity Trajectory Curve Data (chronological)
+  // Cumulative binary return uses each forward record's stored payout units.
+  // No assumed 85% return or forex-pip fallback is applied to missing values.
   const equityPoints = useMemo(() => {
-    const sorted = [...completedSignals].sort((a, b) => {
-      const ta = Date.parse(a.actualExitTimeUtc || a.predictionTimeUtc || '0');
-      const tb = Date.parse(b.actualExitTimeUtc || b.predictionTimeUtc || '0');
-      return ta - tb;
-    });
+    const sorted = forwardObservations
+      .filter(row => typeof row.observedNetReturnUnits === 'number' && Number.isFinite(row.observedNetReturnUnits))
+      .sort((a, b) => {
+        const ta = Date.parse(a.valPeriod?.end || a.createdAt || '0');
+        const tb = Date.parse(b.valPeriod?.end || b.createdAt || '0');
+        return ta - tb;
+      });
 
     let cumUnits = 0;
-    const points: Array<{ index: number; symbol: string; change: number; cumUnits: number; isWin: boolean; time: string }> = [
-      { index: 0, symbol: 'START', change: 0, cumUnits: 0, isWin: true, time: 'Baseline' },
+    const points: Array<{ index: number; symbol: string; change: number; cumUnits: number; isWin: boolean; isScratch: boolean; time: string }> = [
+      { index: 0, symbol: 'START', change: 0, cumUnits: 0, isWin: true, isScratch: false, time: 'Baseline' },
     ];
 
-    sorted.forEach((sig, i) => {
-      const units = sig.netReturnUnits ?? (sig.outcomeResult === 'WIN' ? 0.85 : -1.0);
+    sorted.forEach((row, i) => {
+      const units = row.observedNetReturnUnits as number;
       cumUnits = Number((cumUnits + units).toFixed(2));
       points.push({
         index: i + 1,
-        symbol: sig.symbol,
+        symbol: row.symbol,
         change: units,
         cumUnits,
-        isWin: sig.outcomeResult === 'WIN',
-        time: sig.candleCloseTimeIst || sig.predictionTimeIst || `Trade ${i + 1}`,
+        isWin: row.liveOutcome === 'WIN',
+        isScratch: row.liveOutcome === 'SCRATCH',
+        time: row.valPeriod?.end || row.createdAt || `Outcome ${i + 1}`,
       });
     });
 
     return points;
-  }, [completedSignals]);
+  }, [forwardObservations]);
 
-  // Asset / Currency Pair Breakdown
+  // Asset / Currency Pair Breakdown from retained forward outcomes.
   const pairStats = useMemo(() => {
     return FOREX_PAIRS.map(pair => {
-      const pairTrades = completedSignals.filter(s => s.symbol === pair);
-      const pwins = pairTrades.filter(s => s.outcomeResult === 'WIN').length;
-      const plosses = pairTrades.filter(s => s.outcomeResult === 'LOSS').length;
+      const pairTrades = forwardObservations.filter(row => row.symbol === pair);
+      const pwins = pairTrades.filter(row => row.liveOutcome === 'WIN').length;
+      const plosses = pairTrades.filter(row => row.liveOutcome === 'LOSS').length;
       const scored = pwins + plosses;
       const pwinRate = scored > 0 ? Number(((pwins / scored) * 100).toFixed(1)) : null;
       const pnetUnits = Number(
-        pairTrades.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2)
-      );
-      const ppips = Number(
-        pairTrades.reduce((acc, s) => acc + (s.grossReturnPips || 0), 0).toFixed(1)
+        pairTrades.reduce((acc, row) => acc + (typeof row.observedNetReturnUnits === 'number' ? row.observedNetReturnUnits : 0), 0).toFixed(2)
       );
 
       return {
@@ -109,7 +99,6 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
         losses: plosses,
         winRate: pwinRate,
         netUnits: pnetUnits,
-        netPips: ppips,
       };
     }).sort((a, b) => {
       if (assetSortKey === 'winRate') {
@@ -122,7 +111,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
       }
       return b.netUnits - a.netUnits;
     });
-  }, [completedSignals, assetSortKey]);
+  }, [forwardObservations, assetSortKey]);
 
   // Global Market Session Matrix
   const sessionMatrix = useMemo(() => {
@@ -134,13 +123,13 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
     ];
 
     return sessions.map(sess => {
-      const sTrades = completedSignals.filter(s => s.marketSession === sess.id);
-      const swins = sTrades.filter(s => s.outcomeResult === 'WIN').length;
-      const slosses = sTrades.filter(s => s.outcomeResult === 'LOSS').length;
+      const sTrades = forwardObservations.filter(row => String(row.parameters?.marketSession || '') === sess.id);
+      const swins = sTrades.filter(row => row.liveOutcome === 'WIN').length;
+      const slosses = sTrades.filter(row => row.liveOutcome === 'LOSS').length;
       const scored = swins + slosses;
       const swinRate = scored > 0 ? Number(((swins / scored) * 100).toFixed(1)) : null;
       const snetUnits = Number(
-        sTrades.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2)
+        sTrades.reduce((acc, row) => acc + (typeof row.observedNetReturnUnits === 'number' ? row.observedNetReturnUnits : 0), 0).toFixed(2)
       );
 
       return {
@@ -152,7 +141,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
         netUnits: snetUnits,
       };
     });
-  }, [completedSignals]);
+  }, [forwardObservations]);
 
   // Equity SVG Path Calculation
   const svgWidth = 800;
@@ -191,12 +180,12 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
             </span>
             <span className="text-[#354251]">/</span>
             <span className="text-[#AAB4BF]">
-              Real Execution Data &amp; Payout Curves
+              Candle-Settled Paper Data &amp; Payout Curves
             </span>
           </div>
 
           <div className="text-xs text-[#AAB4BF]">
-            Total Audited Outcomes: <strong className="text-[#E8E5DE]">{completedSignals.length}</strong>
+            Total Forward Outcomes: <strong className="text-[#E8E5DE]">{forwardStats.observations}</strong>
           </div>
         </div>
       </div>
@@ -224,9 +213,9 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                 </span>
               </div>
               <div className="text-right">
-                <span className="text-[10px] text-[#AAB4BF] block uppercase">Displacement</span>
-                <span className={`text-xl font-black tabular-nums ${totalNetPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                  {totalNetPips >= 0 ? `+${totalNetPips}` : totalNetPips} pips
+                <span className="text-[10px] text-[#AAB4BF] block uppercase">Scored Outcomes</span>
+                <span className="text-xl font-black tabular-nums text-[#E8E5DE]">
+                  {forwardStats.scoredOutcomes}
                 </span>
               </div>
             </div>
@@ -327,7 +316,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                     cx={cx}
                     cy={cy}
                     r={3}
-                    fill={p.isWin ? '#72A98B' : '#B7797D'}
+                    fill={p.isScratch ? '#AAB4BF' : p.isWin ? '#72A98B' : '#B7797D'}
                     stroke="#121820"
                     strokeWidth="1.5"
                   />
@@ -361,7 +350,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                   <h3 className="text-base font-black text-[#E8E5DE] mt-0.5">Execution Edge</h3>
                 </div>
                 <span className="px-2 py-0.5 rounded text-[10px] font-bold border bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/30">
-                  REALIZED
+                  PAPER
                 </span>
               </div>
 
@@ -369,19 +358,19 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                 <div className="flex items-center justify-between">
                   <span className="text-[#AAB4BF]">Realized Win Rate:</span>
                   <span className="text-base font-black text-[#E8E5DE] tabular-nums">
-                    {botStats.winRate !== null ? `${botStats.winRate}%` : '—'}
+                    {winRate !== null ? `${winRate}%` : '—'}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-[#AAB4BF]">Record (W / L / S):</span>
                   <span className="text-[#72A98B] font-bold">
-                    {botStats.wins}W / {botStats.losses}L / {botStats.scratches}S
+                    {wins}W / {losses}L / {scratches}S
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-[#AAB4BF]">Settled Trades:</span>
                   <span className="text-[#E8E5DE] font-bold tabular-nums">
-                    {botStats.completedTrades}
+                    {forwardStats.observations}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
@@ -415,20 +404,18 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                 <div className="flex items-center justify-between">
                   <span className="text-[#AAB4BF]">Profit Factor:</span>
                   <span className="text-base font-black text-[#E8E5DE] tabular-nums">
-                    {botStats.profitFactor !== null ? botStats.profitFactor.toFixed(2) : '—'}
+                    {forwardStats.profitFactor !== null ? forwardStats.profitFactor.toFixed(2) : '—'}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-[#AAB4BF]">Net P&amp;L Units:</span>
                   <span className={`font-black ${botStats.netUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                    {botStats.netUnits >= 0 ? `+${botStats.netUnits}` : botStats.netUnits} U
+                    {totalNetUnits >= 0 ? `+${totalNetUnits}` : totalNetUnits} U
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-[#AAB4BF]">Total Displacement:</span>
-                  <span className={`font-bold ${botStats.grossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                    {botStats.grossPips >= 0 ? `+${botStats.grossPips}` : botStats.grossPips} pips
-                  </span>
+                  <span className="text-[#AAB4BF]">Records missing return:</span>
+                  <span className="font-bold text-[#E8E5DE]">{forwardStats.missingReturnCount}</span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-[#AAB4BF]">Target R:R:</span>
@@ -437,7 +424,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
               </div>
 
               <div className="text-[11px] text-[#AAB4BF] leading-relaxed">
-                Calculated strictly on actual broker fill executions and price displacements.
+                Candle-based paper settlement at the saved payout; broker fills are not verified.
               </div>
             </div>
 

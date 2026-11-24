@@ -8,6 +8,7 @@ import { Router, Request, Response } from 'express';
 import { FOREX_PAIRS, ForexSymbol, RuleFamily } from '../types/index.js';
 import { dataFeedEngine } from './dataFeeds.js';
 import { db } from './db.js';
+import { summarizeSignalAccounting } from '../utils/tradeAccounting.js';
 import { entryExitEngine } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
 import { autonomousScheduler } from './scheduler.js';
@@ -186,50 +187,50 @@ apiRouter.get('/signals', (_req: Request, res: Response) => {
   const ONE_DAY_MS = 24 * 60 * 60 * 1000;
   const recent24h = signals.filter(s => {
     const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
-    return nowMs - timeMs <= ONE_DAY_MS;
+    return Number.isFinite(timeMs) && timeMs > 0 && timeMs <= nowMs && nowMs - timeMs <= ONE_DAY_MS;
   });
 
+  const accounting = summarizeSignalAccounting(recent24h);
   const activeTrades = recent24h.filter(s =>
-    s.lifecycleState === 'ACTIVE' && s.actualEntryPrice !== null &&
+    Number.isFinite(s.actualEntryPrice) &&
+    (s.actualEntryPrice ?? 0) > 0 &&
+    s.lifecycleState === 'ACTIVE' &&
     (s.plannedExitTimeUtc ? Date.parse(s.plannedExitTimeUtc) > nowMs : true)
   );
-
   const verifyingTrades = recent24h.filter(s =>
     (s.lifecycleState === 'EXIT_PENDING' || (s.lifecycleState === 'ACTIVE' && s.plannedExitTimeUtc && Date.parse(s.plannedExitTimeUtc) <= nowMs)) &&
-    s.actualEntryPrice !== null &&
+    Number.isFinite(s.actualEntryPrice) &&
+    (s.actualEntryPrice ?? 0) > 0 &&
     s.outcomeResult === 'PENDING'
   );
-
-  const completedTrades = recent24h.filter(s =>
-    s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-  );
-
-  const unexecutedSignals = recent24h.filter(s =>
-    s.actualEntryPrice === null || ['WAITING_FOR_ENTRY', 'DETECTED', 'EXPIRED', 'INVALIDATED', 'AMBIGUOUS'].includes(s.lifecycleState)
-  );
-
-  const wins = completedTrades.filter(t => t.outcomeResult === 'WIN').length;
-  const losses = completedTrades.filter(t => t.outcomeResult === 'LOSS').length;
-  const scratches = completedTrades.filter(t => t.outcomeResult === 'SCRATCH').length;
-  const executedCount = activeTrades.length + verifyingTrades.length + completedTrades.length;
-  const scoredCount = wins + losses;
-  const winRate = scoredCount > 0 ? Number(((wins / scoredCount) * 100).toFixed(1)) : null;
-  const netUnits = Number(completedTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
 
   res.json({
     signals,
     latestPrices,
     todayStats: {
-      executedTradesToday: executedCount,
-      completedCount: completedTrades.length,
+      // Legacy key retained for compatibility; these figures describe the rolling 24-hour window.
+      period: 'rolling_24h',
+      // Explicit categories: a setup is not a trade until an entry fill is recorded.
+      signalSetups: accounting.signalSetups,
+      filledContracts: accounting.filledContracts,
+      settledContracts: accounting.settledContracts,
+      pendingFilledContracts: accounting.pendingFilledContracts,
+      expiredUnfilledSetups: accounting.expiredUnfilledSetups,
+      otherUnfilledSetups: accounting.otherUnfilledSetups,
+      scoredOutcomes: accounting.scoredOutcomes,
+      wins: accounting.wins,
+      losses: accounting.losses,
+      scratches: accounting.scratches,
+      winRate: accounting.winRate,
+      netReturnUnits: accounting.netReturnUnits,
+      missingReturnCount: accounting.missingReturnCount,
+      // Backward-compatible aliases now use their literal meanings.
+      executedTradesToday: accounting.filledContracts,
+      completedCount: accounting.settledContracts,
       activeCount: activeTrades.length,
       verifyingCount: verifyingTrades.length,
-      unexecutedCount: unexecutedSignals.length,
-      wins,
-      losses,
-      scratches,
-      winRate,
-      netUnits,
+      unexecutedCount: accounting.signalSetups - accounting.filledContracts,
+      netUnits: accounting.netReturnUnits,
       timestamp: new Date().toISOString(),
     },
     activeCount: activeTrades.length,

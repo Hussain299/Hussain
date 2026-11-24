@@ -38,10 +38,22 @@ export const TradeAuditModal: React.FC<TradeAuditModalProps> = ({ signal, onClos
   const isLost = signal.outcomeResult === 'LOSS';
   const isScratch = signal.outcomeResult === 'SCRATCH';
   const isPending = signal.outcomeResult === 'PENDING' || !signal.outcomeResult;
+  const hasEntryFill = Number.isFinite(signal.actualEntryPrice) && (signal.actualEntryPrice ?? 0) > 0;
+  const isTerminalUnfilled = !hasEntryFill && ['EXPIRED', 'INVALIDATED', 'AMBIGUOUS'].includes(signal.lifecycleState);
+  const auditReason = [...(signal.lifecycleHistory || [])].reverse().find(event =>
+    ['EXPIRED', 'INVALIDATED', 'AMBIGUOUS'].includes(event.toState)
+  )?.reason || 'No entry fill was recorded; this setup is excluded from contract outcomes.';
 
   const entryPrice = signal.actualEntryPrice || signal.triggerPrice;
   const exitPrice = signal.actualExitPrice;
-  const payout = signal.payoutPct || 85;
+  const payout = typeof signal.payoutPct === 'number' && Number.isFinite(signal.payoutPct)
+    ? signal.payoutPct
+    : null;
+  const payoutSourceLabel = signal.payoutSource === 'BROKER_OBSERVED'
+    ? 'Broker-observed payout'
+    : signal.payoutSource === 'ASSUMED_MINIMUM'
+    ? 'Assumed minimum payout'
+    : 'Payout source not recorded';
 
   const formatIST = (utcString?: string | null) => {
     if (!utcString) return '—';
@@ -97,7 +109,7 @@ export const TradeAuditModal: React.FC<TradeAuditModalProps> = ({ signal, onClos
           {/* Outcome Status Banner */}
           <div className="flex items-center justify-between p-3.5 rounded-xl bg-[#121820] border border-[#243040] font-mono">
             <div>
-              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Execution Outcome</span>
+              <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Paper Settlement Outcome</span>
               <div className="flex items-center gap-2 mt-0.5">
                 {isWon && <CheckCircle2 className="w-4 h-4 text-[#72A98B]" />}
                 {isLost && <XCircle className="w-4 h-4 text-[#B7797D]" />}
@@ -133,6 +145,15 @@ export const TradeAuditModal: React.FC<TradeAuditModalProps> = ({ signal, onClos
             </div>
           </div>
 
+          {isTerminalUnfilled && (
+            <div className="p-4 rounded-xl bg-[#C4A574]/10 border border-[#C4A574]/50 space-y-1">
+              <div className="text-[11px] font-black tracking-wide text-[#C4A574]">AUDIT: UNSETTLED / NO ENTRY</div>
+              <div className="text-[10px] font-bold text-[#E8E5DE]">{signal.lifecycleState}</div>
+              <p className="text-xs leading-relaxed text-[#AAB4BF]">{auditReason}</p>
+              <p className="text-[10px] text-[#AAB4BF]">No filled contract exists; no WIN, LOSS, or stake return is counted.</p>
+            </div>
+          )}
+
           {/* IST Timings Matrix */}
           <div className="p-4 rounded-xl bg-[#121820] border border-[#243040] space-y-2.5 font-mono">
             <div className="flex items-center gap-2 text-[#6C9D91] font-bold text-xs uppercase">
@@ -159,37 +180,26 @@ export const TradeAuditModal: React.FC<TradeAuditModalProps> = ({ signal, onClos
             </div>
           </div>
 
-          {/* Pricing & Pip Returns */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono text-center">
+          {/* Binary Contract Inputs & Prices — returns are reported in stake units, not pips. */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 font-mono text-center">
             <div className="p-3 rounded-xl bg-[#121820] border border-[#243040]">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block">Entry Fill Price</span>
+              <span className="text-[10px] text-[#AAB4BF] uppercase block">Entry Price</span>
               <span className="text-sm font-bold text-[#E8E5DE] block mt-0.5 tabular-nums">
-                {entryPrice ? entryPrice.toFixed(5) : '—'}
+                {hasEntryFill ? entryPrice.toFixed(5) : 'Not filled'}
               </span>
             </div>
             <div className="p-3 rounded-xl bg-[#121820] border border-[#243040]">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block">Settlement Exit Price</span>
+              <span className="text-[10px] text-[#AAB4BF] uppercase block">Expiry Price</span>
               <span className="text-sm font-bold text-[#E8E5DE] block mt-0.5 tabular-nums">
-                {exitPrice ? exitPrice.toFixed(5) : 'Pending'}
+                {typeof exitPrice === 'number' && exitPrice > 0 ? exitPrice.toFixed(5) : 'Not settled'}
               </span>
             </div>
             <div className="p-3 rounded-xl bg-[#121820] border border-[#243040]">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block">Displacement</span>
-              <span
-                className={`text-sm font-bold block mt-0.5 tabular-nums ${
-                  (signal.grossReturnPips || 0) >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'
-                }`}
-              >
-                {signal.grossReturnPips !== null && signal.grossReturnPips !== undefined
-                  ? `${signal.grossReturnPips >= 0 ? '+' : ''}${signal.grossReturnPips} pips`
-                  : '—'}
-              </span>
-            </div>
-            <div className="p-3 rounded-xl bg-[#121820] border border-[#243040]">
-              <span className="text-[10px] text-[#AAB4BF] uppercase block">Broker Payout</span>
+              <span className="text-[10px] text-[#AAB4BF] uppercase block">Saved Payout</span>
               <span className="text-sm font-bold text-[#C4A574] block mt-0.5 tabular-nums">
-                {payout}% (Ratio: {(payout / 100).toFixed(2)})
+                {payout === null ? 'Not recorded' : `${payout}%`}
               </span>
+              <span className="mt-1 block text-[10px] text-[#AAB4BF]">{payoutSourceLabel}</span>
             </div>
           </div>
 

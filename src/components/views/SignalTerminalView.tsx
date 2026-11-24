@@ -39,6 +39,7 @@ import {
 } from '../../types/index.js';
 import { AgiSelfLearningModal } from '../AgiSelfLearningModal.tsx';
 import { useFirebase } from '../../contexts/FirebaseContext.tsx';
+import { isExpiredUnfilledSetup, isFilledContract, isSettledContract, isTerminalUnfilledSetup } from '../../utils/tradeAccounting.js';
 
 interface SignalTerminalViewProps {
   signals: ResearchSignal[];
@@ -50,7 +51,7 @@ interface SignalTerminalViewProps {
 }
 
 type TerminalLayer = 'ACTIVE' | 'TODAY' | 'YESTERDAY' | 'DAILY_SESSIONS' | 'ALL' | 'SESSIONS';
-type TradeStatusFilter = 'ALL' | 'EXECUTED' | 'WIN' | 'LOSS';
+type TradeStatusFilter = 'ALL' | 'EXECUTED' | 'WIN' | 'LOSS' | 'SCRATCH' | 'EXPIRED';
 
 export interface DailySessionSummary {
   dateKey: string;
@@ -64,7 +65,7 @@ export interface DailySessionSummary {
   losses: number;
   winRate: number | null;
   netUnits: number;
-  grossPips: number;
+  expiredUnfilledSetups: number;
   isToday: boolean;
   isYesterday: boolean;
 }
@@ -337,28 +338,26 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
     return list.filter(s => {
       if (pairFilter !== 'ALL' && s.symbol !== pairFilter) return false;
       if (statusFilter === 'EXECUTED') {
-        return s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult);
+        return isFilledContract(s);
       }
       if (statusFilter === 'WIN') return s.outcomeResult === 'WIN';
       if (statusFilter === 'LOSS') return s.outcomeResult === 'LOSS';
+      if (statusFilter === 'SCRATCH') return isSettledContract(s) && s.outcomeResult === 'SCRATCH';
+      if (statusFilter === 'EXPIRED') return isExpiredUnfilledSetup(s);
       return true;
     });
   };
 
   // 1. ALL SIGNALS (Full Bot History - Never restarts to 0)
   const allSignals = useMemo(() => signals, [signals]);
-  const allExecutedTrades = useMemo(() => {
-    return allSignals.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
-  }, [allSignals]);
-  const allSettledTrades = useMemo(() => {
-    return allExecutedTrades.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
-  }, [allExecutedTrades]);
+  const allExecutedTrades = useMemo(() => allSignals.filter(isFilledContract), [allSignals]);
+  const allSettledTrades = useMemo(() => allSignals.filter(isSettledContract), [allSignals]);
   const allWins = allSettledTrades.filter(t => t.outcomeResult === 'WIN').length;
   const allLosses = allSettledTrades.filter(t => t.outcomeResult === 'LOSS').length;
   const allScored = allWins + allLosses;
   const allWinRate = allScored > 0 ? Number(((allWins / allScored) * 100).toFixed(1)) : null;
   const allNetUnits = Number(allSettledTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
-  const allGrossPips = Number(allSettledTrades.reduce((acc, t) => acc + (t.grossReturnPips || 0), 0).toFixed(1));
+  const allExpiredUnfilled = allSignals.filter(isExpiredUnfilledSetup).length;
   const displayedAllSignals = useMemo(() => applyFilters(allSignals), [allSignals, pairFilter, statusFilter]);
 
   // 2. DAILY SESSIONS GROUPING (Partitioned strictly by IST calendar day)
@@ -384,15 +383,15 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
       const displayDate = formatIstDateHeading(sampleDate);
       const dayOfWeek = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'long' }).format(sampleDate);
 
-      const executed = sigs.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
-      const settled = executed.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+      const executed = sigs.filter(isFilledContract);
+      const settled = sigs.filter(isSettledContract);
       const active = sigs.filter(s => s.lifecycleState === 'ACTIVE' || s.lifecycleState === 'WAITING_FOR_ENTRY' || s.lifecycleState === 'EXIT_PENDING');
       const wins = settled.filter(s => s.outcomeResult === 'WIN').length;
       const losses = settled.filter(s => s.outcomeResult === 'LOSS').length;
       const scored = wins + losses;
       const winRate = scored > 0 ? Number(((wins / scored) * 100).toFixed(1)) : null;
       const netUnits = Number(settled.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2));
-      const grossPips = Number(settled.reduce((acc, s) => acc + (s.grossReturnPips || 0), 0).toFixed(1));
+      const expiredUnfilledSetups = sigs.filter(isExpiredUnfilledSetup).length;
 
       return {
         dateKey,
@@ -406,7 +405,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
         losses,
         winRate,
         netUnits,
-        grossPips,
+        expiredUnfilledSetups,
         isToday: dateKey === todayIstKey,
         isYesterday: dateKey === yesterdayIstKey,
       };
@@ -428,17 +427,17 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
     });
   }, [signals, todayIstKey]);
   const todayExecutedTrades = useMemo(() => {
-    return todaySignals.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+    return todaySignals.filter(isFilledContract);
   }, [todaySignals]);
   const todaySettledTrades = useMemo(() => {
-    return todayExecutedTrades.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+    return todaySignals.filter(isSettledContract);
   }, [todayExecutedTrades]);
   const todayWins = todaySettledTrades.filter(t => t.outcomeResult === 'WIN').length;
   const todayLosses = todaySettledTrades.filter(t => t.outcomeResult === 'LOSS').length;
   const todayScored = todayWins + todayLosses;
   const todayWinRate = todayScored > 0 ? Number(((todayWins / todayScored) * 100).toFixed(1)) : null;
   const todayNetUnits = Number(todaySettledTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
-  const todayGrossPips = Number(todaySettledTrades.reduce((acc, t) => acc + (t.grossReturnPips || 0), 0).toFixed(1));
+  const todayExpiredUnfilled = todaySignals.filter(isExpiredUnfilledSetup).length;
   const displayedTodaySignals = useMemo(() => applyFilters(todaySignals), [todaySignals, pairFilter, statusFilter]);
 
   // 4. YESTERDAY'S SIGNALS (Strict IST Yesterday)
@@ -449,17 +448,17 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
     });
   }, [signals, yesterdayIstKey]);
   const yesterdayExecutedTrades = useMemo(() => {
-    return yesterdaySignals.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+    return yesterdaySignals.filter(isFilledContract);
   }, [yesterdaySignals]);
   const yesterdaySettledTrades = useMemo(() => {
-    return yesterdayExecutedTrades.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+    return yesterdaySignals.filter(isSettledContract);
   }, [yesterdayExecutedTrades]);
   const yesterdayWins = yesterdaySettledTrades.filter(t => t.outcomeResult === 'WIN').length;
   const yesterdayLosses = yesterdaySettledTrades.filter(t => t.outcomeResult === 'LOSS').length;
   const yesterdayScored = yesterdayWins + yesterdayLosses;
   const yesterdayWinRate = yesterdayScored > 0 ? Number(((yesterdayWins / yesterdayScored) * 100).toFixed(1)) : null;
   const yesterdayNetUnits = Number(yesterdaySettledTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
-  const yesterdayGrossPips = Number(yesterdaySettledTrades.reduce((acc, t) => acc + (t.grossReturnPips || 0), 0).toFixed(1));
+  const yesterdayExpiredUnfilled = yesterdaySignals.filter(isExpiredUnfilledSetup).length;
   const displayedYesterdaySignals = useMemo(() => applyFilters(yesterdaySignals), [yesterdaySignals, pairFilter, statusFilter]);
 
   // Live Pip Displacement Calculation for active trade cards
@@ -531,6 +530,11 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
               const isActive = trade.lifecycleState === 'ACTIVE';
               const isWaiting = trade.lifecycleState === 'WAITING_FOR_ENTRY';
               const isVerifying = trade.lifecycleState === 'EXIT_PENDING';
+              const isScratch = trade.outcomeResult === 'SCRATCH';
+              const isTerminalUnfilled = isTerminalUnfilledSetup(trade);
+              const auditReason = [...(trade.lifecycleHistory || [])].reverse().find(event =>
+                ['EXPIRED', 'INVALIDATED', 'AMBIGUOUS'].includes(event.toState)
+              )?.reason || 'No entry fill was recorded; this setup is excluded from contract outcomes.';
 
               return (
                 <tr key={`terminal_trade_${trade.id}_${idx}`} className="hover:bg-[#17212D]/60 transition-colors">
@@ -546,6 +550,9 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         <X className="w-3.5 h-3.5" />
                         LOST
                       </span>
+                    )}
+                    {isScratch && (
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-black bg-[#C5A36A]/20 text-[#C5A36A] border border-[#C5A36A]/40">SCRATCH</span>
                     )}
                     {isActive && (
                       <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-black bg-[#72A98B]/20 text-[#72A98B] border border-[#72A98B]/40">
@@ -565,7 +572,13 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         VERIFYING
                       </span>
                     )}
-                    {!isWin && !isLoss && !isActive && !isWaiting && !isVerifying && (
+                    {isTerminalUnfilled ? (
+                      <div className="max-w-[260px] space-y-1 rounded-md border border-[#C4A574]/50 bg-[#C4A574]/10 p-2 text-left">
+                        <span className="block text-[10px] font-black text-[#C4A574]">AUDIT: UNSETTLED / NO ENTRY</span>
+                        <span className="block text-[10px] font-bold text-[#E8E5DE]">{trade.lifecycleState}</span>
+                        <span className="block whitespace-normal text-[10px] leading-relaxed text-[#AAB4BF]">{auditReason}</span>
+                      </div>
+                    ) : !isWin && !isLoss && !isScratch && !isActive && !isWaiting && !isVerifying && (
                       <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs bg-[#17212D] text-[#AAB4BF] border border-[#354251]">
                         {trade.lifecycleState}
                       </span>
@@ -895,7 +908,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         </div>
 
                         <div className="p-3 rounded-xl bg-[#222B36] border border-[#354251]">
-                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-bold">P&amp;L Displacement</span>
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-bold">Live Price Move (not settled P&amp;L)</span>
                           <div className={`text-lg sm:text-xl font-black mt-0.5 tabular-nums ${disp.isInTheMoney ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
                             {(disp.diffPips ?? 0) >= 0 ? `+${disp.diffPips ?? 0}` : (disp.diffPips ?? 0)} pips
                           </div>
@@ -975,7 +988,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                   <div className="text-sm sm:text-base font-black text-[#E8E5DE] flex items-center gap-2">
                     <span>AUTONOMOUS 5M SIGNAL SCANNER ACTIVE</span>
                     <span className="px-2 py-0.5 rounded text-[10px] bg-[#72A98B]/20 text-[#72A98B] font-bold">
-                      20 PAIRS MONITORED
+                      {FOREX_PAIRS.length} PAIRS MONITORED
                     </span>
                   </div>
                   <p className="text-[#AAB4BF] text-xs leading-relaxed max-w-2xl">
@@ -1146,13 +1159,33 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
               >
                 Lost
               </button>
+              <button
+                onClick={() => setStatusFilter('SCRATCH')}
+                className={`px-2.5 py-1 rounded cursor-pointer transition-colors ${
+                  statusFilter === 'SCRATCH'
+                    ? 'bg-[#C5A36A] text-[#17212D] font-bold'
+                    : 'bg-[#222B36] text-[#C5A36A] hover:text-[#E8E5DE] border border-[#354251]'
+                }`}
+              >
+                Scratch
+              </button>
+              <button
+                onClick={() => setStatusFilter('EXPIRED')}
+                className={`px-2.5 py-1 rounded cursor-pointer transition-colors ${
+                  statusFilter === 'EXPIRED'
+                    ? 'bg-[#C4A574] text-[#17212D] font-bold'
+                    : 'bg-[#222B36] text-[#C4A574] hover:text-[#E8E5DE] border border-[#354251]'
+                }`}
+              >
+                Expired Unfilled
+              </button>
 
               <select
                 value={pairFilter}
                 onChange={e => setPairFilter(e.target.value)}
                 className="bg-[#222B36] border border-[#354251] text-[#E8E5DE] rounded px-2 py-1 text-xs outline-none cursor-pointer"
               >
-                <option value="ALL">All Pairs (20)</option>
+                <option value="ALL">All Pairs ({FOREX_PAIRS.length})</option>
                 {FOREX_PAIRS.map(p => (
                   <option key={p} value={p}>{p}</option>
                 ))}
@@ -1256,18 +1289,18 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 <div className="flex items-center gap-2">
                   <span className="w-2.5 h-2.5 rounded-full bg-[#6C9D91]" />
                   <h2 className="text-base font-black text-[#E8E5DE] uppercase tracking-wider">
-                    ALL BOT TRADES &amp; PERSISTENT AUDIT SCORECARD
+                    SIGNAL SETUPS &amp; SETTLED CONTRACT SCORECARD
                   </h2>
                 </div>
                 <div className="text-xs text-[#AAB4BF]">
-                  Complete Multi-Day Persistent Memory • Never Erased on Window Close
+                  Current signal window · older paper outcomes retained separately
                 </div>
               </div>
 
-              {/* 4-Stat High-Visibility Strip */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              {/* Separate signal, fill and settlement counters; this is the retained signal window. */}
+              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
                 <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Overall Win Rate</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Current Window Win Rate</span>
                   <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
                     {allWinRate !== null ? `${allWinRate}%` : '—'}
                   </div>
@@ -1277,29 +1310,35 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 </div>
 
                 <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Executed Fills</span>
-                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
-                    {allExecutedTrades.length}
-                  </div>
-                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">
-                    {allSignals.length} total signals emitted
-                  </span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Signal Setups</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">{allSignals.length}</div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Unique retained records</span>
                 </div>
 
                 <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Net Stake Units</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Filled Contracts</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">{allExecutedTrades.length}</div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">{Math.max(0, allExecutedTrades.length - allSettledTrades.length)} awaiting settlement</span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Settled Outcomes</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">{allSettledTrades.length}</div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">{allWins}W · {allLosses}L · {allSettledTrades.filter(t => t.outcomeResult === 'SCRATCH').length} scratches</span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Net Paper Return</span>
                   <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${allNetUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
                     {allNetUnits >= 0 ? `+${allNetUnits}` : allNetUnits} U
                   </div>
-                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Audited contract payouts</span>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Recorded binary payout units</span>
                 </div>
 
                 <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Gross Displacement</span>
-                  <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${allGrossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                    {allGrossPips >= 0 ? `+${allGrossPips}` : allGrossPips} pips
-                  </div>
-                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Cumulative price delta</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Expired Unfilled Setups</span>
+                  <div className="text-3xl sm:text-4xl font-black mt-1 tabular-nums text-[#E8E5DE]">{allExpiredUnfilled}</div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Excluded from contract outcomes</span>
                 </div>
               </div>
             </div>
@@ -1372,7 +1411,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 </div>
 
                 <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Net Stake Units</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Net Paper Return</span>
                   <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${todayNetUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
                     {todayNetUnits >= 0 ? `+${todayNetUnits}` : todayNetUnits} U
                   </div>
@@ -1380,12 +1419,10 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 </div>
 
                 <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Gross Pip Move</span>
-                  <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${todayGrossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                    {todayGrossPips >= 0 ? `+${todayGrossPips}` : todayGrossPips} pips
-                  </div>
-                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Displacement total</span>
-                </div>
+                <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Expired Unfilled Today</span>
+                <div className="text-3xl sm:text-4xl font-black mt-1 tabular-nums text-[#E8E5DE]">{todayExpiredUnfilled}</div>
+                <span className="text-[10px] text-[#AAB4BF] mt-1 block">Not counted as trades</span>
+              </div>
               </div>
             </div>
 
@@ -1471,7 +1508,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
               const execCount = yesterdaySignals.length > 0 ? yesterdayExecutedTrades.length : (latestCompletedSession?.executedTrades.length ?? 0);
               const totalLogged = yesterdaySignals.length > 0 ? yesterdaySignals.length : (latestCompletedSession?.signals.length ?? 0);
               const netUnits = yesterdaySignals.length > 0 ? yesterdayNetUnits : (latestCompletedSession?.netUnits ?? 0);
-              const grossPips = yesterdaySignals.length > 0 ? yesterdayGrossPips : (latestCompletedSession?.grossPips ?? 0);
+              const expiredUnfilled = yesterdaySignals.length > 0 ? yesterdayExpiredUnfilled : (latestCompletedSession?.expiredUnfilledSetups ?? 0);
 
               return (
                 <div className="space-y-6">
@@ -1516,15 +1553,13 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${netUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
                           {netUnits >= 0 ? `+${netUnits}` : netUnits} U
                         </div>
-                        <span className="text-[10px] text-[#AAB4BF] mt-1 block">Audited contract payouts</span>
+                        <span className="text-[10px] text-[#AAB4BF] mt-1 block">Recorded binary payout units</span>
                       </div>
 
                       <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Gross Displacement</span>
-                        <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${grossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                          {grossPips >= 0 ? `+${grossPips}` : grossPips} pips
-                        </div>
-                        <span className="text-[10px] text-[#AAB4BF] mt-1 block">Cumulative market move</span>
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Expired Unfilled Setups</span>
+                        <div className="text-3xl sm:text-4xl font-black mt-1 tabular-nums text-[#E8E5DE]">{expiredUnfilled}</div>
+                        <span className="text-[10px] text-[#AAB4BF] mt-1 block">Excluded from trade results</span>
                       </div>
                     </div>
                   </div>
@@ -1714,11 +1749,9 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         </div>
 
                         <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
-                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Gross Displacement</span>
-                          <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${cur.grossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                            {cur.grossPips >= 0 ? `+${cur.grossPips}` : cur.grossPips} pips
-                          </div>
-                          <span className="text-[10px] text-[#AAB4BF] mt-1 block">Pips move</span>
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Expired Unfilled Setups</span>
+                          <div className="text-3xl sm:text-4xl font-black mt-1 tabular-nums text-[#E8E5DE]">{cur.expiredUnfilledSetups}</div>
+                          <span className="text-[10px] text-[#AAB4BF] mt-1 block">Not entered, not a trade</span>
                         </div>
                       </div>
                     </div>

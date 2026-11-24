@@ -33,6 +33,7 @@ import {
   loadManualControls,
   ManualControlsState,
 } from '../../utils/botControls.js';
+import { isExpiredUnfilledSetup, isFilledContract, isSettledContract } from '../../utils/tradeAccounting.js';
 
 interface OverviewViewProps {
   signals: ResearchSignal[];
@@ -103,18 +104,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     s => getIstDateKey(s.actualEntryTimeUtc || s.candleOpenTimeUtc || s.predictionTimeUtc) === todayIstKey
   );
 
-  const todayCompleted = todaySignals.filter(
-    s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-  );
+  const todayCompleted = todaySignals.filter(isSettledContract);
+  const todayExpiredUnfilled = todaySignals.filter(isExpiredUnfilledSetup).length;
+  const todayFilled = todaySignals.filter(isFilledContract).length;
   const todayWins = todayCompleted.filter(s => s.outcomeResult === 'WIN').length;
   const todayLosses = todayCompleted.filter(s => s.outcomeResult === 'LOSS').length;
   const todayScored = todayWins + todayLosses;
   const todayWinRate = todayScored > 0 ? Number(((todayWins / todayScored) * 100).toFixed(1)) : null;
   const todayNetUnits = Number(
     todayCompleted.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2)
-  );
-  const todayPips = Number(
-    todayCompleted.reduce((acc, s) => acc + (s.grossReturnPips || 0), 0).toFixed(1)
   );
 
   // Overall Yesterday Performance (IST Calendar Day)
@@ -126,18 +124,13 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
     s => getIstDateKey(s.actualEntryTimeUtc || s.candleOpenTimeUtc || s.predictionTimeUtc) === yesterdayIstKey
   );
 
-  const yesterdayCompleted = yesterdaySignals.filter(
-    s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-  );
+  const yesterdayCompleted = yesterdaySignals.filter(isSettledContract);
   const yesterdayWins = yesterdayCompleted.filter(s => s.outcomeResult === 'WIN').length;
   const yesterdayLosses = yesterdayCompleted.filter(s => s.outcomeResult === 'LOSS').length;
   const yesterdayScored = yesterdayWins + yesterdayLosses;
   const yesterdayWinRate = yesterdayScored > 0 ? Number(((yesterdayWins / yesterdayScored) * 100).toFixed(1)) : null;
   const yesterdayNetUnits = Number(
     yesterdayCompleted.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2)
-  );
-  const yesterdayPips = Number(
-    yesterdayCompleted.reduce((acc, s) => acc + (s.grossReturnPips || 0), 0).toFixed(1)
   );
 
   // Multi-Day Sessions Grouping (Partitioned strictly by IST calendar day)
@@ -159,7 +152,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         day: 'numeric',
         month: 'short',
       }).format(sampleDate);
-      const completed = sigs.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+      const completed = sigs.filter(isSettledContract);
       const wins = completed.filter(s => s.outcomeResult === 'WIN').length;
       const losses = completed.filter(s => s.outcomeResult === 'LOSS').length;
       const scored = wins + losses;
@@ -344,7 +337,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             {/* Win Rate */}
             <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
               <span className="text-[10px] uppercase tracking-wider text-[#AAB4BF] block">
-                Realized Win Rate
+                Retained Window Win Rate
               </span>
               <div className="text-2xl font-black text-[#E8E5DE] mt-1 tabular-nums">
                 {botStats.winRate !== null ? `${botStats.winRate}%` : '—'}
@@ -357,7 +350,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             {/* Net Return */}
             <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
               <span className="text-[10px] uppercase tracking-wider text-[#AAB4BF] block">
-                Net Cumulative P&L
+                Retained Window Net Return
               </span>
               <div
                 className={`text-2xl font-black mt-1 tabular-nums ${
@@ -372,7 +365,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 <span className="text-xs font-normal text-[#AAB4BF] ml-1">U</span>
               </div>
               <span className="text-[11px] text-[#AAB4BF] block mt-0.5">
-                {botStats.grossPips >= 0 ? `+${botStats.grossPips}` : botStats.grossPips} pips
+                {botStats.filledContracts} filled · {botStats.expiredUnfilledSetups} expired unfilled
               </span>
             </div>
 
@@ -385,7 +378,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 {botStats.profitFactor !== null ? botStats.profitFactor.toFixed(2) : '—'}
               </div>
               <span className="text-[11px] text-[#6C9D91] block mt-0.5">
-                {botStats.completedTrades} total settled
+                {botStats.completedTrades} settled paper contracts
               </span>
             </div>
 
@@ -492,7 +485,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                   Institutional Performance Summary
                 </h3>
                 <p className="text-xs text-[#AAB4BF] mt-0.5">
-                  Audited binary payout returns synchronized to Indian Standard Time (IST).
+                  Candle-settled paper results using saved payout assumptions, shown in Indian Standard Time (IST).
                 </p>
               </div>
               <button
@@ -505,7 +498,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 font-mono">
               <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-                <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Win Rate</span>
+                <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Retained Window Win Rate</span>
                 <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">
                   {todayWinRate !== null ? `${todayWinRate}%` : '—'}
                 </div>
@@ -515,13 +508,9 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               </div>
 
               <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-                <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Executed Fills Today</span>
-                <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">
-                  {todayCompleted.length + activeTrades.length + verifyingTrades.length}
-                </div>
-                <span className="text-[10px] text-[#AAB4BF] block mt-1">
-                  {todaySignals.length} total signals
-                </span>
+                <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Filled Contracts Today</span>
+                <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">{todayFilled}</div>
+                <span className="text-[10px] text-[#AAB4BF] block mt-1">{todaySignals.length} signal setups</span>
               </div>
 
               <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
@@ -530,18 +519,14 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                   {todayNetUnits >= 0 ? `+${todayNetUnits}` : todayNetUnits} U
                 </div>
                 <span className="text-[10px] text-[#AAB4BF] block mt-1">
-                  Payouts verified
+                  Saved paper payout units
                 </span>
               </div>
 
               <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-                <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Displacement Pips</span>
-                <div className={`text-2xl sm:text-3xl font-black mt-1 tabular-nums ${todayPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
-                  {todayPips >= 0 ? `+${todayPips}` : todayPips} pips
-                </div>
-                <span className="text-[10px] text-[#AAB4BF] block mt-1">
-                  Net price move
-                </span>
+                <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Expired Unfilled Today</span>
+                <div className="text-2xl sm:text-3xl font-black mt-1 tabular-nums text-[#E8E5DE]">{todayExpiredUnfilled}</div>
+                <span className="text-[10px] text-[#AAB4BF] block mt-1">Not counted as trades</span>
               </div>
             </div>
 
@@ -788,7 +773,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             )}
             {overviewLayer === 'ALL' && (
               <div className="flex flex-wrap items-center gap-3">
-                <span className="text-[#AAB4BF]">Total Bot Ledger:</span>
+                <span className="text-[#AAB4BF]">Retained Signal Ledger:</span>
+                <span className="text-[#E8E5DE] font-bold">{botStats.totalSignals} setups</span>
+                <span className="text-[#354251]">·</span>
+                <span className="text-[#E8E5DE] font-bold">{botStats.filledContracts} filled</span>
+                <span className="text-[#354251]">·</span>
+                <span className="text-[#E8E5DE] font-bold">{botStats.completedTrades} settled</span>
+                <span className="text-[#354251]">·</span>
+                <span className="text-[#C4A574] font-bold">{botStats.expiredUnfilledSetups} expired unfilled</span>
+                <span className="text-[#354251]">·</span>
                 <span className="text-[#72A98B] font-bold">{botStats.wins} Wins</span>
                 <span className="text-[#354251]">·</span>
                 <span className="text-[#B7797D] font-bold">{botStats.losses} Losses</span>

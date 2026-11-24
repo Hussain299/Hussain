@@ -4,10 +4,11 @@
  * Research Trinity Audits, and System State.
  */
 
-import { Candle, ForexSymbol, FOREX_PAIRS, ResearchSignal, VerificationTestResult } from '../types/index.js';
+import { Candle, ForexSymbol, FOREX_PAIRS, ResearchExperiment, ResearchSignal, VerificationTestResult } from '../types/index.js';
+import { summarizeForwardObservations, summarizeSignalAccounting } from '../utils/tradeAccounting.js';
 import { dataFeedEngine, filterFreshRealCandles, LIVE_CANDLE_MAX_AGE_MS } from './dataFeeds.js';
 import { db } from './db.js';
-import { entryExitEngine } from './entryExitEngine.js';
+import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { telegramService } from './telegramService.js';
@@ -258,6 +259,86 @@ export async function runAllVerificationTests(): Promise<{
     }
   });
 
+  await runTest('SYSTEM', 'Signal setups, filled contracts, settled outcomes and expired unfilled setups are counted separately', () => {
+    const makeSignal = (
+      id: string,
+      lifecycleState: ResearchSignal['lifecycleState'],
+      outcomeResult: ResearchSignal['outcomeResult'],
+      entryPrice: number | null,
+      netReturnUnits: number | null = null,
+    ) => ({
+      id,
+      lifecycleState,
+      outcomeResult,
+      actualEntryTimeUtc: entryPrice === null ? null : new Date().toISOString(),
+      actualEntryPrice: entryPrice,
+      actualExitTimeUtc: entryPrice === null ? null : new Date().toISOString(),
+      actualExitPrice: entryPrice === null ? null : 1.1001,
+      netReturnUnits,
+    } as ResearchSignal);
+
+    const summary = summarizeSignalAccounting([
+      makeSignal('acct_waiting', 'WAITING_FOR_ENTRY', 'PENDING', null),
+      makeSignal('acct_expired', 'EXPIRED', 'CANCELLED', null),
+      makeSignal('acct_invalidated', 'INVALIDATED', 'CANCELLED', null),
+      makeSignal('acct_active_fill', 'ACTIVE', 'PENDING', 1.1),
+      makeSignal('acct_win', 'CLOSED', 'WIN', 1.1, 0.8),
+      makeSignal('acct_loss', 'CLOSED', 'LOSS', 1.1, -1),
+      makeSignal('acct_scratch', 'CLOSED', 'SCRATCH', 1.1, 0),
+    ]);
+
+    if (summary.signalSetups !== 7 ||
+        summary.filledContracts !== 4 ||
+        summary.settledContracts !== 3 ||
+        summary.pendingFilledContracts !== 1 ||
+        summary.expiredUnfilledSetups !== 1 ||
+        summary.otherUnfilledSetups !== 2 ||
+        summary.wins !== 1 ||
+        summary.losses !== 1 ||
+        summary.scratches !== 1 ||
+        summary.winRate !== 50 ||
+        summary.netReturnUnits !== -0.2) {
+      throw new Error(`Incorrect signal accounting breakdown: ${JSON.stringify(summary)}`);
+    }
+  });
+
+  await runTest('SYSTEM', 'Forward analytics deduplicate IDs and use recorded stake returns without pips or payout defaults', () => {
+    const makeForward = (
+      id: string,
+      liveOutcome: 'WIN' | 'LOSS' | 'SCRATCH',
+      observedNetReturnUnits?: number,
+    ) => ({
+      id: `exp_forward_${id}`,
+      experimentType: 'FORWARD_OBSERVATION',
+      liveOutcome,
+      observedNetReturnUnits,
+      observedPayoutPct: 80,
+      createdAt: new Date().toISOString(),
+      valPeriod: { start: '', end: new Date().toISOString() },
+    } as unknown as ResearchExperiment);
+
+    const summary = summarizeForwardObservations([
+      makeForward('fwd_win_1', 'WIN', 0.8),
+      makeForward('fwd_win_2', 'WIN', 0.8),
+      makeForward('fwd_loss_1', 'LOSS', -1),
+      makeForward('fwd_scratch_1', 'SCRATCH', 0),
+      makeForward('fwd_win_missing_return', 'WIN'),
+      makeForward('fwd_win_1', 'LOSS', -1),
+    ]);
+
+    if (summary.observations !== 5 ||
+        summary.wins !== 3 ||
+        summary.losses !== 1 ||
+        summary.scratches !== 1 ||
+        summary.scoredOutcomes !== 4 ||
+        summary.winRate !== 75 ||
+        summary.netReturnUnits !== 0.6 ||
+        summary.missingReturnCount !== 1 ||
+        summary.profitFactor !== 1.6) {
+      throw new Error(`Incorrect retained forward outcome summary: ${JSON.stringify(summary)}`);
+    }
+  });
+
   await runTest('DATA', 'Binary payout settlement (win, loss, push and payout floor)', () => {
     const win = calculateBinarySettlement('BUY', 1.10000, 1.10010, 80);
     if (win.outcome !== 'WIN' || win.netReturnUnits !== 0.8) {
@@ -401,6 +482,50 @@ export async function runAllVerificationTests(): Promise<{
   // ==========================================
   // 2. ENTRY / EXIT CAUSAL TESTS
   // ==========================================
+  await runTest('ENTRY_EXIT', 'Live paper entry requires the exact M5-open candle and never substitutes a nearby bar', () => {
+    const openMs = Date.UTC(2026, 10, 24, 10, 0, 0);
+    const candle = (offsetMs: number, source: Candle['source'] = 'yahoo', open = 1.085) => ({
+      symbol: 'EUR/USD' as ForexSymbol,
+      timestamp: new Date(openMs + offsetMs).toISOString(),
+      timestampMs: openMs + offsetMs,
+      open,
+      high: open + 0.0005,
+      low: open - 0.0005,
+      close: open + 0.0001,
+      volume: 100,
+      source,
+    } as Candle);
+
+    const exactDelayedBar = candle(800, 'yahoo', 1.0861);
+    const earlierBar = candle(-60_000, 'biquote', 1.0840);
+    const laterBar = candle(60_000, 'dukascopy', 1.0870);
+    const selected = findExactEntryCandle(
+      [earlierBar, laterBar, exactDelayedBar],
+      'EUR/USD',
+      openMs,
+    );
+
+    if (selected !== exactDelayedBar || selected.open !== 1.0861) {
+      throw new Error('The entry selector did not choose the exact M5-open candle.');
+    }
+    if (findExactEntryCandle([earlierBar, laterBar], 'EUR/USD', openMs) !== null) {
+      throw new Error('A nearby candle was incorrectly accepted as the M5 entry.');
+    }
+    if (findExactEntryCandle([candle(0, 'synthetic')], 'EUR/USD', openMs) !== null) {
+      throw new Error('A synthetic candle was incorrectly accepted as a live entry.');
+    }
+    if (findExactEntryCandle([candle(0, 'imported')], 'EUR/USD', openMs) !== null ||
+        findExactEntryCandle([candle(0, 'test_fixture')], 'EUR/USD', openMs) !== null) {
+      throw new Error('Imported or test-fixture candles were incorrectly accepted as a live entry.');
+    }
+    if (findExactEntryCandle([candle(0, 'yahoo', 0)], 'EUR/USD', openMs) !== null) {
+      throw new Error('A zero/invalid open price was incorrectly accepted.');
+    }
+    if (LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS !== 5 * 60_000) {
+      throw new Error('The delayed-feed grace must be exactly one five-minute window.');
+    }
+  });
+
   await runTest('ENTRY_EXIT', 'Causal Trigger: No Lookahead Entry', () => {
     const signalCandle: Candle = {
       symbol: 'EUR/USD',
