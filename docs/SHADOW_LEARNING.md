@@ -5,7 +5,7 @@ SignalForge retains its existing AGI, MLP, LinUCB and strategy-bandit systems. T
 ## Learning contract
 
 - A 19-dimensional market feature vector is frozen when a signal is created, using only real candles available at prediction time.
-- The FTRL-Proximal classifier augments that vector with an intercept, one-hot pair identity, direction and one-hot strategy family (47 total inputs).
+- The FTRL-Proximal classifier augments that vector with an intercept, one-hot pair identity, direction and one-hot strategy family (56 total inputs).
 - A prediction is scored only after a filled contract is fully closed with a WIN or LOSS. Unfilled, cancelled and scratch outcomes are not directional labels.
 - Evaluation uses the stored prediction probability (prequential Brier score and log loss). The model gradient uses the current model state when delayed feedback arrives.
 - Recovery replay orders prediction and outcome events by event time. A result is not available to a later prediction until its recorded settlement time.
@@ -24,3 +24,8 @@ Diagnostics:
 - `POST /api/evolution/reconcile`
 
 Raw feature vectors and credentials are never returned by the diagnostics endpoint.
+
+
+## Pair-universe update
+
+The scanner universe is now 29 currency pairs, ordered by the supplied Olymp Trade observation sample for 10:30–22:30 IST at the 80% payout floor. The shadow learner's identity encoding was expanded from 20 to 29 pair flags. Existing 47-dimensional learner weights are migrated by pair name into the 56-dimensional layout; the nine new pair weights start at zero. The two low tradable-rate audit exclusions (USD/NOK and USD/SGD) are not included.
