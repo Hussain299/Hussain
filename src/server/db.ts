@@ -895,9 +895,8 @@ class DatabaseService {
       }
       return existing;
     }
-    if (this.state.recordedForwardObservationIds.includes(sig.id)) {
-      throw new Error('Forward observation was already recorded but its display row is outside retained history.');
-    }
+    // A lifetime ledger may outlive the bounded display row. In that case
+    // return the reconstructed record without inserting or counting it again.
     const netPips = sig.netReturnPips ?? 0;
     const netReturnUnits = sig.netReturnUnits ?? 0;
     const sessionName = sig.marketSessionName || 'Market Session';
