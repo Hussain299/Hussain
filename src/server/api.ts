@@ -15,6 +15,9 @@ import { runAllVerificationTests } from './tests.js';
 import { historicalDataStore } from './historicalData.js';
 import { agiSelfLearningEngine } from './agiEngine.js';
 import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
+import { behaviouralEngine } from './behaviouralEngine.js';
+import { botAuditor } from './botAuditor.js';
+import { telegramService } from './telegramService.js';
 
 interface StrategySearchJob {
   jobId: string;
@@ -51,6 +54,14 @@ interface StrategySearchJob {
 const strategySearchJobs = new Map<string, StrategySearchJob>();
 
 export const apiRouter = Router();
+
+// Strictly prevent browser, proxy, or Service Worker caching of dynamic trading API responses
+apiRouter.use((_req: Request, res: Response, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 
 // Healthcheck
 apiRouter.get('/_healthcheck', (_req: Request, res: Response) => {
@@ -159,12 +170,69 @@ apiRouter.post('/analyze', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/signals — All signals or filtered
+// GET /api/signals — Pure read-only ledger, latest pair prices, and today's execution statistics
 apiRouter.get('/signals', (_req: Request, res: Response) => {
-  entryExitEngine.sweepStaleActiveSignals();
+  const signals = db.getSignals();
+  const latestPrices: Record<string, number> = {};
+  for (const pair of FOREX_PAIRS) {
+    const candles = db.getCandles(pair, 1);
+    if (candles && candles.length > 0) {
+      latestPrices[pair] = candles[candles.length - 1].close;
+    }
+  }
+
+  // Precompute clean 24h execution categories
+  const nowMs = Date.now();
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const recent24h = signals.filter(s => {
+    const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
+    return nowMs - timeMs <= ONE_DAY_MS;
+  });
+
+  const activeTrades = recent24h.filter(s =>
+    s.lifecycleState === 'ACTIVE' && s.actualEntryPrice !== null &&
+    (s.plannedExitTimeUtc ? Date.parse(s.plannedExitTimeUtc) > nowMs : true)
+  );
+
+  const verifyingTrades = recent24h.filter(s =>
+    (s.lifecycleState === 'EXIT_PENDING' || (s.lifecycleState === 'ACTIVE' && s.plannedExitTimeUtc && Date.parse(s.plannedExitTimeUtc) <= nowMs)) &&
+    s.actualEntryPrice !== null &&
+    s.outcomeResult === 'PENDING'
+  );
+
+  const completedTrades = recent24h.filter(s =>
+    s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
+  );
+
+  const unexecutedSignals = recent24h.filter(s =>
+    s.actualEntryPrice === null || ['WAITING_FOR_ENTRY', 'DETECTED', 'EXPIRED', 'INVALIDATED', 'AMBIGUOUS'].includes(s.lifecycleState)
+  );
+
+  const wins = completedTrades.filter(t => t.outcomeResult === 'WIN').length;
+  const losses = completedTrades.filter(t => t.outcomeResult === 'LOSS').length;
+  const scratches = completedTrades.filter(t => t.outcomeResult === 'SCRATCH').length;
+  const executedCount = activeTrades.length + verifyingTrades.length + completedTrades.length;
+  const scoredCount = wins + losses;
+  const winRate = scoredCount > 0 ? Number(((wins / scoredCount) * 100).toFixed(1)) : null;
+  const netUnits = Number(completedTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
+
   res.json({
-    signals: db.getSignals(),
-    activeCount: db.getActiveSignals().length,
+    signals,
+    latestPrices,
+    todayStats: {
+      executedTradesToday: executedCount,
+      completedCount: completedTrades.length,
+      activeCount: activeTrades.length,
+      verifyingCount: verifyingTrades.length,
+      unexecutedCount: unexecutedSignals.length,
+      wins,
+      losses,
+      scratches,
+      winRate,
+      netUnits,
+      timestamp: new Date().toISOString(),
+    },
+    activeCount: activeTrades.length,
     sessions: db.getSessionAccuracyBreakdown(),
   });
 });
@@ -361,6 +429,17 @@ apiRouter.post('/signals/clear-history', (_req: Request, res: Response) => {
   });
 });
 
+// POST /api/signals/hydrate-ledger — Restores immutable settled trades from persistent Firestore cloud ledger after cold start
+apiRouter.post('/signals/hydrate-ledger', (req: Request, res: Response) => {
+  const incoming = Array.isArray(req.body?.signals) ? req.body.signals : [];
+  const { importedCount } = db.hydrateImmutableSignals(incoming);
+  res.json({
+    success: true,
+    importedCount,
+    signals: db.getSignals(),
+  });
+});
+
 // POST /api/signals/evaluate — Step causal entry/exit engine on active signals
 apiRouter.post('/signals/evaluate', async (_req: Request, res: Response) => {
   try {
@@ -393,6 +472,30 @@ apiRouter.post('/signals/evaluate', async (_req: Request, res: Response) => {
     for (const signal of completed) {
       db.recordForwardObservation(signal);
       db.recordStrategyOutcome(signal);
+      db.updateBehaviouralMemoryOutcome(signal.id, signal.outcomeResult, signal.netReturnPips, signal.netReturnUnits);
+
+      if (signal.outcomeResult === 'LOSS' && !signal.lossAutopsy) {
+        const pairCandles = candlesMap[signal.symbol] || [];
+        const lastCandle = pairCandles[pairCandles.length - 1] || {
+          close: signal.actualExitPrice || signal.actualEntryPrice || 0,
+          high: signal.actualExitPrice || signal.actualEntryPrice || 0,
+          low: signal.actualExitPrice || signal.actualEntryPrice || 0,
+          open: signal.actualEntryPrice || 0,
+          volume: 100,
+          timestamp: signal.actualExitTimeUtc || new Date().toISOString(),
+          timestampMs: Date.now(),
+          source: 'dukascopy',
+          symbol: signal.symbol,
+        };
+        const { autopsy } = researchEngine.conductForensicLossAutopsy(signal, lastCandle);
+        signal.lossAutopsy = autopsy;
+        db.addLossAutopsy(autopsy);
+        db.updateSignal(signal);
+      }
+
+      await telegramService.sendSettlementAlert(signal).catch(err => {
+        console.error('[API] Telegram settlement audit dispatch error:', err.message);
+      });
     }
     res.json({
       evaluatedCount: db.getActiveSignals().length,
@@ -476,11 +579,156 @@ apiRouter.get('/system/health', (_req: Request, res: Response) => {
     totalForwardObservations: db.getExperiments().filter(e => e.experimentType === 'LIVE_TRADE' || e.experimentType === 'FORWARD_OBSERVATION').length,
     lastCronRun: cron.lastRun,
     nextCronRun: cron.nextRun,
-    isCronRunning: cron.isRunning,
+    isCronRunning: autonomousScheduler.isRunning(),
     cronHistory: cron.history,
     providers: db.getFeedHealthList(),
     sessions: dataFeedEngine.getMarketSessions(),
+    uptimeTelemetry: autonomousScheduler.getUptimeTelemetry(),
   });
+});
+
+// GET /api/system/uptime-status — 24/5 runtime environment & external cron verification
+apiRouter.get('/system/uptime-status', (req: Request, res: Response) => {
+  const telemetry = autonomousScheduler.getUptimeTelemetry();
+  const forwardedProto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+  const forwardedHost = (req.headers['x-forwarded-host'] as string) || req.get('host') || 'localhost:3000';
+  const origin = `${forwardedProto}://${forwardedHost}`;
+
+  res.json({
+    ...telemetry,
+    detectedOrigin: origin,
+    cronTickUrl: `${origin}/api/cron/tick`,
+    cloudflareWorkerKeepalive: `export default {\n  async scheduled(event, env, ctx) {\n    ctx.waitUntil(\n      fetch("${origin}/api/cron/tick?source=CLOUDFLARE_CRON", {\n        method: "GET",\n        headers: { "User-Agent": "SignalForge-24x5-Worker/1.0" }\n      })\n    );\n  }\n};`,
+  });
+});
+
+// GET /api/scheduler/heartbeat — Service Worker keepalive & engine execution probe
+apiRouter.get('/scheduler/heartbeat', (_req: Request, res: Response) => {
+  const cron = db.getCronState();
+  res.json({
+    status: 'ONLINE',
+    engine: 'SignalForge Autonomous Daemon',
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    activeSignalsCount: db.getActiveSignals().length,
+    totalSignalsCount: db.getSignals().length,
+    lastPulse: cron.lastRun,
+    isCronRunning: autonomousScheduler.isRunning(),
+    dbSynced: true,
+    version: '2.4.0',
+    backgroundSyncSupported: true,
+    uptimeTelemetry: autonomousScheduler.getUptimeTelemetry(),
+  });
+});
+
+// Dedicated 24/5 External Cron Tick Handler (supports both GET and POST for cron-job.org, UptimeRobot, Cloud Scheduler, CF Workers)
+const handleExternalCronTick = async (req: Request, res: Response) => {
+  try {
+    // Optional secret gate if CRON_SECRET env var is configured
+    const expectedSecret = process.env.CRON_SECRET;
+    if (expectedSecret) {
+      const provided =
+        (req.query.key as string) ||
+        (req.headers['x-cron-key'] as string) ||
+        (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+      if (provided !== expectedSecret) {
+        res.status(401).json({ error: 'Unauthorized cron key' });
+        return;
+      }
+    }
+
+    if (!autonomousScheduler.isRunning()) {
+      autonomousScheduler.start();
+    }
+
+    const source =
+      (req.query.source as string) ||
+      (req.body?.source as string) ||
+      (req.headers['user-agent']?.slice(0, 48)) ||
+      'EXTERNAL_24_5_CRON';
+
+    db.recordExternalCronPing(source);
+
+    const beforeSignalIds = new Set(db.getSignals().map(s => s.id));
+    const result = await autonomousScheduler.executeAutopilotPulse('EXTERNAL_24_5_CRON');
+
+    const allSignals = db.getSignals();
+    const newlySettled = allSignals.filter(s =>
+      ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult) &&
+      s.actualExitTimeUtc &&
+      Date.now() - Date.parse(s.actualExitTimeUtc) <= 120_000
+    );
+    const newlyEmitted = allSignals.filter(s =>
+      !beforeSignalIds.has(s.id) &&
+      s.confidence >= 0.70
+    );
+
+    const telemetry = autonomousScheduler.getUptimeTelemetry();
+    const timestampIst = new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }).format(new Date()).toUpperCase() + ' IST';
+
+    res.json({
+      status: 'ok',
+      mode: telemetry.runtimeMode,
+      marketOpen: telemetry.marketOpen,
+      marketStatusText: telemetry.marketStatusText,
+      source,
+      timestampUtc: new Date().toISOString(),
+      timestampIst,
+      uptimeSeconds: telemetry.uptimeSeconds,
+      externalCronCount: telemetry.externalCronCount,
+      summary: result,
+      newlyEmittedCount: newlyEmitted.length,
+      newlySettledCount: newlySettled.length,
+      activeSignalsCount: db.getActiveSignals().length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ status: 'error', error: err.message });
+  }
+};
+
+apiRouter.get('/cron/tick', handleExternalCronTick);
+apiRouter.post('/cron/tick', handleExternalCronTick);
+apiRouter.get('/scheduler/pulse', handleExternalCronTick);
+
+// POST /api/scheduler/pulse — Triggered by Service Worker background sync or periodic pulse
+apiRouter.post('/scheduler/pulse', async (req: Request, res: Response) => {
+  try {
+    const source = req.body?.source || 'SERVICE_WORKER_BACKGROUND_PULSE';
+    if (!autonomousScheduler.isRunning()) {
+      autonomousScheduler.start();
+    }
+    const beforeSignalIds = new Set(db.getSignals().map(s => s.id));
+
+    const result = await autonomousScheduler.executeAutopilotPulse(source);
+
+    const allSignals = db.getSignals();
+    const newlySettled = allSignals.filter(s =>
+      ['WIN', 'LOSS'].includes(s.outcomeResult) &&
+      s.actualExitTimeUtc &&
+      Date.now() - Date.parse(s.actualExitTimeUtc) <= 120_000
+    );
+    const newlyEmitted = allSignals.filter(s =>
+      !beforeSignalIds.has(s.id) &&
+      s.confidence >= 0.70
+    );
+
+    res.json({
+      success: true,
+      summary: result,
+      newlySettled,
+      newlyEmitted,
+      activeSignalsCount: db.getActiveSignals().length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/system/export-d1 — Cloudflare D1 SQL Schema & wrangler.toml
@@ -546,3 +794,270 @@ apiRouter.get('/online-model/weights', (_req: Request, res: Response) => {
     weights: onlinePolicyNetwork.getWeightsSnapshot(),
   });
 });
+
+// ==========================================
+// BEHAVIOURAL INTELLIGENCE & BOT AUDITOR APIS
+// ==========================================
+
+// GET /api/behavioural/assessment — Real market behavioral assessments
+apiRouter.get('/behavioural/assessment', async (req: Request, res: Response) => {
+  try {
+    const rawSymbol = ((req.query.symbol as string) || 'EUR/USD').toUpperCase();
+    let symbol: ForexSymbol = 'EUR/USD';
+    const found = FOREX_PAIRS.find(p => p.replace('/', '') === rawSymbol.replace('/', ''));
+    if (found) symbol = found;
+
+    const candleRes = await dataFeedEngine.fetchCandles(symbol, 60);
+    const hypotheses = behaviouralEngine.assessMarketBehavior(symbol, candleRes.candles);
+    const active = hypotheses.filter(h => h.isActive);
+
+    res.json({
+      symbol,
+      candleCount: candleRes.candles.length,
+      feedQualityScore: candleRes.qualityScore,
+      hypotheses,
+      activeCount: active.length,
+      activeBehaviors: active.map(h => h.type),
+      timestampIst: new Date().toLocaleTimeString('en-US', {
+        timeZone: 'Asia/Kolkata',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+      }) + ' IST',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/behavioural/bot-auditor — Algorithmic self-monitoring state
+apiRouter.get('/behavioural/bot-auditor', (_req: Request, res: Response) => {
+  try {
+    let state = db.getBotHealthState();
+    if (!state) {
+      state = botAuditor.auditBotHealth(db.getSignals(), db.getLossAutopsies());
+      db.saveBotHealthState(state);
+    }
+    res.json({
+      botHealth: state,
+      evaluatedSignalsCount: db.getSignals().length,
+      evaluatedLossesCount: db.getLossAutopsies().length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/behavioural/memory — Persistent auditable memory trail
+apiRouter.get('/behavioural/memory', (_req: Request, res: Response) => {
+  try {
+    const memory = db.getBehaviouralMemory();
+    res.json({
+      records: memory,
+      totalCount: memory.length,
+      pendingCount: memory.filter(m => m.actualOutcome === 'PENDING').length,
+      settledCount: memory.filter(m => ['WIN', 'LOSS', 'SCRATCH'].includes(m.actualOutcome)).length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/behavioural/shadow-comparison — Shadow vs Baseline experimentation
+apiRouter.get('/behavioural/shadow-comparison', (_req: Request, res: Response) => {
+  try {
+    const comparison = db.getShadowComparison();
+    res.json({
+      comparison,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// TELEGRAM BOT INTEGRATION ENDPOINTS
+// ==========================================
+
+// GET /api/telegram/status — Get bot profile and subscriber status
+apiRouter.get('/telegram/status', async (_req: Request, res: Response) => {
+  try {
+    const config = db.getTelegramConfig();
+    const botInfo = await telegramService.getBotInfo();
+
+    res.json({
+      configured: Boolean(config.botToken),
+      enabled: config.enabled,
+      bot: botInfo.bot || {
+        id: 8386549882,
+        username: config.botUsername || 'Forex_new_calender_bot',
+        firstName: config.botFirstName || 'Forex news',
+      },
+      botStatus: botInfo.ok ? 'ONLINE' : 'ERROR',
+      botError: botInfo.error,
+      subscribersCount: config.subscribers.length,
+      subscribers: config.subscribers,
+      notifyOnNewSignal: config.notifyOnNewSignal,
+      notifyOnSettlement: config.notifyOnSettlement,
+      minConfidence: config.minConfidence,
+      lastSyncAt: config.lastSyncAt,
+      botUrl: `https://t.me/${config.botUsername || 'Forex_new_calender_bot'}`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/telegram/sync — Trigger getUpdates to auto-discover subscribers
+apiRouter.post('/api/telegram/sync', async (_req: Request, res: Response) => {
+  try {
+    const syncRes = await telegramService.syncSubscribersFromUpdates();
+    res.json(syncRes);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Also support without /api prefix for router mounting convenience
+apiRouter.post('/telegram/sync', async (_req: Request, res: Response) => {
+  try {
+    const syncRes = await telegramService.syncSubscribersFromUpdates();
+    res.json(syncRes);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/telegram/subscribers — Manually add a subscriber (Chat ID or Channel)
+apiRouter.post('/telegram/subscribers', (req: Request, res: Response) => {
+  try {
+    const { id, name, username, type } = req.body;
+    if (!id) {
+      return res.status(400).json({ error: 'Subscriber chat id is required' });
+    }
+
+    const nowIst = new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }).format(new Date()).toUpperCase() + ' IST';
+
+    db.addTelegramSubscriber({
+      id,
+      name: name || `Subscriber ${id}`,
+      username: username ? username.replace(/^@/, '') : undefined,
+      type: type || 'user',
+      addedAt: nowIst,
+    });
+
+    const updated = db.getTelegramConfig();
+    res.json({
+      success: true,
+      subscribers: updated.subscribers,
+      totalCount: updated.subscribers.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/telegram/subscribers/:id — Remove a subscriber
+apiRouter.delete('/telegram/subscribers/:id', (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const removed = db.removeTelegramSubscriber(id);
+    const updated = db.getTelegramConfig();
+    res.json({
+      success: removed,
+      subscribers: updated.subscribers,
+      totalCount: updated.subscribers.length,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/telegram/settings — Update Telegram notification preferences
+apiRouter.post('/telegram/settings', (req: Request, res: Response) => {
+  try {
+    const { enabled, botToken, notifyOnNewSignal, notifyOnSettlement, minConfidence } = req.body;
+
+    const updates: any = {};
+    if (typeof enabled === 'boolean') updates.enabled = enabled;
+    if (typeof botToken === 'string' && botToken.trim()) updates.botToken = botToken.trim();
+    if (typeof notifyOnNewSignal === 'boolean') updates.notifyOnNewSignal = notifyOnNewSignal;
+    if (typeof notifyOnSettlement === 'boolean') updates.notifyOnSettlement = notifyOnSettlement;
+    if (typeof minConfidence === 'number') updates.minConfidence = Math.max(0.5, Math.min(0.99, minConfidence));
+
+    const updated = db.saveTelegramConfig(updates);
+    res.json({
+      success: true,
+      config: updated,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/telegram/test — Send test verification alert
+apiRouter.post('/telegram/test', async (req: Request, res: Response) => {
+  try {
+    const { targetChatId } = req.body || {};
+    const testResult = await telegramService.sendTestAlert(targetChatId);
+    res.json(testResult);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/telegram/audit-report — Dispatch a Win & Loss Audit Report (single settled signal or full Daily Audit Summary)
+apiRouter.post('/telegram/audit-report', async (req: Request, res: Response) => {
+  try {
+    const { signalId, targetChatId } = req.body || {};
+
+    if (signalId) {
+      const sig = db.getSignalById(String(signalId));
+      if (!sig) {
+        return res.status(404).json({ success: false, sentTo: 0, error: 'Signal not found in ledger.' });
+      }
+      if (sig.lifecycleState !== 'CLOSED' || !['WIN', 'LOSS', 'SCRATCH'].includes(sig.outcomeResult)) {
+        return res.status(400).json({
+          success: false,
+          sentTo: 0,
+          error: 'Signal is not settled yet. Audit reports can only be sent for CLOSED WIN/LOSS/SCRATCH results.',
+        });
+      }
+
+      const config = db.getTelegramConfig();
+      if (!targetChatId && config.subscribers.length === 0) {
+        return res.json({
+          success: false,
+          sentTo: 0,
+          error: 'No Telegram subscribers registered yet. Open Telegram Settings and sync your chat ID first.',
+        });
+      }
+
+      const results = await telegramService.sendSettlementAlert(sig, {
+        forceResend: true,
+        targetChatId,
+      });
+      const delivered = results.filter(r => r.success).length;
+      return res.json({
+        success: delivered > 0,
+        sentTo: delivered,
+        signalId: sig.id,
+        outcome: sig.outcomeResult,
+        error: delivered === 0 ? results[0]?.error || 'Failed to deliver audit report to Telegram' : undefined,
+      });
+    }
+
+    const summaryRes = await telegramService.sendDailyAuditSummaryReport(targetChatId);
+    return res.json(summaryRes);
+  } catch (err: any) {
+    res.status(500).json({ success: false, sentTo: 0, error: err.message });
+  }
+});
+

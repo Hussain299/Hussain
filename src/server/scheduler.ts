@@ -20,19 +20,88 @@ import { researchEngine } from './researchEngine.js';
 import { historicalDataStore } from './historicalData.js';
 import { agiSelfLearningEngine } from './agiEngine.js';
 import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
+import { behaviouralEngine } from './behaviouralEngine.js';
+import { botAuditor } from './botAuditor.js';
+import { telegramService } from './telegramService.js';
 
 export class AutonomousScheduler {
   private isRunningCycle = false;
   private autopilotTimer: NodeJS.Timeout | null = null;
-  private autopilotIntervalMs = 20 * 1000; // Poll configured pairs every 20 seconds
+  private advanceTimer: NodeJS.Timeout | null = null;
+  private autopilotIntervalMs = 25 * 1000; // Poll configured pairs every 25 seconds (plus exact 3M advance timer)
   private currentGeneration = 1;
   private cycleCount = 0;
+  private hasBootstrappedOnlineModel = false;
 
   constructor() {
     const existingGens = db.getGenerations();
     if (existingGens.length > 0) {
       this.currentGeneration = existingGens[0].generation + 1;
     }
+  }
+
+  private syncOnlineLearningWithLedger(candlesMap?: Partial<Record<ForexSymbol, Candle[]>>) {
+    try {
+      agiSelfLearningEngine.hydrateFromPersistentLedger();
+      const getCombinedRealCandles = (symbol: ForexSymbol): Candle[] => {
+        const byTs = new Map<number, Candle>();
+        for (const c of historicalDataStore.getCandles(symbol) || []) {
+          if (c && c.source !== 'synthetic') byTs.set(c.timestampMs, c);
+        }
+        for (const c of db.getCandles(symbol, 500) || []) {
+          if (c && c.source !== 'synthetic') byTs.set(c.timestampMs, c);
+        }
+        for (const c of candlesMap?.[symbol] || []) {
+          if (c && c.source !== 'synthetic') byTs.set(c.timestampMs, c);
+        }
+        return Array.from(byTs.values()).sort((a, b) => a.timestampMs - b.timestampMs);
+      };
+
+      const res = onlinePolicyNetwork.bootstrapFromSettledSignals(
+        getCombinedRealCandles,
+        (candle, history) => agiSelfLearningEngine.extractFeatureVector(candle, history)
+      );
+
+      if (res.trainedCount > 0) {
+        // Re-hydrate AGI episodic memories after onlinePolicyNetwork persisted newly trained vectors
+        agiSelfLearningEngine.hydrateFromPersistentLedger();
+        this.logMind(
+          'MIND',
+          `Online Policy Network caught up on ${res.trainedCount} settled trades (causal entry vectors). Total Adam steps: ${res.stepCount}.`
+        );
+      }
+      this.hasBootstrappedOnlineModel = true;
+    } catch (err: any) {
+      console.error('[Scheduler] Online learning bootstrap error:', err?.message || err);
+    }
+  }
+
+  /**
+   * Precision 3-Minute Advance Pulse Scheduler:
+   * Dynamically synchronizes to the exact 3-minute advance second (:02:00, :07:00, :12:00, :17:00...)
+   * guaranteeing that every 5M signal is evaluated and dispatched with ~2m 55s to 3m 00s of advance preparation time.
+   */
+  private scheduleNext3MinuteAdvancePulse() {
+    if (this.advanceTimer) {
+      clearTimeout(this.advanceTimer);
+      this.advanceTimer = null;
+    }
+    const now = Date.now();
+    const FIVE_MIN_MS = 5 * 60 * 1000;
+    const current5mOpenMs = Math.floor(now / FIVE_MIN_MS) * FIVE_MIN_MS;
+    // Exactly 2 minutes into the 5M candle is the 3-minute advance mark (180s before next 5M open)
+    let target3mMs = current5mOpenMs + (2 * 60 * 1000);
+    if (target3mMs <= now) {
+      target3mMs += FIVE_MIN_MS;
+    }
+    const delayMs = Math.max(250, target3mMs - now);
+
+    this.advanceTimer = setTimeout(() => {
+      if (this.isRunning()) {
+        this.executeAutopilotPulse('EXACT_3M_ADVANCE_TRIGGER');
+        this.scheduleNext3MinuteAdvancePulse();
+      }
+    }, delayMs);
   }
 
   public start() {
@@ -42,28 +111,71 @@ export class AutonomousScheduler {
     // Sweep any stale active signals from previous session/weekend
     entryExitEngine.sweepStaleActiveSignals();
 
+    // Hydrate AGI bandit arms / PID controller and catch up online MLP weights from persisted ledger
+    this.syncOnlineLearningWithLedger();
+
     this.logMind(
       'MIND',
-      `Research coordinator online. 20-second pulse across ${FOREX_PAIRS.length} configured currency pairs.`
+      `Research coordinator online. 25-second precision pulse + synchronous 3-minute advance timer across ${FOREX_PAIRS.length} configured currency pairs.`
     );
 
-    // Initial warm pulse immediately
+    // Defer initial warm pulse briefly so cold-start HTTP/Vite traffic gets full priority
     setTimeout(() => {
       this.executeAutopilotPulse('WARMUP');
-    }, 1500);
+    }, 4000);
 
-    // Continuous autonomous pulse every 20 seconds
+    // Continuous autonomous pulse every 25 seconds (exact 3M timer still fires at :02, :07, :12...)
     this.autopilotTimer = setInterval(() => {
       this.executeAutopilotPulse('AUTONOMOUS_PULSE');
     }, this.autopilotIntervalMs);
+
+    // Schedule precision 3-minute advance pulse aligned to :02, :07, :12, :17...
+    this.scheduleNext3MinuteAdvancePulse();
   }
 
   public stop() {
     if (this.autopilotTimer) {
       clearInterval(this.autopilotTimer);
       this.autopilotTimer = null;
-      this.logMind('MIND', 'Autopilot pulse paused.');
     }
+    if (this.advanceTimer) {
+      clearTimeout(this.advanceTimer);
+      this.advanceTimer = null;
+    }
+    this.logMind('MIND', 'Autopilot pulse paused.');
+  }
+
+  public isRunning(): boolean {
+    return this.autopilotTimer !== null;
+  }
+
+  public getUptimeTelemetry() {
+    const cron = db.getCronState();
+    const kService = process.env.K_SERVICE || '';
+    const isAiStudioDevPreview =
+      kService.startsWith('ais-dev-') ||
+      (process.env.NODE_ENV !== 'production' && !kService.startsWith('ais-pre-'));
+    const market = isForexMarketOpen(new Date());
+    const lastExtMs = cron.lastExternalCronAt ? Date.parse(cron.lastExternalCronAt) : 0;
+    const isExternalCronActive = lastExtMs > 0 && Date.now() - lastExtMs <= 5 * 60 * 1000;
+
+    return {
+      runtimeMode: isAiStudioDevPreview ? 'AI_STUDIO_DEV_PREVIEW' : 'DEPLOYED_PRODUCTION',
+      isSandboxedPreview: isAiStudioDevPreview,
+      serviceName: kService || 'local-node',
+      schedulerRunning: this.isRunning(),
+      uptimeSeconds: Math.floor(process.uptime()),
+      marketOpen: market.isOpen,
+      marketStatusText: market.statusText,
+      lastPulseAt: cron.lastRun,
+      lastExternalCronAt: cron.lastExternalCronAt || null,
+      externalCronCount: cron.externalCronCount || 0,
+      lastExternalCronSource: cron.lastExternalCronSource || null,
+      isExternalCronActive,
+      is24x5Guaranteed: !isAiStudioDevPreview && isExternalCronActive,
+      cronTickPath: '/api/cron/tick',
+      recommendedIntervalSeconds: 60,
+    };
   }
 
   private logMind(
@@ -80,6 +192,42 @@ export class AutonomousScheduler {
       symbol,
       signalId,
     });
+  }
+
+  private recordBehavioralValidation(signal: any, candles: Candle[]) {
+    try {
+      const botHealth = db.getBotHealthState() || botAuditor.auditBotHealth(db.getSignals(), db.getLossAutopsies());
+      db.saveBotHealthState(botHealth);
+      const validation = behaviouralEngine.validateSignal(signal, candles, botHealth);
+      const activeHyp = validation.activeHypotheses.filter(h => h.isActive);
+      db.addBehaviouralMemoryRecord({
+        id: `bmem_${signal.id}`,
+        signalId: signal.id,
+        symbol: signal.symbol,
+        direction: signal.direction,
+        timestampIst: signal.predictionTimeIst,
+        baselineConfidence: validation.baselineConfidence,
+        adjustedConfidence: validation.behaviouralAdjustedConfidence,
+        marketRegime: activeHyp[0]?.type || 'NORMAL_FLOW',
+        activeBehaviors: activeHyp.map(h => h.type),
+        evidenceSnapshot: validation.evidenceSummary.slice(0, 2).join(' | ') || 'Baseline technical alignment',
+        recommendation: validation.recommendation,
+        actualOutcome: 'PENDING',
+        predictionError: null,
+        grossReturnPips: null,
+        netReturnUnits: null,
+        avoidedLoss: false,
+      });
+
+      this.logMind(
+        'AUDITOR',
+        `🧠 [BEHAVIOURAL VALIDATION · SHADOW]: ${signal.symbol} ${signal.direction} -> Recommendation: ${validation.recommendation} (Conf: ${(validation.baselineConfidence * 100).toFixed(0)}% -> ${(validation.behaviouralAdjustedConfidence * 100).toFixed(0)}%). Active Catalysts: ${activeHyp.length}. ${validation.decisionRationale}`,
+        signal.symbol,
+        signal.id
+      );
+    } catch (err: any) {
+      console.error('[Scheduler] Behavioral validation error:', err.message);
+    }
   }
 
   /**
@@ -113,8 +261,40 @@ export class AutonomousScheduler {
       // 0. Weekend Market Closure Guard
       const marketState = isForexMarketOpen(new Date());
       if (!marketState.isOpen) {
-        // Safely sweep and expire any stale active/waiting signals from Friday
-        entryExitEngine.sweepStaleActiveSignals();
+        // Safely sweep and reconcile any stale active/waiting signals from Friday, and send Telegram Audit Reports for any settled trades
+        const weekendSwept = entryExitEngine.sweepStaleActiveSignals();
+        const weekendAuditDispatches: Array<Promise<any>> = [];
+        for (const sig of weekendSwept) {
+          if (sig.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(sig.outcomeResult)) {
+            db.updateBehaviouralMemoryOutcome(sig.id, sig.outcomeResult, sig.netReturnPips, sig.netReturnUnits);
+            if (sig.outcomeResult === 'LOSS' && !sig.lossAutopsy) {
+              const storedCandles = db.getCandles(sig.symbol, 5);
+              const lastCandle = storedCandles[storedCandles.length - 1] || ({
+                close: sig.actualExitPrice || sig.actualEntryPrice || 0,
+                high: sig.actualExitPrice || sig.actualEntryPrice || 0,
+                low: sig.actualExitPrice || sig.actualEntryPrice || 0,
+                open: sig.actualEntryPrice || 0,
+                volume: 100,
+                timestamp: sig.actualExitTimeUtc || new Date().toISOString(),
+                timestampMs: Date.now(),
+                source: 'dukascopy',
+                symbol: sig.symbol,
+              } as Candle);
+              const { autopsy } = researchEngine.conductForensicLossAutopsy(sig, lastCandle);
+              sig.lossAutopsy = autopsy;
+              db.addLossAutopsy(autopsy);
+              db.updateSignal(sig);
+            }
+            weekendAuditDispatches.push(
+              telegramService.sendSettlementAlert(sig).catch(err => {
+                console.error('[Scheduler] Weekend Telegram audit dispatch error:', err.message);
+              })
+            );
+          }
+        }
+        if (weekendAuditDispatches.length > 0) {
+          await Promise.allSettled(weekendAuditDispatches);
+        }
 
         // Log status periodically (once every ~3 minutes) so the log stream isn't spammed
         if (this.cycleCount % 9 === 1) {
@@ -129,41 +309,82 @@ export class AutonomousScheduler {
           durationMs: Date.now() - startTime,
           pairsProcessed: 0,
           signalsCreated: 0,
-          signalsUpdated: 0,
+          signalsUpdated: weekendSwept.length,
           experimentsRun: 0,
           topExperiment: null,
         };
       }
 
-      // Continuous 24-Hour Signal History Purge & Stale Active Sweep:
-      // Automatically erases completed/closed trades older than 24 hours so daily stats reset cleanly.
+      const pendingTelegramDispatches: Array<Promise<any>> = [];
+
+      // Continuous 7-day history housekeeping
       db.purgeSignalsOlderThan24Hours();
-      entryExitEngine.sweepStaleActiveSignals();
+
+      // Periodically sync new Telegram subscribers who messaged /start to the bot
+      if (this.cycleCount % 6 === 1) {
+        telegramService.syncSubscribersFromUpdates().catch(() => {});
+      }
 
       const candlesMap: Record<ForexSymbol, Candle[]> = {} as any;
       let totalCandlesFetched = 0;
 
-      // 1. Autonomous Market Sensing across all 8 forex pairs
-      for (const symbol of FOREX_PAIRS) {
+      // 1. Autonomous Market Sensing across all 20 forex pairs in bounded concurrency batches of 5
+      // Prevents socket/memory/CPU spikes while still fetching all fresh real candles BEFORE sweeping or evaluating trades.
+      const FETCH_BATCH_SIZE = 5;
+      for (let i = 0; i < FOREX_PAIRS.length; i += FETCH_BATCH_SIZE) {
+        const batch = FOREX_PAIRS.slice(i, i + FETCH_BATCH_SIZE);
+        await Promise.all(
+          batch.map(async (symbol) => {
+            try {
+              const res = await dataFeedEngine.fetchCandles(symbol, 100);
+              // Strictly use verified real market candles (never settle live trades on synthetic continuity data)
+              const realCandles = res.candles.filter(c => c.source !== 'synthetic');
+              const storedReal = db.getCandles(symbol, 100).filter(c => c.source !== 'synthetic');
+              candlesMap[symbol] = realCandles.length > 0 ? realCandles : storedReal;
+              totalCandlesFetched += candlesMap[symbol].length;
+            } catch (err: any) {
+              console.error(`[Autopilot] Sensing failed for ${symbol}:`, err.message);
+            }
+          })
+        );
+      }
+
+      // 1b. Reconcile any stale or previously candle-delayed settlements using freshly fetched real candles
+      const sweptSignals = entryExitEngine.sweepStaleActiveSignals(candlesMap);
+      for (const sig of sweptSignals) {
+        if (sig.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(sig.outcomeResult)) {
+          db.updateBehaviouralMemoryOutcome(sig.id, sig.outcomeResult, sig.netReturnPips, sig.netReturnUnits);
+          if (sig.outcomeResult === 'LOSS' && !sig.lossAutopsy) {
+            const pairCandles = candlesMap[sig.symbol] || db.getCandles(sig.symbol, 5);
+            const lastCandle = pairCandles[pairCandles.length - 1] || ({
+              close: sig.actualExitPrice || sig.actualEntryPrice || 0,
+              high: sig.actualExitPrice || sig.actualEntryPrice || 0,
+              low: sig.actualExitPrice || sig.actualEntryPrice || 0,
+              open: sig.actualEntryPrice || 0,
+              volume: 100,
+              timestamp: sig.actualExitTimeUtc || new Date().toISOString(),
+              timestampMs: Date.now(),
+              source: 'dukascopy',
+              symbol: sig.symbol,
+            } as Candle);
+            const { autopsy } = researchEngine.conductForensicLossAutopsy(sig, lastCandle);
+            sig.lossAutopsy = autopsy;
+            db.addLossAutopsy(autopsy);
+            db.updateSignal(sig);
+          }
+          pendingTelegramDispatches.push(
+            telegramService.sendSettlementAlert(sig).catch(err => {
+              console.error('[Scheduler] Swept Telegram audit dispatch error:', err.message);
+            })
+          );
+        }
+      }
+      if (sweptSignals.some(s => s.lifecycleState === 'CLOSED')) {
         try {
-          const res = await dataFeedEngine.fetchCandles(symbol, 100);
-          const newest = res.candles[res.candles.length - 1];
-          const ageMs = newest ? Date.now() - newest.timestampMs : Infinity;
-          const isRealFreshFeed =
-            res.source !== 'synthetic' &&
-            !!newest &&
-            newest.source !== 'synthetic' &&
-            ['biquote', 'dukascopy', 'yahoo', 'imported'].includes(newest.source) &&
-            ageMs >= -60_000 &&
-            ageMs <= 120_000;
-          // The feed bridge may append random synthetic candles. Never allow those
-          // candles (or stale prices) into signal generation or execution evaluation.
-          candlesMap[symbol] = isRealFreshFeed
-            ? res.candles.filter(c => c.source !== 'synthetic')
-            : [];
-          totalCandlesFetched += candlesMap[symbol].length;
+          const updatedBotHealth = botAuditor.auditBotHealth(db.getSignals(), db.getLossAutopsies());
+          db.saveBotHealthState(updatedBotHealth);
         } catch (err: any) {
-          console.error(`[Autopilot] Sensing failed for ${symbol}:`, err.message);
+          console.error('[Scheduler] Bot health audit error after sweep:', err.message);
         }
       }
 
@@ -181,9 +402,10 @@ export class AutonomousScheduler {
           } else if (sig.lifecycleState === 'CLOSED') {
             const tradeExp = db.recordForwardObservation(sig);
             db.recordStrategyOutcome(sig);
+            db.updateBehaviouralMemoryOutcome(sig.id, sig.outcomeResult, sig.netReturnPips, sig.netReturnUnits);
 
             // AGI Autonomous Forensic Loss Investigation & Self-Correction Engine
-            // Every loss counts: investigate causal root-cause and evolve antidote strategy
+            // Run BEFORE Telegram Audit Report dispatch so every LOSS report includes the real forensic autopsy!
             if (sig.outcomeResult === 'LOSS') {
               const lastCandle = candlesMap[sig.symbol]?.[candlesMap[sig.symbol].length - 1] || ({
                 close: sig.actualExitPrice || sig.actualEntryPrice || 0,
@@ -209,15 +431,31 @@ export class AutonomousScheduler {
                 sig.id
               );
             } else {
+              const dispPips = sig.grossReturnPips ?? sig.netReturnPips ?? 0;
+              const dispUnits = sig.netReturnUnits ?? 0;
               this.logMind(
                 'EXECUTION',
-                `Position closed for ${sig.symbol} ${sig.direction} at ${sig.actualExitPrice}. Net: ${
-                  sig.netReturnPips! > 0 ? '+' : ''
-                }${sig.netReturnPips} pips (${sig.outcomeResult}). Recorded as a forward paper observation ${tradeExp.id}.`,
+                `Position closed for ${sig.symbol} ${sig.direction} at ${sig.actualExitPrice}. Move: ${
+                  dispPips > 0 ? '+' : ''
+                }${dispPips} pips | Net: ${dispUnits > 0 ? '+' : ''}${dispUnits.toFixed(2)} U (${sig.outcomeResult}). Recorded as a forward paper observation ${tradeExp.id}.`,
                 sig.symbol,
                 sig.id
               );
             }
+
+            try {
+              const updatedBotHealth = botAuditor.auditBotHealth(db.getSignals(), db.getLossAutopsies());
+              db.saveBotHealthState(updatedBotHealth);
+            } catch (err: any) {
+              console.error('[Scheduler] Bot health audit error:', err.message);
+            }
+
+            // Dispatch verified Win / Loss Audit Report to Telegram bot subscribers (awaited before pulse returns)
+            pendingTelegramDispatches.push(
+              telegramService.sendSettlementAlert(sig).catch(err => {
+                console.error('[Scheduler] Telegram settlement audit dispatch error:', err.message);
+              })
+            );
           } else if (sig.lifecycleState === 'AMBIGUOUS') {
             this.logMind(
               'AUDITOR',
@@ -236,7 +474,11 @@ export class AutonomousScheduler {
       // have settled, providing maximum mathematical conviction.
       const createdSignals: any[] = [];
       const currentActive = db.getActiveSignals();
-      const activeSymbols = new Set(currentActive.map(s => s.symbol));
+      const inFlightTrades = currentActive.filter(s => {
+        const exitMs = s.plannedExitTimeUtc ? Date.parse(s.plannedExitTimeUtc) : 0;
+        return exitMs === 0 || Date.now() < exitMs;
+      });
+      const inFlightSymbols = new Set(inFlightTrades.map(s => s.symbol));
       const activeSession = getSessionFromTimestamp(new Date());
 
       const nowMs = Date.now();
@@ -246,24 +488,36 @@ export class AutonomousScheduler {
       const next5mCandleOpenMs = current5mOpenMs + FIVE_MIN_MS;
       const msUntilNextOpen = next5mCandleOpenMs - nowMs;
 
-      // Only generate within the strict 3-minute advance window (between 180s and 15s before candle open)
-      const isWithin3MinAdvanceWindow = msUntilNextOpen <= THREE_MIN_MS && msUntilNextOpen >= 15 * 1000;
+      // Strict 3-Minute Advance Window:
+      // Active between 210s and 145s prior to 5M candle open (65-second window centered at 180s / 3 minutes).
+      // A 65-second window guarantees that ANY 1-minute external 24/5 cron pinger lands inside the window
+      // every 5-minute candle cycle without ever missing a setup or emitting rushed/late signals.
+      const isWithin3MinAdvanceWindow = msUntilNextOpen <= 210 * 1000 && msUntilNextOpen >= 145 * 1000;
+      const isManualOrWarmup =
+        triggerSource === 'WARMUP' ||
+        triggerSource === 'MANUAL_TRIGGER' ||
+        triggerSource === 'SCAN_NOW' ||
+        triggerSource === 'SERVICE_WORKER_BACKGROUND_PULSE' ||
+        triggerSource === 'EXACT_3M_ADVANCE_TRIGGER';
+      const shouldScanForSignals = isWithin3MinAdvanceWindow || isManualOrWarmup;
 
-      if (!isWithin3MinAdvanceWindow && currentActive.length < 4) {
-        const secondsUntil3m = Math.max(0, Math.round((msUntilNextOpen - THREE_MIN_MS) / 1000));
-        if (this.cycleCount % 3 === 0) {
+      if (!shouldScanForSignals && inFlightTrades.length < 6) {
+        const secondsUntil3m = msUntilNextOpen > 210 * 1000
+          ? Math.round((msUntilNextOpen - THREE_MIN_MS) / 1000)
+          : Math.round((msUntilNextOpen + (2 * 60 * 1000)) / 1000);
+        if (this.cycleCount % 6 === 0) {
           this.logMind(
             'MIND',
-            `⏳ [STRICT 3M ADVANCE GUARD ACTIVE]: 5m advance signal generation blocked for accuracy safety. Setup candle is maturing. 3-minute advance signal window opens in ${secondsUntil3m}s.`
+            `⏳ [STRICT 3M ADVANCE GUARD ACTIVE]: Setup candle maturing. 3-minute advance alert window opens in ${secondsUntil3m}s.`
           );
         }
       }
 
-      // Emit new setups strictly within the 3-minute advance window when capacity permits
-      if (isWithin3MinAdvanceWindow && currentActive.length < 4) {
+      // Emit new setups when capacity permits (up to 6 concurrent in-flight slots)
+      if (shouldScanForSignals && inFlightTrades.length < 6) {
         for (const symbol of FOREX_PAIRS) {
-          // Strict Pair Isolation: If this pair already has an active or pending signal, NEVER create another!
-          if (activeSymbols.has(symbol)) {
+          // Strict Pair Isolation: If this pair already has an active in-flight trade, NEVER create another!
+          if (inFlightSymbols.has(symbol)) {
             continue;
           }
 
@@ -422,7 +676,15 @@ export class AutonomousScheduler {
             });
 
             createdSignals.push(signal);
-            activeSymbols.add(symbol);
+            this.recordBehavioralValidation(signal, candles);
+            inFlightSymbols.add(symbol);
+
+            // Dispatch instant signal notification to Telegram subscribers (awaited before pulse returns)
+            pendingTelegramDispatches.push(
+              telegramService.sendSignalAlert(signal).catch(err => {
+                console.error('[Scheduler] Telegram novel signal dispatch error:', err.message);
+              })
+            );
 
             this.logMind(
               'SCIENTIST',
@@ -551,10 +813,124 @@ export class AutonomousScheduler {
               strategyName = `Stacked: 30-Min ${activeSession.shortName} Macro Trend Flow`;
             }
 
-            // Deterministic signal-strength score from rule confluence; not a calibrated probability.
-            const confidence = Number(
-              Math.min(0.92, 0.77 + (candidate.confluenceScore - 2) * 0.05).toFixed(2)
+            const strategyId = `stacked:${ruleFamily}:${dynamicExpiry}`;
+
+            // =========================================================================
+            // LIVE ADAPTIVE ML GATE STACK (Closed-Loop Learning Applied Pre-Execution)
+            // =========================================================================
+            if (!this.hasBootstrappedOnlineModel) {
+              this.syncOnlineLearningWithLedger(candlesMap);
+            }
+
+            // GATE 1: Thompson Sampling Bandit / Empirical Break-Even Throttle (<55.6% WR @ n>=8)
+            const throttleCheck = agiSelfLearningEngine.isStrategyThrottled(strategyId);
+            if (throttleCheck.throttled) {
+              this.logMind(
+                'AUDITOR',
+                `[ADAPTIVE BANDIT THROTTLE] Blocked ${symbol} ${candidate.direction} (${strategyId}): ${throttleCheck.reason}`,
+                symbol
+              );
+              continue;
+            }
+
+            // GATE 2: Hurst Exponent & Shannon Entropy Regime Chop Filter
+            const regime = agiSelfLearningEngine.classifyMarketRegime(symbol, candles);
+            if (regime.regimeType === 'RANDOM_WALK_CHOP' && candidate.confluenceScore < 3) {
+              this.logMind(
+                'AUDITOR',
+                `[REGIME CHOP GATE] Blocked low-confluence ${symbol} ${candidate.direction} (${candidate.confluenceScore} signals) during RANDOM_WALK_CHOP (H=${regime.hurstExponent}, Entropy=${regime.shannonEntropy}).`,
+                symbol
+              );
+              continue;
+            }
+
+            // GATE 3: 19D Feature Extraction + Dual Episodic k-NN Loss Veto
+            const featureVec = agiSelfLearningEngine.extractFeatureVector(c, candles);
+            const agiKnn = agiSelfLearningEngine.evaluateEpisodicVeto(symbol, candidate.direction, featureVec);
+            const policyKnn = onlinePolicyNetwork.queryEpisodicKNN(featureVec, symbol, candidate.direction);
+            if (agiKnn.shouldVeto || policyKnn.shouldVeto) {
+              this.logMind(
+                'AUDITOR',
+                `[EPISODIC k-NN VETO] Blocked ${symbol} ${candidate.direction}: ${agiKnn.shouldVeto ? agiKnn.reason : policyKnn.explanation}`,
+                symbol
+              );
+              continue;
+            }
+
+            // GATE 4: Online Neural Policy (19-16-1 MLP + LinUCB) Directional Alignment
+            const netEval = onlinePolicyNetwork.forward(featureVec);
+            const policyTelemetry = onlinePolicyNetwork.getTelemetry();
+            const mlpDirProb = candidate.direction === 'BUY' ? netEval.probabilityUp : 1.0 - netEval.probabilityUp;
+
+            if (policyTelemetry.stepCount >= 10 && mlpDirProb < 0.35) {
+              this.logMind(
+                'AUDITOR',
+                `[NEURAL POLICY VETO] Blocked ${symbol} ${candidate.direction}: Trained MLP (step=${policyTelemetry.stepCount}) assigns only ${(mlpDirProb * 100).toFixed(1)}% probability to ${candidate.direction} (LinUCB=${netEval.linUcbScore}).`,
+                symbol
+              );
+              continue;
+            }
+
+            // Base structural score adjusted by centered online MLP directional edge (relative to 0.50 neutral)
+            // Positive MLP agreement (>50%) boosts conviction; disagreement (<50%) penalizes it without pulling valid trades below floor.
+            const baseScore = Math.min(0.92, 0.77 + (candidate.confluenceScore - 2) * 0.05);
+            const mlpScale = policyTelemetry.stepCount >= 10
+              ? Math.min(0.28, 0.16 + (policyTelemetry.stepCount - 10) * 0.003)
+              : 0;
+            const mlpDelta = (mlpDirProb - 0.50) * mlpScale;
+            let adaptedConfidence = baseScore + mlpDelta;
+
+            // GATE 5: Active Forensic Loss Autopsy Immune Damping + PID Adaptive Threshold
+            const immune = agiSelfLearningEngine.evaluateAntidoteImmuneResistance(symbol, candidate.direction, c);
+            if (immune.resistanceApplied) {
+              // Apply focused penalty when a recent (<6h) loss autopsy occurred on this exact pair + direction
+              adaptedConfidence -= immune.dampingPenalty * 0.45;
+            }
+
+            const agiState = agiSelfLearningEngine.getSelfLearningState();
+            const pidMinFloor = Number(
+              Math.max(0.70, Math.min(0.775, 0.72 + agiState.adaptiveThresholdDelta * 0.35)).toFixed(3)
             );
+            adaptedConfidence = Number(Math.max(0.50, Math.min(0.95, adaptedConfidence)).toFixed(2));
+
+            if (adaptedConfidence < pidMinFloor) {
+              this.logMind(
+                'AUDITOR',
+                `[PID + IMMUNE GATE] Blocked ${symbol} ${candidate.direction} (${strategyId}): Adapted conviction ${(adaptedConfidence * 100).toFixed(1)}% < PID floor ${(pidMinFloor * 100).toFixed(1)}% (delta=${agiState.adaptiveThresholdDelta >= 0 ? '+' : ''}${agiState.adaptiveThresholdDelta}${immune.resistanceApplied ? `, Immune: ${immune.antidoteName}` : ''}).`,
+                symbol
+              );
+              continue;
+            }
+
+            // GATE 6: Pre-Execution Behavioural Trap Filter (Promoted from shadow-only)
+            const botHealth = db.getBotHealthState() || botAuditor.auditBotHealth(db.getSignals(), db.getLossAutopsies());
+            db.saveBotHealthState(botHealth);
+            const preCheckSignal: any = {
+              id: `precheck_${Date.now()}`,
+              symbol,
+              direction: candidate.direction,
+              confidence: adaptedConfidence,
+              strategyId,
+              ruleFamily,
+              predictionTimeIst: new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata' }),
+            };
+            const preBehavioral = behaviouralEngine.validateSignal(preCheckSignal, candles, botHealth);
+            const severeTrapCatalysts = preBehavioral.activeHypotheses.filter(
+              h =>
+                h.isActive &&
+                ['LIQUIDITY_SWEEP_CLUSTERS', 'FAILED_BREAKOUT_TRAP', 'FOMO_LATE_ENTRY', 'FEAR_PANIC'].includes(h.type)
+            );
+            if (
+              preBehavioral.recommendation === 'REJECT_INSUFFICIENT_EVIDENCE' &&
+              severeTrapCatalysts.length > 0
+            ) {
+              this.logMind(
+                'AUDITOR',
+                `[BEHAVIOURAL TRAP VETO] Blocked ${symbol} ${candidate.direction}: ${severeTrapCatalysts.map(h => h.type).join(', ')} (${preBehavioral.decisionRationale})`,
+                symbol
+              );
+              continue;
+            }
 
             const signal = entryExitEngine.createResearchSignal({
               symbol,
@@ -562,23 +938,31 @@ export class AutonomousScheduler {
               signalCandle: c,
               ruleFamily,
               expiryMinutes: dynamicExpiry,
-              confidence,
-              modelVersion: `v2.5-stacked-agi`,
+              confidence: adaptedConfidence,
+              modelVersion: `v3.0-adaptive-online-ml`,
               strategyName,
-              strategyId: `stacked:${ruleFamily}:${dynamicExpiry}`,
+              strategyId,
               confluenceStrategies: candidate.confluence,
               confluenceScore: candidate.confluenceScore,
               isStackedStrategy: true,
               paperOnly: true,
-              notes: `[PAPER ONLY — NOT APPROVED FOR ACTIONABLE TRADING] Confluence: [${candidate.confluence.join(' · ')}]. Dynamic ${dynamicExpiry}m expiry strictly on 5M candle open (${activeSession.name}).`,
+              notes: `[ADAPTIVE ONLINE ML · PAPER] Confluence: [${candidate.confluence.join(' · ')}] | Regime: ${regime.regimeType} (H=${regime.hurstExponent}) | MLP(${policyTelemetry.stepCount} steps): ${(mlpDirProb * 100).toFixed(1)}% | PID Floor: ${(pidMinFloor * 100).toFixed(1)}%${immune.resistanceApplied ? ` | Immune Damped (${immune.antidoteName})` : ''}. Enters strictly on 5M open (${activeSession.name}).`,
             });
 
             createdSignals.push(signal);
-            activeSymbols.add(symbol);
+            this.recordBehavioralValidation(signal, candles);
+            inFlightSymbols.add(symbol);
+
+            // Dispatch instant signal notification to Telegram subscribers (awaited before pulse returns)
+            pendingTelegramDispatches.push(
+              telegramService.sendSignalAlert(signal).catch(err => {
+                console.error('[Scheduler] Telegram stacked signal dispatch error:', err.message);
+              })
+            );
 
             this.logMind(
               'SCIENTIST',
-              `3-Min Advance Stacked Signal: ${symbol} ${candidate.direction} [${strategyName} · Dynamic Expiry: ${dynamicExpiry}m · Confluence: ${candidate.confluenceScore} Models]. Enters strictly at 5M Candle Open (${signal.candleOpenTimeIst}).`,
+              `3-Min Advance Adaptive ML Signal: ${symbol} ${candidate.direction} [${strategyName} · Expiry: ${dynamicExpiry}m · Adapted Conf: ${(adaptedConfidence * 100).toFixed(0)}% vs PID Floor ${(pidMinFloor * 100).toFixed(0)}% · MLP ${(mlpDirProb * 100).toFixed(0)}% @ ${policyTelemetry.stepCount} steps · Regime: ${regime.regimeType}]. Enters at 5M Open (${signal.candleOpenTimeIst}).`,
               symbol,
               signal.id
             );
@@ -666,12 +1050,27 @@ export class AutonomousScheduler {
         );
       }
 
+      // Ensure all Telegram dispatches finish BEFORE returning (critical for serverless Cloud Run cron ticks)
+      if (pendingTelegramDispatches.length > 0) {
+        await Promise.allSettled(pendingTelegramDispatches);
+      }
+
       const durationMs = Date.now() - startTime;
       db.logCronRun(
         durationMs,
         'SUCCESS',
-        `Autopilot pulse #${this.cycleCount} executed in ${durationMs}ms. ${createdSignals.length} signals generated, ${updatedSignals.length} active updated.`
+        `Autopilot pulse #${this.cycleCount} (${triggerSource}) executed in ${durationMs}ms. ${createdSignals.length} signals generated, ${updatedSignals.length} active updated.`
       );
+
+      // Flush database asynchronously whenever state changed or driven by an external serverless cron tick
+      if (
+        createdSignals.length > 0 ||
+        updatedSignals.length > 0 ||
+        triggerSource === 'EXTERNAL_24_5_CRON' ||
+        triggerSource === 'SERVICE_WORKER_BACKGROUND_PULSE'
+      ) {
+        await db.flushAsync();
+      }
 
       return {
         durationMs,
@@ -684,6 +1083,7 @@ export class AutonomousScheduler {
     } catch (err: any) {
       const durationMs = Date.now() - startTime;
       db.logCronRun(durationMs, 'ERROR', `Autopilot pulse error: ${err.message}`);
+      await db.flushAsync();
       return {
         durationMs,
         pairsProcessed: 0,

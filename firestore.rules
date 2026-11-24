@@ -1,0 +1,296 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // PHASE 3: REUSABLE HARDENED PRIMITIVES
+    // =========================================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerified() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'mahammadhussain998@gmail.com'
+      );
+    }
+
+    function optionalString(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function optionalNumber(data, field) {
+      return !(field in data) || (data[field] is number);
+    }
+
+    // =========================================================================
+    // PILLAR 2: STANDALONE VALIDATION BLUEPRINTS (Zero DB reads)
+    // =========================================================================
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'role', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 200
+        && data.role is string && data.role.size() <= 20 && data.role == 'trader'
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTradeRecord(data, userId, signalId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'symbol', 'direction', 'ruleFamily', 'strategyName',
+          'expiryMinutes', 'confidence', 'triggerPrice',
+          'predictionTimeUtc', 'predictionTimeIst',
+          'lifecycleState', 'outcomeResult', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'symbol', 'direction', 'ruleFamily', 'strategyName',
+          'expiryMinutes', 'confidence', 'triggerPrice',
+          'actualEntryPrice', 'actualExitPrice',
+          'predictionTimeUtc', 'predictionTimeIst',
+          'candleOpenTimeUtc', 'candleOpenTimeIst',
+          'candleCloseTimeUtc', 'candleCloseTimeIst',
+          'actualEntryTimeUtc', 'actualExitTimeUtc', 'plannedExitTimeUtc',
+          'lifecycleState', 'outcomeResult',
+          'grossReturnPips', 'netReturnUnits', 'payoutPct',
+          'marketSession', 'marketSessionName',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.id == signalId
+        && isValidId(data.ownerId)
+        && data.ownerId == userId
+        && data.symbol is string && data.symbol.size() >= 3 && data.symbol.size() <= 16
+        && data.direction is string && data.direction.size() <= 8 && data.direction in ['BUY', 'SELL']
+        && data.ruleFamily is string && data.ruleFamily.size() >= 1 && data.ruleFamily.size() <= 120
+        && data.strategyName is string && data.strategyName.size() >= 1 && data.strategyName.size() <= 200
+        && data.expiryMinutes is number && data.expiryMinutes >= 1 && data.expiryMinutes <= 240
+        && data.confidence is number && data.confidence >= 0 && data.confidence <= 1
+        && data.triggerPrice is number && data.triggerPrice > 0
+        && optionalNumber(data, 'actualEntryPrice')
+        && optionalNumber(data, 'actualExitPrice')
+        && data.predictionTimeUtc is string && data.predictionTimeUtc.size() >= 1 && data.predictionTimeUtc.size() <= 40
+        && data.predictionTimeIst is string && data.predictionTimeIst.size() >= 1 && data.predictionTimeIst.size() <= 40
+        && optionalString(data, 'candleOpenTimeUtc', 40)
+        && optionalString(data, 'candleOpenTimeIst', 40)
+        && optionalString(data, 'candleCloseTimeUtc', 40)
+        && optionalString(data, 'candleCloseTimeIst', 40)
+        && optionalString(data, 'actualEntryTimeUtc', 40)
+        && optionalString(data, 'actualExitTimeUtc', 40)
+        && optionalString(data, 'plannedExitTimeUtc', 40)
+        && data.lifecycleState is string && data.lifecycleState.size() <= 32
+        && data.lifecycleState in ['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE', 'EXIT_PENDING', 'CLOSED', 'EXPIRED', 'INVALIDATED', 'AMBIGUOUS']
+        && data.outcomeResult is string && data.outcomeResult.size() <= 16
+        && data.outcomeResult in ['PENDING', 'WIN', 'LOSS', 'SCRATCH', 'CANCELLED']
+        && optionalNumber(data, 'grossReturnPips')
+        && optionalNumber(data, 'netReturnUnits')
+        && optionalNumber(data, 'payoutPct')
+        && optionalString(data, 'marketSession', 32)
+        && optionalString(data, 'marketSessionName', 64)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isSettledTrade(data) {
+      return data.lifecycleState == 'CLOSED'
+        && data.outcomeResult in ['WIN', 'LOSS', 'SCRATCH'];
+    }
+
+    function isValidUserSettings(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'globalKillSwitch', 'dailyLossLimitUnits', 'maxOpenExposureUnits',
+          'telegramBroadcast', 'telegramMinConfidence', 'minConfidence', 'maxConcurrentTrades',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'globalKillSwitch', 'dailyLossLimitUnits', 'maxOpenExposureUnits',
+          'telegramBroadcast', 'telegramMinConfidence', 'minConfidence', 'maxConcurrentTrades',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == userId
+        && data.globalKillSwitch is bool
+        && data.dailyLossLimitUnits is number && data.dailyLossLimitUnits >= 0 && data.dailyLossLimitUnits <= 1000
+        && data.maxOpenExposureUnits is number && data.maxOpenExposureUnits >= 0 && data.maxOpenExposureUnits <= 1000
+        && data.telegramBroadcast is bool
+        && data.telegramMinConfidence is number && data.telegramMinConfidence >= 0.5 && data.telegramMinConfidence <= 0.99
+        && data.minConfidence is number && data.minConfidence >= 0.5 && data.minConfidence <= 0.99
+        && data.maxConcurrentTrades is number && data.maxConcurrentTrades >= 1 && data.maxConcurrentTrades <= 20
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // COLLECTION 1: /admins/{adminId} (Read-only lookup; client writes denied)
+    // =========================================================================
+    match /admins/{adminId} {
+      allow get: if isVerified() && isValidId(adminId) && request.auth.uid == adminId;
+      allow list, create, update, delete: if false;
+    }
+
+    // =========================================================================
+    // COLLECTION 2: /users/{userId} (PII strictly isolated to owner or admin)
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if false;
+      allow create: if isVerified()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerified()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().role == existing().role
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(userId) && incoming().uid == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'updatedAt']))
+        );
+      allow delete: if false;
+
+      // =======================================================================
+      // SUBCOLLECTION 2A: /users/{userId}/tradeLedger/{signalId}
+      // Immutable cloud ledger: settled CLOSED (WIN/LOSS/SCRATCH) trades are locked!
+      // =======================================================================
+      match /tradeLedger/{signalId} {
+        allow get: if isSignedIn()
+          && isValidId(userId)
+          && isValidId(signalId)
+          && (isOwner(userId) || isAdmin());
+
+        allow list: if isSignedIn()
+          && (
+            (isOwner(userId) && resource.data.ownerId == request.auth.uid) ||
+            isAdmin()
+          );
+
+        allow create: if isVerified()
+          && isValidId(userId)
+          && isValidId(signalId)
+          && isOwner(userId)
+          && isValidTradeRecord(incoming(), userId, signalId)
+          && incoming().ownerId == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerified()
+          && isValidId(userId)
+          && isValidId(signalId)
+          && isValidTradeRecord(incoming(), userId, signalId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().symbol == existing().symbol
+          && incoming().direction == existing().direction
+          && incoming().predictionTimeUtc == existing().predictionTimeUtc
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (
+            isAdmin() ||
+            (
+              // Terminal State Locking: NEVER allow mutating an already-settled WIN/LOSS/SCRATCH trade
+              isOwner(userId)
+              && incoming().ownerId == request.auth.uid
+              && !isSettledTrade(existing())
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'actualEntryPrice', 'actualExitPrice',
+                'actualEntryTimeUtc', 'actualExitTimeUtc', 'plannedExitTimeUtc',
+                'lifecycleState', 'outcomeResult',
+                'grossReturnPips', 'netReturnUnits', 'payoutPct',
+                'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isVerified()
+          && isValidId(userId)
+          && isValidId(signalId)
+          && (isOwner(userId) || isAdmin())
+          && exists(/databases/$(database)/documents/users/$(userId));
+      }
+
+      // =======================================================================
+      // SUBCOLLECTION 2B: /users/{userId}/settings/{settingId}
+      // =======================================================================
+      match /settings/{settingId} {
+        allow get: if isSignedIn()
+          && isValidId(userId)
+          && isValidId(settingId)
+          && (isOwner(userId) || isAdmin());
+
+        allow list: if isSignedIn()
+          && (
+            (isOwner(userId) && resource.data.ownerId == request.auth.uid) ||
+            isAdmin()
+          );
+
+        allow create: if isVerified()
+          && isValidId(userId)
+          && isValidId(settingId)
+          && isOwner(userId)
+          && isValidUserSettings(incoming(), userId)
+          && incoming().ownerId == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId));
+
+        allow update: if isVerified()
+          && isValidId(userId)
+          && isValidId(settingId)
+          && isValidUserSettings(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (
+            isAdmin() ||
+            (
+              isOwner(userId)
+              && incoming().ownerId == request.auth.uid
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'globalKillSwitch', 'dailyLossLimitUnits', 'maxOpenExposureUnits',
+                'telegramBroadcast', 'telegramMinConfidence', 'minConfidence', 'maxConcurrentTrades',
+                'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if false;
+      }
+    }
+  }
+}

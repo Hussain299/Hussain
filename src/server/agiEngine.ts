@@ -28,10 +28,46 @@ export class AgiSelfLearningEngine {
   private recentVetoes: AgiSelfLearningState['recentVetoes'] = [];
   private adaptiveThresholdDelta: number = 0; // PID dynamic sensitivity adjustment
   private trailingErrors: number[] = [];
+  private recordedSignalIds: Set<string> = new Set();
   private lastReinforcementTime: string = new Date().toISOString();
 
   constructor() {
-    this.initializeBanditArms();
+    this.hydrateFromPersistentLedger();
+  }
+
+  private formatStrategyName(strategyId: string): string {
+    const gene = db.getSynthesizedStrategyById(strategyId);
+    if (gene) return gene.name;
+    if (strategyId.startsWith('stacked:')) {
+      const parts = strategyId.split(':');
+      const family = (parts[1] || 'confluence')
+        .split('_')
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+      const expiry = parts[2] ? ` (${parts[2]}m)` : '';
+      return `Stacked: ${family}${expiry}`;
+    }
+    return strategyId;
+  }
+
+  private ensureBanditArm(strategyId: string, strategyName?: string): BanditArmState {
+    if (!this.banditArms[strategyId]) {
+      // Uninformative Beta(2, 2) prior centered at 50% so live outcomes adapt quickly
+      this.banditArms[strategyId] = {
+        strategyId,
+        strategyName: strategyName || this.formatStrategyName(strategyId),
+        alpha: 2.0,
+        beta: 2.0,
+        totalTrades: 0,
+        wins: 0,
+        losses: 0,
+        currentWinRate: 50.0,
+        thompsonSampleScore: 0.5,
+        status: 'ACTIVE_ARM',
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+    return this.banditArms[strategyId];
   }
 
   /**
@@ -41,22 +77,166 @@ export class AgiSelfLearningEngine {
     const strategies = db.getSynthesizedStrategies();
     for (const strat of strategies) {
       if (!this.banditArms[strat.id]) {
-        // Uniform Beta(2, 2) uninformative prior centered around 50%
         this.banditArms[strat.id] = {
           strategyId: strat.id,
           strategyName: strat.name,
-          alpha: 4.0, // pseudo-observations: 4 wins
-          beta: 2.0,  // pseudo-observations: 2 losses
+          alpha: 2.0,
+          beta: 2.0,
           totalTrades: 0,
           wins: 0,
           losses: 0,
-          currentWinRate: 66.7,
-          thompsonSampleScore: 0.667,
+          currentWinRate: 50.0,
+          thompsonSampleScore: 0.5,
           status: 'ACTIVE_ARM',
           lastUpdated: new Date().toISOString(),
         };
       }
     }
+  }
+
+  /**
+   * Re-hydrates Thompson Sampling bandit arms (for BOTH synthesized and stacked strategies),
+   * episodic k-NN memories, and the PID adaptive threshold directly from persistent DB state
+   * so learning is NEVER wiped on server restart.
+   */
+  public hydrateFromPersistentLedger() {
+    this.initializeBanditArms();
+
+    // 1. Hydrate all strategy bandit arms from persisted StrategyPerformanceRecord ledger
+    const perfRecords = db.getStrategyPerformance();
+    const gamma = 0.96;
+    for (const record of perfRecords) {
+      if (!record.strategyId || record.strategyId.includes('test_')) continue;
+
+      let alpha = 2.0;
+      let beta = 2.0;
+      let wins = 0;
+      let losses = 0;
+
+      if (Array.isArray(record.scoredOutcomes) && record.scoredOutcomes.length > 0) {
+        for (const outcome of record.scoredOutcomes) {
+          if (outcome.result === 'WIN') {
+            wins += 1;
+            alpha = alpha * gamma + 1.0;
+            beta = beta * gamma;
+          } else if (outcome.result === 'LOSS') {
+            losses += 1;
+            alpha = alpha * gamma;
+            beta = beta * gamma + 1.0;
+          }
+        }
+      } else {
+        wins = record.binaryWins ?? record.wins ?? 0;
+        losses = record.binaryLosses ?? record.losses ?? 0;
+        alpha = 2.0 + wins;
+        beta = 2.0 + losses;
+      }
+
+      const scored = wins + losses;
+      const expectedWinRate = alpha / Math.max(0.001, alpha + beta);
+      const empiricalWinRate = scored > 0 ? wins / scored : 0.5;
+      const shouldThrottle = scored >= 8 && (expectedWinRate < 0.556 || empiricalWinRate < 0.556);
+
+      this.banditArms[record.strategyId] = {
+        strategyId: record.strategyId,
+        strategyName: this.formatStrategyName(record.strategyId),
+        alpha: Number(alpha.toFixed(3)),
+        beta: Number(beta.toFixed(3)),
+        totalTrades: scored,
+        wins,
+        losses,
+        currentWinRate: scored > 0 ? Number(((wins / scored) * 100).toFixed(1)) : 50.0,
+        thompsonSampleScore: Number(this.sampleBeta(alpha, beta).toFixed(3)),
+        status: shouldThrottle ? 'THROTTLED' : 'ACTIVE_ARM',
+        lastUpdated: record.updatedAt || new Date().toISOString(),
+      };
+    }
+
+    // 2. Hydrate Episodic Memory Bank from persisted vectors
+    const storedMemories = db.getEpisodicMemories();
+    if (Array.isArray(storedMemories) && storedMemories.length > 0) {
+      this.episodicMemories = storedMemories.slice(0, 500).map((m, idx) => ({
+        id: m.signalId ? `mem_${m.signalId}` : `mem_hydrated_${idx}`,
+        signalId: m.signalId || `hydrated_${idx}`,
+        symbol: m.symbol,
+        direction: m.direction,
+        featureVector: m.vector,
+        marketSession: 'OVERLAP',
+        outcome: m.y === 1 ? 'WIN' : 'LOSS',
+        netReturnUnits: m.y === 1 ? 0.8 : -1.0,
+        entryPrice: 0,
+        exitPrice: 0,
+        timestamp: m.timestamp,
+      }));
+    }
+
+    // 3. Hydrate PID adaptive threshold & deduplication set from settled signals chronologically
+    const settledSignals = db
+      .getSignals(false)
+      .filter(
+        s =>
+          s.lifecycleState === 'CLOSED' &&
+          (s.outcomeResult === 'WIN' || s.outcomeResult === 'LOSS') &&
+          !s.ruleFamily?.startsWith('test_')
+      )
+      .sort((a, b) => {
+        const ta = Date.parse(a.actualExitTimeUtc || a.plannedExitTimeUtc || a.predictionTimeUtc);
+        const tb = Date.parse(b.actualExitTimeUtc || b.plannedExitTimeUtc || b.predictionTimeUtc);
+        return ta - tb;
+      });
+
+    this.trailingErrors = [];
+    this.adaptiveThresholdDelta = 0;
+    this.recordedSignalIds.clear();
+
+    const pidSlice = settledSignals.slice(-20);
+    for (const sig of settledSignals) {
+      this.recordedSignalIds.add(sig.id);
+    }
+    for (const sig of pidSlice) {
+      this.updatePidController(sig.outcomeResult as 'WIN' | 'LOSS');
+      this.lastReinforcementTime = sig.actualExitTimeUtc || sig.predictionTimeUtc || this.lastReinforcementTime;
+    }
+  }
+
+  /**
+   * Checks whether a strategy arm is empirically underperforming the 80%-payout binary break-even floor (55.6%)
+   * and should be throttled from emitting live signals.
+   */
+  public isStrategyThrottled(strategyId: string): {
+    throttled: boolean;
+    reason?: string;
+    winRate?: number;
+    sampleSize?: number;
+  } {
+    const arm = this.banditArms[strategyId];
+    if (arm && arm.status === 'THROTTLED') {
+      return {
+        throttled: true,
+        winRate: arm.currentWinRate,
+        sampleSize: arm.wins + arm.losses,
+        reason: `Bandit Arm THROTTLED: ${arm.strategyName} is ${arm.wins}W-${arm.losses}L (${arm.currentWinRate.toFixed(1)}% WR < 55.6% break-even floor across ${arm.wins + arm.losses} settled trades).`,
+      };
+    }
+
+    // Also verify directly against persisted strategyPerformance in case arm wasn't synced yet
+    const perf = db.getStrategyPerformance().find(p => p.strategyId === strategyId);
+    if (perf) {
+      const wins = perf.binaryWins ?? perf.wins ?? 0;
+      const losses = perf.binaryLosses ?? perf.losses ?? 0;
+      const scored = wins + losses;
+      const wr = scored > 0 ? wins / scored : 0.5;
+      if (scored >= 8 && wr < 0.556) {
+        return {
+          throttled: true,
+          winRate: Number((wr * 100).toFixed(1)),
+          sampleSize: scored,
+          reason: `Empirical Performance THROTTLED: ${strategyId} is ${wins}W-${losses}L (${(wr * 100).toFixed(1)}% WR < 55.6% break-even floor).`,
+        };
+      }
+    }
+
+    return { throttled: false };
   }
 
   /**
@@ -173,6 +353,13 @@ export class AgiSelfLearningEngine {
     outcome: 'WIN' | 'LOSS' | 'SCRATCH' | 'CANCELLED',
     netUnits: number
   ) {
+    if (signal.id && this.recordedSignalIds.has(signal.id)) {
+      return; // Never double-count the same settled signal
+    }
+    if (signal.id) {
+      this.recordedSignalIds.add(signal.id);
+    }
+
     const memory: EpisodicTradeMemory = {
       id: `mem_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       signalId: signal.id,
@@ -192,8 +379,9 @@ export class AgiSelfLearningEngine {
       this.episodicMemories.pop(); // Cap bounded episodic memory store
     }
 
-    // Trigger online Bayesian Reinforcement for the strategy arm
-    this.updateBanditArm(signal.strategyId || signal.synthesizedGeneId || 'default', outcome);
+    // Trigger online Bayesian Reinforcement for BOTH stacked and synthesized strategy arms
+    const strategyId = signal.strategyId || signal.synthesizedGeneId || `rule:${signal.ruleFamily}`;
+    this.updateBanditArm(strategyId, outcome, signal.strategyName);
 
     // Update PID Adaptive Threshold
     this.updatePidController(outcome);
@@ -280,10 +468,14 @@ export class AgiSelfLearningEngine {
    * 3. ONLINE BAYESIAN MULTI-ARMED BANDIT (THOMPSON SAMPLING)
    * Updates posterior Beta distribution of strategy win rates with exponential decay.
    */
-  public updateBanditArm(strategyId: string, outcome: 'WIN' | 'LOSS' | 'SCRATCH' | 'CANCELLED') {
+  public updateBanditArm(
+    strategyId: string,
+    outcome: 'WIN' | 'LOSS' | 'SCRATCH' | 'CANCELLED',
+    strategyName?: string
+  ) {
+    if (!strategyId || ['SCRATCH', 'CANCELLED'].includes(outcome)) return;
     this.initializeBanditArms();
-    const arm = this.banditArms[strategyId];
-    if (!arm || ['SCRATCH', 'CANCELLED'].includes(outcome)) return;
+    const arm = this.ensureBanditArm(strategyId, strategyName);
 
     const gamma = 0.96; // Exponential recency discount (~25 trade memory horizon)
     arm.totalTrades += 1;
@@ -306,7 +498,8 @@ export class AgiSelfLearningEngine {
 
     // Throttle underperforming arms below binary options break-even floor (55.6% @ 80% payout)
     const expectedWinRate = arm.alpha / (arm.alpha + arm.beta);
-    if (scored >= 8 && expectedWinRate < 0.556) {
+    const empiricalWinRate = arm.wins / scored;
+    if (scored >= 8 && (expectedWinRate < 0.556 || empiricalWinRate < 0.556)) {
       arm.status = 'THROTTLED';
     } else {
       arm.status = 'ACTIVE_ARM';
@@ -504,9 +697,14 @@ export class AgiSelfLearningEngine {
       return { resistanceApplied: false, dampingPenalty: 0 };
     }
 
-    // Match autopsies on this pair and direction in recent history
+    // Match recent autopsies (last 6 hours) on this pair and direction so stale losses don't permanently starve winning pairs
+    const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+    const nowMs = Date.now();
     const matching = autopsies.filter(
-      a => a.symbol === symbol && a.direction === direction
+      a =>
+        a.symbol === symbol &&
+        a.direction === direction &&
+        (!a.timestamp || nowMs - Date.parse(a.timestamp) <= SIX_HOURS_MS)
     );
 
     if (matching.length === 0) {

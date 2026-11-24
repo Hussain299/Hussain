@@ -13,6 +13,14 @@ export const NotificationBanner: React.FC<NotificationBannerProps> = ({
   onDismiss,
   onSelectSignal,
 }) => {
+  React.useEffect(() => {
+    if (!notification) return;
+    const timer = setTimeout(() => {
+      onDismiss();
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [notification, onDismiss]);
+
   if (!notification) return null;
 
   const isBuy = notification.direction === 'BUY';
@@ -43,8 +51,8 @@ export const NotificationBanner: React.FC<NotificationBannerProps> = ({
   };
 
   return (
-    <div className="fixed top-14 left-3 right-3 sm:left-auto sm:right-6 sm:w-[420px] z-50 animate-bounce-once">
-      <div className="bg-neutral-900 border-2 border-emerald-500 rounded-2xl shadow-2xl p-4 flex flex-col gap-3 backdrop-blur-md">
+    <div className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 sm:w-[420px] z-50 pointer-events-none animate-in fade-in slide-in-from-bottom-4 duration-200">
+      <div className="bg-[#17212D]/95 border-2 border-[#72A98B] rounded-2xl shadow-2xl p-4 flex flex-col gap-3 backdrop-blur-md pointer-events-auto">
         {/* Top Header */}
         <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
           <div className="flex items-center gap-2">

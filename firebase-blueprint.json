@@ -1,0 +1,317 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated trader profile isolated strictly to owner and verified admin.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Authentication user UID."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Display name shown in header."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 200,
+          "description": "Verified account email (PII restricted to owner/admin)."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["trader"],
+          "maxLength": 20,
+          "description": "Non-privileged default trader role; cannot be self-elevated."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": ["uid", "displayName", "email", "role", "createdAt", "updatedAt"]
+    },
+    "TradeRecord": {
+      "title": "TradeRecord",
+      "description": "Immutable forward trading ledger record synced from SignalForge backend.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique signal identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the authenticated user owning this ledger copy."
+        },
+        "symbol": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 16,
+          "description": "Forex currency pair (e.g., EUR/USD)."
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["BUY", "SELL"],
+          "maxLength": 8,
+          "description": "Trade direction."
+        },
+        "ruleFamily": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Quantitative rule family identifier."
+        },
+        "strategyName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Human-readable strategy name."
+        },
+        "expiryMinutes": {
+          "type": "number",
+          "description": "Binary option expiry duration in minutes."
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Calibrated model conviction score (0 to 1)."
+        },
+        "triggerPrice": {
+          "type": "number",
+          "description": "Target trigger price level."
+        },
+        "actualEntryPrice": {
+          "type": "number",
+          "description": "Observed candle-open entry price."
+        },
+        "actualExitPrice": {
+          "type": "number",
+          "description": "Observed expiry candle close price."
+        },
+        "predictionTimeUtc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Signal alert UTC ISO timestamp."
+        },
+        "predictionTimeIst": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Signal alert IST formatted time."
+        },
+        "candleOpenTimeUtc": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Scheduled 5M candle open UTC ISO timestamp."
+        },
+        "candleOpenTimeIst": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Scheduled 5M candle open IST formatted time."
+        },
+        "candleCloseTimeUtc": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Scheduled contract expiry UTC ISO timestamp."
+        },
+        "candleCloseTimeIst": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Scheduled contract expiry IST formatted time."
+        },
+        "actualEntryTimeUtc": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Actual entry execution UTC ISO timestamp."
+        },
+        "actualExitTimeUtc": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Actual settlement exit UTC ISO timestamp."
+        },
+        "plannedExitTimeUtc": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Planned settlement UTC ISO timestamp."
+        },
+        "lifecycleState": {
+          "type": "string",
+          "enum": ["WAITING_FOR_ENTRY", "ENTRY_TRIGGERED", "ACTIVE", "EXIT_PENDING", "CLOSED", "EXPIRED", "INVALIDATED", "AMBIGUOUS"],
+          "maxLength": 32,
+          "description": "Causal trade lifecycle state."
+        },
+        "outcomeResult": {
+          "type": "string",
+          "enum": ["PENDING", "WIN", "LOSS", "SCRATCH", "CANCELLED"],
+          "maxLength": 16,
+          "description": "Final or pending contract settlement outcome."
+        },
+        "grossReturnPips": {
+          "type": "number",
+          "description": "Informational price movement in pips."
+        },
+        "netReturnUnits": {
+          "type": "number",
+          "description": "Payout-adjusted stake unit return (+0.80 / -1.00 / 0)."
+        },
+        "payoutPct": {
+          "type": "number",
+          "description": "Contract payout percentage."
+        },
+        "marketSession": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Market session identifier."
+        },
+        "marketSessionName": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Market session display name."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "symbol",
+        "direction",
+        "ruleFamily",
+        "strategyName",
+        "expiryMinutes",
+        "confidence",
+        "triggerPrice",
+        "predictionTimeUtc",
+        "predictionTimeIst",
+        "lifecycleState",
+        "outcomeResult",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "Persistent manual bot control preferences for the authenticated user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner UID."
+        },
+        "globalKillSwitch": {
+          "type": "boolean",
+          "description": "Emergency bot pause toggle."
+        },
+        "dailyLossLimitUnits": {
+          "type": "number",
+          "description": "Maximum daily stake loss limit."
+        },
+        "maxOpenExposureUnits": {
+          "type": "number",
+          "description": "Maximum concurrent open exposure."
+        },
+        "telegramBroadcast": {
+          "type": "boolean",
+          "description": "Whether Telegram alerts are enabled."
+        },
+        "telegramMinConfidence": {
+          "type": "number",
+          "description": "Minimum confidence threshold for Telegram broadcast."
+        },
+        "minConfidence": {
+          "type": "number",
+          "description": "Minimum bot signal confidence threshold."
+        },
+        "maxConcurrentTrades": {
+          "type": "number",
+          "description": "Maximum concurrent trades allowed."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "ownerId",
+        "globalKillSwitch",
+        "dailyLossLimitUnits",
+        "maxOpenExposureUnits",
+        "telegramBroadcast",
+        "telegramMinConfidence",
+        "minConfidence",
+        "maxConcurrentTrades",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Server-provisioned admin role lookup record.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        }
+      },
+      "required": ["uid"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile documents (strictly owner/admin read and write)."
+    },
+    "/users/{userId}/tradeLedger/{signalId}": {
+      "schema": { "$ref": "#/entities/TradeRecord" },
+      "description": "Persistent immutable trade history ledger locked once CLOSED with WIN/LOSS/SCRATCH."
+    },
+    "/users/{userId}/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/UserSettings" },
+      "description": "Persistent user bot configuration settings."
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Admin authorization table (read-only by rules, client writes denied)."
+    }
+  }
+}

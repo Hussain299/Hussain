@@ -24,6 +24,9 @@ export default defineConfig(() => {
         'react/jsx-runtime',
         'lucide-react',
         'motion',
+        'firebase/app',
+        'firebase/auth',
+        'firebase/firestore',
       ],
       // Prevent 504 Outdated Optimize Dep in iframe preview environment
       ignoreOutdatedRequests: true,

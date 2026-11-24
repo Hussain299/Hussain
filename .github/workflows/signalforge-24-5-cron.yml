@@ -1,0 +1,22 @@
+name: SignalForge 24/5 Forex Market Cron
+
+# Runs every 5 minutes Monday through Friday (UTC) plus Sunday 22:00-23:59 UTC
+# to keep a deployed SignalForge Cloud Run / external server awake and executing 24/5.
+# Set repository secret SIGNALFORGE_APP_URL to your deployed public URL (e.g. https://your-app.run.app)
+on:
+  schedule:
+    - cron: '*/5 * * * 1-5'
+    - cron: '*/5 22-23 * * 0'
+  workflow_dispatch:
+
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger 24/5 SignalForge Cron Tick
+        run: |
+          if [ -z "${{ secrets.SIGNALFORGE_APP_URL }}" ]; then
+            echo "Set SIGNALFORGE_APP_URL secret to your deployed public URL."
+            exit 0
+          fi
+          curl -fsS -m 25 "${{ secrets.SIGNALFORGE_APP_URL }}/api/cron/tick?source=GITHUB_ACTIONS_24_5"

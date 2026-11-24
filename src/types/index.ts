@@ -197,6 +197,8 @@ export interface ResearchSignal {
   /** True when this is an internal forward-paper observation, not an approved actionable alert. */
   paperOnly?: boolean;
   lossAutopsy?: LossAutopsy;
+  /** UTC ISO timestamp recording when the Telegram Win/Loss Audit Report was dispatched for this settled signal. */
+  telegramAuditSentAt?: string;
 }
 
 export interface LossAutopsy {
@@ -545,4 +547,194 @@ export interface AgiSelfLearningState {
   adaptiveThresholdDelta: number;
   activeImmuneAntidotesCount: number;
   lastReinforcementAt: string;
+}
+
+// -------------------------------------------------------------
+// BEHAVIOURAL INTELLIGENCE & BOT SELF-MONITORING ARCHITECTURE
+// -------------------------------------------------------------
+
+export type MarketBehaviorType =
+  | 'FEAR_PANIC'
+  | 'GREED_MOMENTUM_CHASING'
+  | 'HERD_CROWDED_POSITIONING'
+  | 'FOMO_LATE_ENTRY'
+  | 'LOSS_AVERSION_DEFENSE'
+  | 'OVERCONFIDENCE_COMPLACENCY'
+  | 'LIQUIDITY_SWEEP_CLUSTERS'
+  | 'CAPITULATION'
+  | 'FAILED_BREAKOUT_TRAP'
+  | 'MARKET_INDECISION';
+
+export interface MeasurableEvidenceItem {
+  metricName: string;
+  measuredValue: number;
+  threshold: number;
+  unit?: string;
+  interpretation: string;
+}
+
+export interface BehavioralHypothesis {
+  type: MarketBehaviorType;
+  name: string;
+  symbol: ForexSymbol;
+  isActive: boolean;
+  confidenceScore: number; // 0.0 - 1.0
+  evidenceStrength: number; // 0.0 - 1.0
+  measurableEvidence: MeasurableEvidenceItem[];
+  plainLanguageExplanation: string;
+  tradeImplication: 'BULLISH_EDGE' | 'BEARISH_EDGE' | 'HIGH_RISK_FADE' | 'STAND_DOWN' | 'NEUTRAL';
+  detectedAtIst: string;
+}
+
+export interface ConfidenceCalibrationState {
+  brierScore: number;
+  expectedCalibrationError: number;
+  calibrationStatus: 'WELL_CALIBRATED' | 'OVERCONFIDENT' | 'UNDERCONFIDENT';
+  averageReportedConfidence: number;
+  actualRealizedWinRate: number;
+  sampleSize: number;
+  calibrationBins: Array<{
+    binRange: string;
+    meanPredictedProbability: number;
+    observedWinRate: number;
+    tradeCount: number;
+  }>;
+}
+
+export interface BotSelfMonitoringState {
+  confidenceCalibration: ConfidenceCalibrationState;
+  recencyBiasIndex: {
+    streakLength: number;
+    streakType: 'WIN' | 'LOSS' | 'NONE';
+    distortionFactor: number;
+    isBiased: boolean;
+    recommendation: string;
+  };
+  confirmationBiasAudit: {
+    contradictionRate: number;
+    trendCounterTradesCount: number;
+    trendAlignedTradesCount: number;
+    status: 'OPTIMAL' | 'ELEVATED_CONFIRMATION_BIAS';
+  };
+  overtradingMetrics: {
+    signalsPastHour: number;
+    signalsPast24h: number;
+    hourlyThreshold: number;
+    isOvertrading: boolean;
+    burstFrequencyPenalty: number;
+  };
+  repeatedFailureVulnerability: {
+    vulnerabilityIndex: number; // 0.0 - 1.0
+    activeVulnerabilities: string[];
+    clusterCentroidMatches: Array<{
+      clusterName: string;
+      similarityScore: number;
+      historicalLossRate: number;
+    }>;
+  };
+  strategyDeterioration: {
+    monitoredCount: number;
+    deterioratingCount: number;
+    decayingStrategies: Array<{
+      strategyId: string;
+      strategyName: string;
+      recentWinRate: number;
+      breakevenThreshold: number;
+      cusumStatistic: number;
+      isQuarantined: boolean;
+    }>;
+  };
+  excessiveDependenceHHI: {
+    hhiScore: number; // 0 - 10000
+    dominantStrategy: string;
+    concentrationRisk: 'DIVERSIFIED' | 'MODERATE' | 'HIGH_CONCENTRATION';
+  };
+  lastAuditedAtIst: string;
+}
+
+export interface BehavioralDecisionValidation {
+  signalId: string;
+  symbol: ForexSymbol;
+  direction: SignalDirection;
+  recommendation: 'SUPPORT' | 'REDUCE_CONFIDENCE' | 'FLAG_UNCERTAINTY' | 'REJECT_INSUFFICIENT_EVIDENCE' | 'OBSERVE_ONLY';
+  baselineConfidence: number;
+  behaviouralAdjustedConfidence: number;
+  adjustmentMultiplier: number;
+  activeHypotheses: BehavioralHypothesis[];
+  evidenceSummary: string[];
+  botHealthPenalty: number;
+  decisionRationale: string;
+  validatedAtIst: string;
+}
+
+export interface BehavioralMemoryRecord {
+  id: string;
+  signalId: string;
+  symbol: ForexSymbol;
+  direction: SignalDirection;
+  timestampIst: string;
+  baselineConfidence: number;
+  adjustedConfidence: number;
+  marketRegime: string;
+  activeBehaviors: MarketBehaviorType[];
+  evidenceSnapshot: string;
+  recommendation: 'SUPPORT' | 'REDUCE_CONFIDENCE' | 'FLAG_UNCERTAINTY' | 'REJECT_INSUFFICIENT_EVIDENCE' | 'OBSERVE_ONLY';
+  actualOutcome: 'WIN' | 'LOSS' | 'SCRATCH' | 'PENDING' | 'CANCELLED';
+  predictionError: number | null; // (outcome - confidence)^2
+  grossReturnPips: number | null;
+  netReturnUnits: number | null;
+  avoidedLoss: boolean;
+  settledAtIst?: string;
+}
+
+export interface ShadowModeComparison {
+  totalEvaluations: number;
+  baselineTradesCount: number;
+  shadowTradesCount: number;
+  baselineWinRate: number | null;
+  shadowWinRate: number | null;
+  baselineExpectedValueUnits: number;
+  shadowExpectedValueUnits: number;
+  avoidedLosingTradesCount: number;
+  brierScoreBaseline: number;
+  brierScoreShadow: number;
+  calibrationImprovementPct: number;
+  ablationTests: Array<{
+    componentId: string;
+    componentName: string;
+    description: string;
+    sampleSize: number;
+    marginalWinRateDelta: number;
+    marginalEVUnitsDelta: number;
+    pValue: number;
+    status: 'PROMOTABLE' | 'NEEDS_MORE_DATA' | 'REJECTED';
+  }>;
+  lastComparedAtIst: string;
+}
+
+export interface TelegramSubscriber {
+  id: string | number;
+  name: string;
+  username?: string;
+  addedAt: string;
+  type?: 'user' | 'group' | 'channel';
+  lastNotifiedAt?: string;
+}
+
+export interface TelegramConfig {
+  enabled: boolean;
+  botToken: string;
+  botUsername?: string;
+  botFirstName?: string;
+  subscribers: TelegramSubscriber[];
+  notifyOnNewSignal: boolean;
+  notifyOnSettlement: boolean;
+  minConfidence: number;
+  lastSyncAt?: string;
+}
+
+export interface TelegramDispatchResult {
+  subscriberId: string | number;
+  success: boolean;
+  error?: string;
 }

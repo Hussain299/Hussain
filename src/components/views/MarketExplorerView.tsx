@@ -1,11 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import {
-  LineChart,
   Activity,
-  Layers,
   Database,
   CheckCircle2,
-  AlertCircle,
   Clock,
   ArrowUp,
   ArrowDown,
@@ -54,11 +51,30 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
         )
       : 0;
 
+  const formatIST = (timestampStr?: string) => {
+    if (!timestampStr) return '--:--:-- IST';
+    try {
+      const d = new Date(timestampStr);
+      if (isNaN(d.getTime())) return timestampStr;
+      return (
+        d.toLocaleTimeString('en-IN', {
+          timeZone: 'Asia/Kolkata',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        }) + ' IST'
+      );
+    } catch {
+      return timestampStr;
+    }
+  };
+
   // Render SVG Candlestick Chart
   const renderChart = () => {
     if (candles.length < 2) {
       return (
-        <div className="h-72 flex items-center justify-center text-neutral-500 font-mono text-xs">
+        <div className="h-72 flex items-center justify-center text-[#AAB4BF] font-mono text-xs bg-[#222B36] border border-[#354251] rounded-lg">
           Loading candle series...
         </div>
       );
@@ -78,7 +94,7 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
     };
 
     return (
-      <div className="relative w-full overflow-x-auto bg-neutral-950 p-4 border border-neutral-800 rounded">
+      <div className="relative w-full overflow-x-auto bg-[#222B36] p-4 border border-[#354251] rounded-lg">
         <svg
           viewBox={`0 0 ${chartWidth} ${chartHeight}`}
           className="w-full h-72 overflow-visible select-none"
@@ -94,14 +110,15 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
                   y1={y}
                   x2={chartWidth}
                   y2={y}
-                  stroke="#1f2937"
+                  stroke="#354251"
                   strokeDasharray="3 3"
                   strokeWidth="1"
+                  strokeOpacity="0.6"
                 />
                 <text
                   x={chartWidth - 55}
                   y={y - 4}
-                  fill="#64748b"
+                  fill="#AAB4BF"
                   fontSize="9"
                   fontFamily="monospace"
                 >
@@ -121,11 +138,12 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
             const yClose = getY(c.close);
             const bodyY = Math.min(yOpen, yClose);
             const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
+            const candleColor = isGreen ? '#72A98B' : '#B7797D';
 
             return (
               <g
                 key={c.timestampMs}
-                className="cursor-pointer"
+                className="cursor-pointer transition-opacity hover:opacity-80"
                 onMouseEnter={() => setHoveredCandle(c)}
                 onMouseLeave={() => setHoveredCandle(null)}
               >
@@ -135,7 +153,7 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
                   y1={yHigh}
                   x2={x}
                   y2={yLow}
-                  stroke={isGreen ? '#10b981' : '#f43f5e'}
+                  stroke={candleColor}
                   strokeWidth="1.2"
                 />
                 {/* Candle Body */}
@@ -144,7 +162,7 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
                   y={bodyY}
                   width={candleWidth}
                   height={bodyHeight}
-                  fill={isGreen ? '#10b981' : '#f43f5e'}
+                  fill={candleColor}
                   rx="0.5"
                 />
               </g>
@@ -153,26 +171,27 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
         </svg>
 
         {/* OHLC Bar Inspector */}
-        <div className="mt-3 pt-2 border-t border-neutral-850 flex items-center justify-between text-xs font-mono text-neutral-400">
-          <div className="flex items-center gap-4">
+        <div className="mt-3 pt-2 border-t border-[#354251] flex flex-wrap items-center justify-between text-xs font-mono text-[#AAB4BF] gap-2">
+          <div className="flex flex-wrap items-center gap-4">
             <span>
-              O: <strong className="text-white">{(hoveredCandle || latestCandle)?.open}</strong>
+              O: <strong className="text-[#E8E5DE]">{(hoveredCandle || latestCandle)?.open}</strong>
             </span>
             <span>
-              H: <strong className="text-white">{(hoveredCandle || latestCandle)?.high}</strong>
+              H: <strong className="text-[#E8E5DE]">{(hoveredCandle || latestCandle)?.high}</strong>
             </span>
             <span>
-              L: <strong className="text-white">{(hoveredCandle || latestCandle)?.low}</strong>
+              L: <strong className="text-[#E8E5DE]">{(hoveredCandle || latestCandle)?.low}</strong>
             </span>
             <span>
-              C: <strong className="text-white">{(hoveredCandle || latestCandle)?.close}</strong>
+              C: <strong className="text-[#E8E5DE]">{(hoveredCandle || latestCandle)?.close}</strong>
             </span>
             <span>
-              Vol: <strong className="text-white">{(hoveredCandle || latestCandle)?.volume}</strong>
+              Vol: <strong className="text-[#E8E5DE]">{(hoveredCandle || latestCandle)?.volume}</strong>
             </span>
           </div>
-          <div className="text-[11px] text-neutral-500">
-            Time: {(hoveredCandle || latestCandle)?.timestamp.substring(11, 19)} UTC
+          <div className="text-[11px] text-[#AAB4BF] flex items-center gap-1.5">
+            <Clock className="w-3 h-3 text-[#6C9D91]" />
+            <span>Time: {formatIST((hoveredCandle || latestCandle)?.timestamp)}</span>
           </div>
         </div>
       </div>
@@ -180,18 +199,18 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-y-auto bg-neutral-950 p-6 space-y-6">
+    <div className="w-full bg-[#17212D] text-[#E8E5DE] p-4 lg:p-6 space-y-6 font-sans pb-16 lg:pb-8">
       {/* Pair Selector & Feed Health Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-neutral-800">
-        <div className="flex items-center gap-1.5 overflow-x-auto">
+      <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-[#354251]">
+        <div className="flex items-center gap-1.5 overflow-x-auto py-1">
           {FOREX_PAIRS.map(pair => (
             <button
               key={pair}
               onClick={() => setSelectedPair(pair)}
               className={`px-3 py-1.5 rounded text-xs font-mono font-medium transition-colors ${
                 selectedPair === pair
-                  ? 'bg-neutral-800 text-white font-semibold border border-neutral-700'
-                  : 'text-neutral-400 hover:text-white bg-neutral-900 border border-neutral-800/80'
+                  ? 'bg-[#17212D] text-[#E8E5DE] font-semibold border border-[#6C9D91]'
+                  : 'text-[#AAB4BF] hover:text-[#E8E5DE] bg-[#222B36] border border-[#354251]'
               }`}
             >
               {pair}
@@ -200,35 +219,38 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
         </div>
 
         <div className="flex items-center gap-4 text-xs font-mono">
-          <div className="flex items-center gap-1.5 text-neutral-400">
+          <div className="flex items-center gap-1.5 text-[#AAB4BF]">
             <span>Active Source:</span>
-            <span className="text-emerald-400 font-semibold uppercase">{activeSource}</span>
+            <span className="text-[#72A98B] font-semibold uppercase">{activeSource}</span>
           </div>
-          <div className="flex items-center gap-1.5 text-neutral-400">
+          <div className="flex items-center gap-1.5 text-[#AAB4BF]">
             <span>Data Quality:</span>
-            <span className="text-white font-semibold">{qualityScore}/100</span>
+            <span className="text-[#E8E5DE] font-semibold">{qualityScore}/100</span>
           </div>
         </div>
       </div>
 
       {/* Main Chart Section */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-3">
-            <h3 className="text-base font-bold text-white font-mono">{selectedPair} M1 Continuous</h3>
-            <span className="text-xs font-mono text-neutral-400">
-              Last: <strong className="text-white">{latestCandle?.close}</strong>
+            <h3 className="text-base font-bold text-[#E8E5DE] font-mono">{selectedPair} M1 Continuous</h3>
+            <span className="text-xs font-mono text-[#AAB4BF]">
+              Last: <strong className="text-[#E8E5DE]">{latestCandle?.close}</strong>
             </span>
             <span
-              className={`text-xs font-mono font-medium flex items-center ${
-                changePips >= 0 ? 'text-emerald-400' : 'text-rose-400'
+              className={`text-xs font-mono font-medium flex items-center gap-0.5 px-2 py-0.5 rounded ${
+                changePips >= 0
+                  ? 'bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/30'
+                  : 'bg-[#B7797D]/15 text-[#B7797D] border border-[#B7797D]/30'
               }`}
             >
+              {changePips >= 0 ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />}
               {changePips >= 0 ? '+' : ''}
               {changePips} pips
             </span>
           </div>
-          <div className="text-xs font-mono text-neutral-500">
+          <div className="text-xs font-mono text-[#AAB4BF]">
             {candles.length} One-Minute Candles Cached
           </div>
         </div>
@@ -238,40 +260,40 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
 
       {/* Provider Health Matrix & Architecture */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
-        <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4 text-xs font-mono space-y-2">
-          <div className="text-neutral-400 uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
-            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Tier 1 Provider: Biquote.io</span>
+        <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
+          <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
+            <CheckCircle2 className="w-3.5 h-3.5 text-[#72A98B]" />
+            <span className="text-[#E8E5DE]">Tier 1 Provider: Biquote.io</span>
           </div>
-          <p className="text-neutral-300">
-            Direct public forex endpoint (<code className="text-neutral-400">/api/symbol/ohlc</code>).
-            Unfinished candles stripped; timestamps converted to ISO UTC.
+          <p className="text-[#AAB4BF]">
+            Direct public forex endpoint (<code className="text-[#E8E5DE] bg-[#17212D] px-1 py-0.5 rounded">/api/symbol/ohlc</code>).
+            Unfinished candles stripped; timestamps converted to ISO IST.
           </p>
-          <div className="text-[11px] text-neutral-500">Status: Active / Monitored</div>
+          <div className="text-[11px] text-[#72A98B] font-semibold">Status: Active / Monitored</div>
         </div>
 
-        <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4 text-xs font-mono space-y-2">
-          <div className="text-neutral-400 uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
-            <Activity className="w-3.5 h-3.5 text-amber-400" />
-            <span>Tier 2 Fallback: Dukascopy</span>
+        <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
+          <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
+            <Activity className="w-3.5 h-3.5 text-[#C5A36A]" />
+            <span className="text-[#E8E5DE]">Tier 2 Fallback: Dukascopy</span>
           </div>
-          <p className="text-neutral-300">
+          <p className="text-[#AAB4BF]">
             Dukascopy secondary feed with institutional bid/ask midpoints. Engages automatically if
             Biquote exceeds 4s timeout.
           </p>
-          <div className="text-[11px] text-neutral-500">Status: Standby Ready</div>
+          <div className="text-[11px] text-[#AAB4BF]">Status: Standby Ready</div>
         </div>
 
-        <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4 text-xs font-mono space-y-2">
-          <div className="text-neutral-400 uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
-            <Database className="w-3.5 h-3.5 text-purple-400" />
-            <span>Tier 3 Fallback: Yahoo Finance</span>
+        <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
+          <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
+            <Database className="w-3.5 h-3.5 text-[#6C9D91]" />
+            <span className="text-[#E8E5DE]">Tier 3 Fallback: Yahoo Finance</span>
           </div>
-          <p className="text-neutral-300">
+          <p className="text-[#AAB4BF]">
             Chart v8 endpoint fallback. Handles weekend/session boundary fills with realistic
             continuity engine.
           </p>
-          <div className="text-[11px] text-neutral-500">Status: Standby Ready</div>
+          <div className="text-[11px] text-[#AAB4BF]">Status: Standby Ready</div>
         </div>
       </div>
     </div>

@@ -56,6 +56,7 @@ export class OnlinePolicyNetwork {
 
   // Episodic Memory Matrix
   private episodicMemory: Array<{
+    signalId?: string;
     vector: number[];
     symbol: ForexSymbol;
     direction: SignalDirection;
@@ -63,6 +64,7 @@ export class OnlinePolicyNetwork {
     timestamp: string;
   }> = [];
 
+  private trainedSignalIds: Set<string> = new Set();
   private trailingLosses: number[] = [];
   private lastGradNorm: number = 0;
 
@@ -126,10 +128,16 @@ export class OnlinePolicyNetwork {
           this.LinUcbA = persisted.linUcbA;
           this.LinUcbB = persisted.linUcbB;
         }
+        if (Array.isArray(persisted.trainedSignalIds)) {
+          this.trainedSignalIds = new Set(persisted.trainedSignalIds);
+        }
       }
       const memories = db.getEpisodicMemories();
       if (Array.isArray(memories)) {
         this.episodicMemory = memories.slice(0, 1000);
+        for (const mem of this.episodicMemory) {
+          if (mem.signalId) this.trainedSignalIds.add(mem.signalId);
+        }
       }
     } catch (e) {
       console.warn('[OnlinePolicy] Using fresh initial weights:', e);
@@ -147,12 +155,17 @@ export class OnlinePolicyNetwork {
         trailingLosses: this.trailingLosses.slice(-50),
         linUcbA: this.LinUcbA,
         linUcbB: this.LinUcbB,
+        trainedSignalIds: Array.from(this.trainedSignalIds).slice(-1000),
         lastUpdated: new Date().toISOString(),
       });
       db.saveEpisodicMemories(this.episodicMemory.slice(0, 500));
     } catch (e) {
       console.warn('[OnlinePolicy] Failed to persist weights:', e);
     }
+  }
+
+  public hasTrainedOnSignal(signalId: string): boolean {
+    return this.trainedSignalIds.has(signalId);
   }
 
   /**
@@ -218,7 +231,8 @@ export class OnlinePolicyNetwork {
     tradeDirection: SignalDirection,
     tradeOutcome: 'WIN' | 'LOSS' | 'SCRATCH' | 'CANCELLED',
     netReturnUnits: number,
-    symbol: ForexSymbol
+    symbol: ForexSymbol,
+    signalId?: string
   ): {
     loss: number;
     gradientNorm: number;
@@ -226,6 +240,13 @@ export class OnlinePolicyNetwork {
   } {
     if (tradeOutcome === 'CANCELLED' || tradeOutcome === 'SCRATCH') {
       return { loss: 0, gradientNorm: 0, step: this.t };
+    }
+    if (signalId && this.trainedSignalIds.has(signalId)) {
+      return {
+        loss: Number((this.trailingLosses[this.trailingLosses.length - 1] || 0).toFixed(4)),
+        gradientNorm: Number(this.lastGradNorm.toFixed(4)),
+        step: this.t,
+      };
     }
 
     // Determine ground truth binary target:
@@ -343,7 +364,11 @@ export class OnlinePolicyNetwork {
     }
 
     // 6. Record in Episodic Memory Bank
+    if (signalId) {
+      this.trainedSignalIds.add(signalId);
+    }
     this.episodicMemory.unshift({
+      signalId,
       vector: x,
       symbol,
       direction: tradeDirection,
@@ -361,6 +386,83 @@ export class OnlinePolicyNetwork {
       loss: Number(loss.toFixed(4)),
       gradientNorm: Number(gradNorm.toFixed(4)),
       step: this.t,
+    };
+  }
+
+  /**
+   * Catches up the online MLP, LinUCB covariance matrix, and Episodic k-NN bank on any real
+   * settled WIN/LOSS signals that have not yet been trained, strictly using causal entry-time candles
+   * (zero lookahead leakage, zero synthetic candles).
+   */
+  public bootstrapFromSettledSignals(
+    getRealCandlesForSymbol: (symbol: ForexSymbol) => Candle[],
+    extractFeatureVector: (candle: Candle, history: Candle[]) => number[]
+  ): {
+    trainedCount: number;
+    skippedNoCandles: number;
+    stepCount: number;
+  } {
+    const settled = db
+      .getSignals(false)
+      .filter(
+        s =>
+          s.lifecycleState === 'CLOSED' &&
+          (s.outcomeResult === 'WIN' || s.outcomeResult === 'LOSS') &&
+          !s.ruleFamily?.startsWith('test_') &&
+          !this.trainedSignalIds.has(s.id)
+      )
+      .sort((a, b) => {
+        const ta = Date.parse(a.actualEntryTimeUtc || a.candleOpenTimeUtc || a.predictionTimeUtc);
+        const tb = Date.parse(b.actualEntryTimeUtc || b.candleOpenTimeUtc || b.predictionTimeUtc);
+        return ta - tb;
+      });
+
+    let trainedCount = 0;
+    let skippedNoCandles = 0;
+
+    for (const signal of settled) {
+      const entryTsMs = Date.parse(
+        signal.actualEntryTimeUtc || signal.candleOpenTimeUtc || signal.predictionTimeUtc
+      );
+      if (!Number.isFinite(entryTsMs)) {
+        skippedNoCandles++;
+        continue;
+      }
+
+      const realCandles = getRealCandlesForSymbol(signal.symbol)
+        .filter(c => c && c.source !== 'synthetic')
+        .sort((a, b) => a.timestampMs - b.timestampMs);
+
+      // Strict causal slice: only candles at or before entry time
+      const causalSlice = realCandles.filter(c => c.timestampMs <= entryTsMs + 60_000);
+      if (causalSlice.length < 20) {
+        skippedNoCandles++;
+        continue;
+      }
+
+      const entryCandle = causalSlice[causalSlice.length - 1];
+      // Guard against stale gap > 20m between last causal candle and trade entry
+      if (Math.abs(entryCandle.timestampMs - entryTsMs) > 20 * 60_000) {
+        skippedNoCandles++;
+        continue;
+      }
+
+      const featureVec = extractFeatureVector(entryCandle, causalSlice);
+      this.trainStep(
+        featureVec,
+        signal.direction,
+        signal.outcomeResult as 'WIN' | 'LOSS',
+        signal.netReturnUnits ?? (signal.outcomeResult === 'WIN' ? 0.8 : -1.0),
+        signal.symbol,
+        signal.id
+      );
+      trainedCount++;
+    }
+
+    return {
+      trainedCount,
+      skippedNoCandles,
+      stepCount: this.t,
     };
   }
 

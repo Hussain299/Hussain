@@ -1,12 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
   ShieldAlert,
-  Activity,
-  Database,
-  Clock,
-  CheckCircle2,
-  AlertCircle,
-  XCircle,
   RotateCw,
 } from 'lucide-react';
 import { SystemHealthState } from '../../types/index.js';
@@ -36,15 +30,34 @@ export const SystemHealthView: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
+  const formatIST = (timestampStr?: string) => {
+    if (!timestampStr) return '--:--:-- IST';
+    try {
+      const d = new Date(timestampStr);
+      if (isNaN(d.getTime())) return timestampStr;
+      return (
+        d.toLocaleTimeString('en-IN', {
+          timeZone: 'Asia/Kolkata',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        }) + ' IST'
+      );
+    } catch {
+      return timestampStr;
+    }
+  };
+
   return (
-    <div className="flex-1 flex flex-col h-full overflow-y-auto bg-neutral-950 p-6 space-y-6">
-      <div className="flex items-center justify-between pb-4 border-b border-neutral-800">
+    <div className="w-full bg-[#17212D] text-[#E8E5DE] p-4 lg:p-6 space-y-6 font-sans pb-16 lg:pb-8">
+      <div className="flex flex-wrap items-center justify-between pb-4 border-b border-[#354251] gap-4">
         <div>
-          <h3 className="text-base font-bold text-white font-mono flex items-center gap-2">
-            <ShieldAlert className="w-4 h-4 text-emerald-400" />
+          <h3 className="text-base font-bold text-[#E8E5DE] font-mono flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 text-[#72A98B]" />
             <span>System Telemetry & Provider Health</span>
           </h3>
-          <p className="text-xs text-neutral-400 font-mono mt-1">
+          <p className="text-xs text-[#AAB4BF] font-mono mt-1">
             Real-time infrastructure monitor, data feed health checks, and autonomous cron job executions.
           </p>
         </div>
@@ -52,9 +65,9 @@ export const SystemHealthView: React.FC = () => {
         <button
           onClick={fetchHealth}
           disabled={isLoading}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono bg-neutral-900 border border-neutral-800 text-neutral-300 hover:text-white rounded transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono bg-[#222B36] border border-[#354251] text-[#E8E5DE] hover:border-[#6C9D91] rounded transition-colors cursor-pointer"
         >
-          <RotateCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-emerald-400' : ''}`} />
+          <RotateCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-[#6C9D91]' : ''}`} />
           <span>Refresh Health</span>
         </button>
       </div>
@@ -63,49 +76,49 @@ export const SystemHealthView: React.FC = () => {
         <div className="space-y-6 font-mono text-xs">
           {/* Top Status Cards */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4">
-              <span className="text-neutral-500 text-[10px] uppercase block">Engine Uptime</span>
-              <span className="text-xl font-bold text-white tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4">
+              <span className="text-[#AAB4BF] text-[10px] uppercase block font-semibold">Engine Uptime</span>
+              <span className="text-xl font-bold text-[#E8E5DE] tabular-nums">
                 {Math.floor(health.uptimeSeconds / 60)}m {health.uptimeSeconds % 60}s
               </span>
-              <span className="text-[10px] text-emerald-400 block mt-1">Continuous Execution</span>
+              <span className="text-[10px] text-[#72A98B] block mt-1 font-semibold">Continuous Execution</span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4">
-              <span className="text-neutral-500 text-[10px] uppercase block">Database Storage</span>
-              <span className="text-xl font-bold text-white truncate block">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4">
+              <span className="text-[#AAB4BF] text-[10px] uppercase block font-semibold">Database Storage</span>
+              <span className="text-xl font-bold text-[#E8E5DE] truncate block">
                 {health.dbType}
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-1 tabular-nums">
+              <span className="text-[10px] text-[#AAB4BF] block mt-1 tabular-nums">
                 {health.totalCandlesStored} candles cached
               </span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4">
-              <span className="text-neutral-500 text-[10px] uppercase block">Autopilot Pulse</span>
-              <span className="text-xl font-bold text-emerald-400">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4">
+              <span className="text-[#AAB4BF] text-[10px] uppercase block font-semibold">Autopilot Pulse</span>
+              <span className="text-xl font-bold text-[#6C9D91]">
                 {health.isCronRunning ? 'Cycle In Progress' : 'Polling every 20s'}
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-1">
+              <span className="text-[10px] text-[#AAB4BF] block mt-1">
                 Signal scanning interval: 20 seconds
               </span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4">
-              <span className="text-neutral-500 text-[10px] uppercase block">Active Signals</span>
-              <span className="text-xl font-bold text-white tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4">
+              <span className="text-[#AAB4BF] text-[10px] uppercase block font-semibold">Active Signals</span>
+              <span className="text-xl font-bold text-[#E8E5DE] tabular-nums">
                 {health.activeSignalsCount} active / {health.totalExperimentsRun} backtests
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-1">{health.totalForwardObservations || 0} forward paper observations</span>
+              <span className="text-[10px] text-[#AAB4BF] block mt-1">{health.totalForwardObservations || 0} forward paper observations</span>
             </div>
           </div>
 
           {/* Data Providers Health Matrix */}
-          <div className="bg-neutral-900/60 border border-neutral-800 rounded p-5 space-y-3">
-            <h4 className="text-sm font-semibold text-white">Public Feed Auditing & Fallback Matrix</h4>
-            <div className="border border-neutral-800 rounded overflow-hidden">
+          <div className="bg-[#222B36] border border-[#354251] rounded-lg p-5 space-y-3">
+            <h4 className="text-sm font-semibold text-[#E8E5DE]">Public Feed Auditing & Fallback Matrix</h4>
+            <div className="border border-[#354251] rounded overflow-hidden">
               <table className="w-full text-left">
-                <thead className="bg-neutral-950 border-b border-neutral-800 text-neutral-400 uppercase text-[10px]">
+                <thead className="bg-[#17212D] border-b border-[#354251] text-[#AAB4BF] uppercase text-[10px]">
                   <tr>
                     <th className="py-2.5 px-4">Provider Feed</th>
                     <th className="py-2.5 px-4">Symbol</th>
@@ -115,40 +128,40 @@ export const SystemHealthView: React.FC = () => {
                     <th className="py-2.5 px-4">Failure Attribution</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-neutral-850 bg-neutral-950/60">
+                <tbody className="divide-y divide-[#354251] bg-[#222B36]/60">
                   {health.providers.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-4 text-center text-neutral-500">
+                      <td colSpan={6} className="py-4 text-center text-[#AAB4BF]">
                         Providers initializing with market warmups...
                       </td>
                     </tr>
                   ) : (
                     health.providers.map((p, i) => (
-                      <tr key={i} className="hover:bg-neutral-900/50">
-                        <td className="py-2.5 px-4 text-white font-semibold uppercase">{p.provider}</td>
-                        <td className="py-2.5 px-4 text-neutral-300">{p.symbol}</td>
+                      <tr key={i} className="hover:bg-[#17212D]/50">
+                        <td className="py-2.5 px-4 text-[#E8E5DE] font-semibold uppercase">{p.provider}</td>
+                        <td className="py-2.5 px-4 text-[#AAB4BF]">{p.symbol}</td>
                         <td className="py-2.5 px-4">
                           <span
-                            className={`font-semibold ${
+                            className={`font-semibold px-2 py-0.5 rounded text-[10px] ${
                               p.status === 'ONLINE'
-                                ? 'text-emerald-400'
+                                ? 'bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/40'
                                 : p.status === 'DEGRADED'
-                                ? 'text-amber-400'
-                                : 'text-rose-400'
+                                ? 'bg-[#C5A36A]/15 text-[#C5A36A] border border-[#C5A36A]/40'
+                                : 'bg-[#B7797D]/15 text-[#B7797D] border border-[#B7797D]/40'
                             }`}
                           >
                             {p.status}
                           </span>
                         </td>
-                        <td className="py-2.5 px-4 text-right text-neutral-300 tabular-nums">
+                        <td className="py-2.5 px-4 text-right text-[#E8E5DE] tabular-nums">
                           {p.latencyMs}ms
                         </td>
-                        <td className="py-2.5 px-4 text-neutral-400">
-                          {p.lastSuccess.includes('T') ? p.lastSuccess.substring(11, 19) + ' UTC' : p.lastSuccess}
+                        <td className="py-2.5 px-4 text-[#AAB4BF]">
+                          {formatIST(p.lastSuccess)}
                         </td>
-                        <td className="py-2.5 px-4 text-neutral-400 text-[11px]">
+                        <td className="py-2.5 px-4 text-[#AAB4BF] text-[11px]">
                           {p.errorMessage ? (
-                            <span className="text-rose-400">{p.errorMessage}</span>
+                            <span className="text-[#B7797D]">{p.errorMessage}</span>
                           ) : (
                             p.attribution
                           )}
@@ -162,7 +175,7 @@ export const SystemHealthView: React.FC = () => {
           </div>
         </div>
       ) : (
-        <div className="h-64 flex items-center justify-center text-neutral-500 font-mono text-xs">
+        <div className="h-64 flex items-center justify-center text-[#AAB4BF] font-mono text-xs bg-[#222B36] border border-[#354251] rounded-lg">
           Loading system telemetry...
         </div>
       )}

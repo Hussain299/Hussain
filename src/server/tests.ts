@@ -10,6 +10,7 @@ import { db } from './db.js';
 import { entryExitEngine } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
+import { telegramService } from './telegramService.js';
 
 const makeM1TestCandles = (symbol: ForexSymbol, count: number): Candle[] =>
   dataFeedEngine.generateRealisticHistoricalCandles(symbol, count).map(c => {
@@ -444,6 +445,171 @@ export async function runAllVerificationTests(): Promise<{
     const wrangler = db.generateWranglerToml();
     if (!wrangler.includes('binding = "DB"')) {
       throw new Error('Wrangler toml missing D1 binding');
+    }
+  });
+
+  await runTest('SYSTEM', 'Telegram Bot Configuration & Signal Dispatch Engine', () => {
+    const cfg = db.getTelegramConfig();
+    if (!cfg.botToken || !cfg.botToken.startsWith('8386549882:')) {
+      throw new Error(`Invalid Telegram bot token configuration: ${cfg.botToken}`);
+    }
+    if (cfg.minConfidence < 0.5 || cfg.minConfidence > 1.0) {
+      throw new Error(`Invalid Telegram minConfidence threshold: ${cfg.minConfidence}`);
+    }
+
+    // Verify subscriber addition and removal persistence
+    const testSubId = `test_${Date.now()}`;
+    db.addTelegramSubscriber({
+      id: testSubId,
+      name: 'Automated Test Subscriber',
+      username: 'test_user',
+      addedAt: new Date().toISOString(),
+      type: 'user',
+    });
+
+    const withSub = db.getTelegramConfig();
+    if (!withSub.subscribers.some(s => String(s.id) === testSubId)) {
+      throw new Error('Failed to persist Telegram subscriber');
+    }
+
+    db.removeTelegramSubscriber(testSubId);
+    const cleaned = db.getTelegramConfig();
+    if (cleaned.subscribers.some(s => String(s.id) === testSubId)) {
+      throw new Error('Failed to clean up test Telegram subscriber');
+    }
+  });
+
+  await runTest('SYSTEM', 'Telegram Win & Loss Audit Report Formatting & Autopsy Parity', async () => {
+    const { telegramService } = await import('./telegramService.js');
+    const nowIso = new Date().toISOString();
+
+    const winTrade: any = {
+      id: 'sig_test_win_audit',
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      predictionTimeUtc: nowIso,
+      predictionTimeIst: '10:02:00 AM IST',
+      candleOpenTimeUtc: nowIso,
+      candleOpenTimeIst: '10:05:00 AM IST',
+      actualEntryTimeUtc: nowIso,
+      actualExitTimeUtc: nowIso,
+      triggerPrice: 1.08500,
+      actualEntryPrice: 1.08500,
+      actualExitPrice: 1.08565,
+      entrySource: 'dukascopy',
+      expiryMinutes: 5,
+      confidence: 0.84,
+      lifecycleState: 'CLOSED',
+      lifecycleHistory: [{ timestamp: nowIso, fromState: 'ACTIVE', toState: 'CLOSED', reason: 'Settled from dukascopy feed' }],
+      grossReturnPips: 6.5,
+      estimatedSpreadPips: 1.1,
+      netReturnPips: null,
+      payoutPct: 85,
+      netReturnUnits: 0.85,
+      outcomeResult: 'WIN',
+      ruleFamily: 'test_audit_win',
+      strategyName: 'RSI Momentum Confluence',
+      marketSessionName: 'London / NY Overlap',
+    };
+
+    const winReport = telegramService.formatSettlementAuditReport(winTrade);
+    if (!winReport.includes('WIN AUDIT REPORT') || !winReport.includes('+6.5 pips') || !winReport.includes('+0.85 U')) {
+      throw new Error(`WIN Audit Report missing verified pips or payout fields: ${winReport}`);
+    }
+    if (!winReport.includes('LIVE AUDIT SCORECARD')) {
+      throw new Error('WIN Audit Report missing live scorecard section');
+    }
+
+    const lossTrade: any = {
+      ...winTrade,
+      id: 'sig_test_loss_audit',
+      symbol: 'USD/JPY',
+      direction: 'SELL',
+      actualEntryPrice: 154.200,
+      actualExitPrice: 154.242,
+      grossReturnPips: -4.2,
+      netReturnPips: null,
+      netReturnUnits: -1.0,
+      outcomeResult: 'LOSS',
+      ruleFamily: 'test_audit_loss',
+      lossAutopsy: {
+        id: 'autopsy_test_loss',
+        signalId: 'sig_test_loss_audit',
+        symbol: 'USD/JPY',
+        direction: 'SELL',
+        strategyName: 'RSI Momentum Confluence',
+        entryPrice: 154.200,
+        exitPrice: 154.242,
+        grossReturnPips: -4.2,
+        netReturnPips: -5.4,
+        spreadPips: 1.2,
+        marketSession: 'Tokyo Session',
+        rootCause: 'MICRO_WICK_FALSE_ABSORPTION',
+        rootCauseExplanation: 'Stop-run wick swept resting liquidity above resistance before closing higher.',
+        lessonsLearned: ['Require volume expansion confirmation on rejection wick.'],
+        antidoteStrategyGeneId: 'gene_antidote_1',
+        antidoteStrategyName: 'Antidote-USD/JPY: Wick Volume Gate',
+        antidoteFormula: 'tanh(1.5*x)',
+        antidoteOperator: 'tanh',
+        timestamp: nowIso,
+      },
+    };
+
+    const lossReport = telegramService.formatSettlementAuditReport(lossTrade);
+    if (
+      !lossReport.includes('LOSS AUDIT REPORT') ||
+      !lossReport.includes('-4.2 pips') ||
+      !lossReport.includes('-1.00 U') ||
+      !lossReport.includes('FORENSIC LOSS AUTOPSY') ||
+      !lossReport.includes('MICRO WICK FALSE ABSORPTION') ||
+      !lossReport.includes('Antidote-USD/JPY: Wick Volume Gate')
+    ) {
+      throw new Error(`LOSS Audit Report missing forensic autopsy or real pips: ${lossReport}`);
+    }
+
+    const summaryReport = telegramService.formatDailyAuditSummaryReport();
+    if (!summaryReport.includes('WIN &amp; LOSS AUDIT SUMMARY') || !summaryReport.includes("TODAY'S AUDITED PERFORMANCE")) {
+      throw new Error('Daily Audit Summary Report missing expected sections');
+    }
+  });
+
+  await runTest('ML', 'Closed-Loop Adaptive Bandit Throttling & Online MLP Deduplication', async () => {
+    const { AgiSelfLearningEngine } = await import('./agiEngine.js');
+    const { OnlinePolicyNetwork } = await import('./onlinePolicyNetwork.js');
+
+    // 1. Verify stacked strategy arms are auto-registered and throttled when <55.6% WR at n>=8
+    const tempAgi = new AgiSelfLearningEngine();
+    const testStratId = 'stacked:test_losing_arm:20';
+    for (let i = 0; i < 6; i++) tempAgi.updateBanditArm(testStratId, 'LOSS');
+    for (let i = 0; i < 3; i++) tempAgi.updateBanditArm(testStratId, 'WIN');
+    const throttle = tempAgi.isStrategyThrottled(testStratId);
+    if (!throttle.throttled) {
+      throw new Error(`Expected losing stacked arm (3W-6L, 33.3% WR) to be THROTTLED, got ${JSON.stringify(throttle)}`);
+    }
+
+    // 2. Verify winning stacked arm stays ACTIVE_ARM
+    const winStratId = 'stacked:test_winning_arm:15';
+    for (let i = 0; i < 7; i++) tempAgi.updateBanditArm(winStratId, 'WIN');
+    for (let i = 0; i < 2; i++) tempAgi.updateBanditArm(winStratId, 'LOSS');
+    const winThrottle = tempAgi.isStrategyThrottled(winStratId);
+    if (winThrottle.throttled) {
+      throw new Error(`Expected winning stacked arm (7W-2L, 77.8% WR) to remain active, got ${JSON.stringify(winThrottle)}`);
+    }
+
+    // 3. Verify OnlinePolicyNetwork trains on new signalId and deduplicates repeat calls without mutating DB
+    const tempNet = new OnlinePolicyNetwork();
+    // Stub saveState to keep unit test strictly isolated from production DB weights
+    (tempNet as any).saveState = () => {};
+    const stepBefore = tempNet.getTelemetry().stepCount;
+    const vec = new Array(19).fill(0.25);
+    const sigId = 'sig_test_online_dedup_1';
+    const first = tempNet.trainStep(vec, 'BUY', 'WIN', 0.8, 'EUR/USD', sigId);
+    if (first.step !== stepBefore + 1) {
+      throw new Error(`Expected online policy step to increment to ${stepBefore + 1}, got ${first.step}`);
+    }
+    const duplicate = tempNet.trainStep(vec, 'BUY', 'WIN', 0.8, 'EUR/USD', sigId);
+    if (duplicate.step !== stepBefore + 1) {
+      throw new Error(`Expected duplicate signalId training to be skipped, but step became ${duplicate.step}`);
     }
   });
 

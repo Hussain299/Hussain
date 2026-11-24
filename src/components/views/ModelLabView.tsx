@@ -2,11 +2,7 @@ import React, { useState } from 'react';
 import {
   Brain,
   ShieldCheck,
-  CheckCircle,
-  XCircle,
   Play,
-  Layers,
-  Sparkles,
 } from 'lucide-react';
 import { FOREX_PAIRS, ForexSymbol, ResearchExperiment, RuleFamily } from '../../types/index.js';
 
@@ -54,16 +50,16 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
   const exp = activeExp || experiments.find(item => item.experimentType !== 'LIVE_TRADE' && item.experimentType !== 'FORWARD_OBSERVATION') || null;
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-y-auto bg-neutral-950 p-6 space-y-6">
+    <div className="w-full bg-[#17212D] text-[#E8E5DE] p-4 lg:p-6 space-y-6 font-sans pb-16 lg:pb-8">
       {/* Configuration Header */}
-      <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4 flex flex-wrap items-center justify-between gap-4">
+      <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-3 text-xs font-mono">
           <div>
-            <label className="text-neutral-500 block text-[10px] uppercase">Forex Asset</label>
+            <label className="text-[#AAB4BF] block text-[10px] uppercase font-semibold">Forex Asset</label>
             <select
               value={selectedPair}
               onChange={e => setSelectedPair(e.target.value as ForexSymbol)}
-              className="bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1 text-white text-xs mt-1"
+              className="bg-[#17212D] border border-[#354251] rounded px-2.5 py-1 text-[#E8E5DE] text-xs mt-1 focus:outline-none focus:border-[#6C9D91]"
             >
               {FOREX_PAIRS.map(p => (
                 <option key={p} value={p}>
@@ -74,11 +70,11 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
           </div>
 
           <div>
-            <label className="text-neutral-500 block text-[10px] uppercase">Rule Family</label>
+            <label className="text-[#AAB4BF] block text-[10px] uppercase font-semibold">Rule Family</label>
             <select
               value={selectedRule}
               onChange={e => setSelectedRule(e.target.value as RuleFamily)}
-              className="bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1 text-white text-xs mt-1"
+              className="bg-[#17212D] border border-[#354251] rounded px-2.5 py-1 text-[#E8E5DE] text-xs mt-1 focus:outline-none focus:border-[#6C9D91]"
             >
               <option value="momentum_5">Momentum 5</option>
               <option value="mean_reversion_20">Mean Reversion 20</option>
@@ -88,11 +84,11 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
           </div>
 
           <div>
-            <label className="text-neutral-500 block text-[10px] uppercase">Horizon</label>
+            <label className="text-[#AAB4BF] block text-[10px] uppercase font-semibold">Horizon</label>
             <select
               value={selectedHorizon}
               onChange={e => setSelectedHorizon(Number(e.target.value))}
-              className="bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1 text-white text-xs mt-1"
+              className="bg-[#17212D] border border-[#354251] rounded px-2.5 py-1 text-[#E8E5DE] text-xs mt-1 focus:outline-none focus:border-[#6C9D91]"
             >
               <option value={5}>5 Candles (5m)</option>
               <option value={10}>10 Candles (10m)</option>
@@ -106,7 +102,7 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
         <button
           onClick={handleRunExperiment}
           disabled={isRunning}
-          className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-emerald-950 bg-emerald-400 hover:bg-emerald-300 rounded transition-colors disabled:opacity-50"
+          className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-[#17212D] bg-[#72A98B] hover:bg-[#72A98B]/90 rounded transition-colors disabled:opacity-50 cursor-pointer"
         >
           <Play className={`w-3.5 h-3.5 ${isRunning ? 'animate-spin' : ''}`} />
           <span>{isRunning ? 'Validating Purged Split...' : 'Run Purged Walk-Forward'}</span>
@@ -114,109 +110,112 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
       </div>
 
       {errorMessage && (
-        <div className="bg-rose-950/40 border border-rose-800 rounded-lg px-4 py-3 text-xs text-rose-200">
+        <div className="bg-[#B7797D]/15 border border-[#B7797D]/40 rounded-lg px-4 py-3 text-xs text-[#B7797D]">
           {errorMessage}
         </div>
       )}
+
       {exp ? (
         <div className="space-y-6">
           {/* Top Metric Cards */}
           <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-3 text-xs font-mono">
-              <span className="text-neutral-500 text-[10px] block">Untouched Test Directional Accuracy · n={exp.metrics.sampleSize}</span>
-              <span className="text-lg font-bold text-white tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-3 text-xs font-mono">
+              <span className="text-[#AAB4BF] text-[10px] block font-semibold">Untouched Test Acc · n={exp.metrics.sampleSize}</span>
+              <span className="text-lg font-bold text-[#E8E5DE] tabular-nums">
                 {(exp.metrics.testAccuracy * 100).toFixed(1)}%
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-0.5">
-                95% CI (net-positive WR; scored n={exp.metrics.scoredTradeSampleSize}): [{(exp.metrics.confidenceInterval95[0] * 100).toFixed(0)}%,{' '}
+              <span className="text-[10px] text-[#AAB4BF] block mt-0.5">
+                95% CI: [{(exp.metrics.confidenceInterval95[0] * 100).toFixed(0)}%,{' '}
                 {(exp.metrics.confidenceInterval95[1] * 100).toFixed(0)}%]
               </span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-3 text-xs font-mono">
-              <span className="text-neutral-500 text-[10px] block">Balanced Acc</span>
-              <span className="text-lg font-bold text-emerald-400 tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-3 text-xs font-mono">
+              <span className="text-[#AAB4BF] text-[10px] block font-semibold">Balanced Acc</span>
+              <span className="text-lg font-bold text-[#72A98B] tabular-nums">
                 {(exp.metrics.balancedAccuracy * 100).toFixed(1)}%
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-0.5">Class-balanced</span>
+              <span className="text-[10px] text-[#AAB4BF] block mt-0.5">Class-balanced</span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-3 text-xs font-mono">
-              <span className="text-neutral-500 text-[10px] block">F1 Score</span>
-              <span className="text-lg font-bold text-white tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-3 text-xs font-mono">
+              <span className="text-[#AAB4BF] text-[10px] block font-semibold">F1 Score</span>
+              <span className="text-lg font-bold text-[#E8E5DE] tabular-nums">
                 {exp.metrics.f1Score.toFixed(3)}
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-0.5">
+              <span className="text-[10px] text-[#AAB4BF] block mt-0.5">
                 Prec: {exp.metrics.precision} · Rec: {exp.metrics.recall}
               </span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-3 text-xs font-mono">
-              <span className="text-neutral-500 text-[10px] block">Brier Calibration</span>
-              <span className="text-lg font-bold text-white tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-3 text-xs font-mono">
+              <span className="text-[#AAB4BF] text-[10px] block font-semibold">Brier Calibration</span>
+              <span className="text-lg font-bold text-[#E8E5DE] tabular-nums">
                 {exp.metrics.brierScore.toFixed(4)}
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-0.5">
-                {exp.metrics.brierScore < 0.22 ? 'Lower Brier score' : 'Calibration concern'}
+              <span className="text-[10px] text-[#AAB4BF] block mt-0.5">
+                {exp.metrics.brierScore < 0.22 ? 'Well-calibrated' : 'Calibration concern'}
               </span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-3 text-xs font-mono">
-              <span className="text-neutral-500 text-[10px] block">Profit Factor</span>
-              <span className="text-lg font-bold text-white tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-3 text-xs font-mono">
+              <span className="text-[#AAB4BF] text-[10px] block font-semibold">Profit Factor</span>
+              <span className="text-lg font-bold text-[#E8E5DE] tabular-nums">
                 {exp.metrics.profitFactor}
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-0.5">
-                After pair-specific modeled spread
+              <span className="text-[10px] text-[#AAB4BF] block mt-0.5">
+                After modeled spread
               </span>
             </div>
 
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-3 text-xs font-mono">
-              <span className="text-neutral-500 text-[10px] block">Max Drawdown</span>
-              <span className="text-lg font-bold text-rose-400 tabular-nums">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-3 text-xs font-mono">
+              <span className="text-[#AAB4BF] text-[10px] block font-semibold">Max Drawdown</span>
+              <span className="text-lg font-bold text-[#B7797D] tabular-nums">
                 {exp.metrics.maxDrawdownPips.toFixed(1)} pips
               </span>
-              <span className="text-[10px] text-neutral-400 block mt-0.5">Net peak-to-trough</span>
+              <span className="text-[10px] text-[#AAB4BF] block mt-0.5">Net peak-to-trough</span>
             </div>
           </div>
 
           {/* Chronological Walk-Forward Split Visualization */}
-          <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4 space-y-3 font-mono text-xs">
-            <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold text-white">
+          <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 space-y-3 font-mono text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="text-sm font-semibold text-[#E8E5DE]">
                 Chronological Purged Walk-Forward Partitioning
               </h4>
-              <span className="text-[11px] text-emerald-400">
+              <span className="text-[11px] text-[#72A98B]">
                 Purged Embargo: {exp.purgedWindowCandles} M1 candles
               </span>
             </div>
 
             {/* Visual Timeline Bar */}
-            <div className="w-full h-8 bg-neutral-950 rounded flex overflow-hidden border border-neutral-800 text-[10px] font-semibold">
-              <div className="w-[60%] bg-blue-950/70 border-r border-blue-800 flex items-center justify-center text-blue-300">
+            <div className="w-full h-8 bg-[#17212D] rounded flex overflow-hidden border border-[#354251] text-[10px] font-semibold">
+              <div className="w-[60%] bg-[#6C9D91]/25 border-r border-[#354251] flex items-center justify-center text-[#E8E5DE]">
                 TRAIN · n={exp.metrics.trainSampleSize} · {(exp.metrics.trainAccuracy * 100).toFixed(1)}%
               </div>
-              <div className="w-[5%] bg-neutral-900 border-r border-neutral-700 flex items-center justify-center text-neutral-500">
-                EMBARGO
+              <div className="w-[5%] bg-[#17212D] border-r border-[#354251] flex items-center justify-center text-[#AAB4BF]">
+                EMB
               </div>
-              <div className="w-[17%] bg-amber-950/70 border-r border-amber-800 flex items-center justify-center text-amber-300">
+              <div className="w-[17%] bg-[#C5A36A]/25 border-r border-[#354251] flex items-center justify-center text-[#C5A36A]">
                 VAL · n={exp.metrics.validationSampleSize} · {(exp.metrics.valAccuracy * 100).toFixed(1)}%
               </div>
-              <div className="w-[5%] bg-neutral-900 border-r border-neutral-700 flex items-center justify-center text-neutral-500">
-                EMBARGO
+              <div className="w-[5%] bg-[#17212D] border-r border-[#354251] flex items-center justify-center text-[#AAB4BF]">
+                EMB
               </div>
-              <div className="w-[13%] bg-emerald-950/70 flex items-center justify-center text-emerald-300">
+              <div className="w-[13%] bg-[#72A98B]/25 flex items-center justify-center text-[#72A98B]">
                 TEST · n={exp.metrics.sampleSize} · {(exp.metrics.testAccuracy * 100).toFixed(1)}%
               </div>
             </div>
 
-            <p className="text-[10px] text-neutral-500">Timeline widths are schematic; exact partition sample counts are shown in each segment. Embargoes reduce overlap between forward outcome windows but do not guarantee freedom from every possible research bias.</p>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-neutral-400 pt-2 text-[11px]">
+            <p className="text-[10px] text-[#AAB4BF]">
+              Timeline widths are schematic; exact partition sample counts are shown in each segment. Embargoes reduce overlap between forward outcome windows.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-[#AAB4BF] pt-2 text-[11px]">
               <div>
-                <strong className="text-neutral-300">Scaling Isolation:</strong> Feature means and standard deviations are fitted only on the training partition and then held fixed.
+                <strong className="text-[#E8E5DE]">Scaling Isolation:</strong> Feature means and standard deviations are fitted only on the training partition and then held fixed.
               </div>
               <div>
-                <strong className="text-neutral-300">Overfitting Delta:</strong> Train ({exp.metrics.trainAccuracy}) vs
+                <strong className="text-[#E8E5DE]">Overfitting Delta:</strong> Train ({exp.metrics.trainAccuracy}) vs
                 Validation ({exp.metrics.valAccuracy}) Delta ={' '}
                 {((exp.metrics.trainAccuracy - exp.metrics.valAccuracy) * 100).toFixed(1)}%.
               </div>
@@ -226,30 +225,30 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
           {/* Confusion Matrix & Skeptical Auditor Box */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Confusion Matrix */}
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4 font-mono text-xs space-y-3">
-              <h4 className="text-sm font-semibold text-white">Out-of-Sample Confusion Matrix</h4>
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 font-mono text-xs space-y-3">
+              <h4 className="text-sm font-semibold text-[#E8E5DE]">Out-of-Sample Confusion Matrix</h4>
               <div className="grid grid-cols-2 gap-2 text-center">
-                <div className="bg-neutral-950 p-3 rounded border border-neutral-800">
-                  <span className="text-[10px] text-neutral-500 block">True Positives (TP)</span>
-                  <span className="text-base font-bold text-emerald-400 tabular-nums">
+                <div className="bg-[#17212D] p-3 rounded border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] block font-semibold">True Positives (TP)</span>
+                  <span className="text-base font-bold text-[#72A98B] tabular-nums">
                     {exp.metrics.confusionMatrix.tp}
                   </span>
                 </div>
-                <div className="bg-neutral-950 p-3 rounded border border-neutral-800">
-                  <span className="text-[10px] text-neutral-500 block">False Positives (FP)</span>
-                  <span className="text-base font-bold text-rose-400 tabular-nums">
+                <div className="bg-[#17212D] p-3 rounded border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] block font-semibold">False Positives (FP)</span>
+                  <span className="text-base font-bold text-[#B7797D] tabular-nums">
                     {exp.metrics.confusionMatrix.fp}
                   </span>
                 </div>
-                <div className="bg-neutral-950 p-3 rounded border border-neutral-800">
-                  <span className="text-[10px] text-neutral-500 block">False Negatives (FN)</span>
-                  <span className="text-base font-bold text-amber-400 tabular-nums">
+                <div className="bg-[#17212D] p-3 rounded border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] block font-semibold">False Negatives (FN)</span>
+                  <span className="text-base font-bold text-[#C5A36A] tabular-nums">
                     {exp.metrics.confusionMatrix.fn}
                   </span>
                 </div>
-                <div className="bg-neutral-950 p-3 rounded border border-neutral-800">
-                  <span className="text-[10px] text-neutral-500 block">True Negatives (TN)</span>
-                  <span className="text-base font-bold text-neutral-300 tabular-nums">
+                <div className="bg-[#17212D] p-3 rounded border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] block font-semibold">True Negatives (TN)</span>
+                  <span className="text-base font-bold text-[#E8E5DE] tabular-nums">
                     {exp.metrics.confusionMatrix.tn}
                   </span>
                 </div>
@@ -257,35 +256,35 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
             </div>
 
             {/* Auditor Review Verdict */}
-            <div className="bg-neutral-900/60 border border-neutral-800 rounded p-4 font-mono text-xs space-y-3">
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 font-mono text-xs space-y-3">
               <div className="flex items-center justify-between">
-                <h4 className="text-sm font-semibold text-white flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-amber-400" />
+                <h4 className="text-sm font-semibold text-[#E8E5DE] flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-[#C5A36A]" />
                   <span>Skeptical Auditor Gate</span>
                 </h4>
                 <span
-                  className={`font-semibold ${
+                  className={`font-semibold px-2 py-0.5 rounded text-[11px] ${
                     exp.auditorVerdict === 'ACCEPTED'
-                      ? 'text-emerald-400'
+                      ? 'bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/40'
                       : exp.auditorVerdict === 'PROVISIONAL'
-                      ? 'text-amber-400'
-                      : 'text-rose-400'
+                      ? 'bg-[#C5A36A]/15 text-[#C5A36A] border border-[#C5A36A]/40'
+                      : 'bg-[#B7797D]/15 text-[#B7797D] border border-[#B7797D]/40'
                   }`}
                 >
                   {exp.auditorVerdict}
                 </span>
               </div>
 
-              <div className="bg-neutral-950 p-3 rounded border border-neutral-800 space-y-1.5 text-neutral-300">
+              <div className="bg-[#17212D] p-3 rounded border border-[#354251] space-y-1.5 text-[#E8E5DE]">
                 {exp.auditorConcerns.length > 0 ? (
                   exp.auditorConcerns.map((c, i) => (
-                    <div key={i} className="flex gap-2 text-rose-300">
+                    <div key={i} className="flex gap-2 text-[#B7797D]">
                       <span>•</span>
                       <span>{c}</span>
                     </div>
                   ))
                 ) : (
-                  <div className="text-emerald-400">
+                  <div className="text-[#72A98B]">
                     ✓ Passed all leakage, calibration, and transaction-cost checks. Eligible for
                     candidate consideration.
                   </div>
@@ -295,10 +294,10 @@ export const ModelLabView: React.FC<ModelLabViewProps> = ({
           </div>
         </div>
       ) : (
-        <div className="h-64 flex flex-col items-center justify-center text-center text-neutral-500 font-mono text-xs">
-          <Brain className="w-8 h-8 text-neutral-600 mb-2" />
-          <p className="text-neutral-400 font-medium text-sm">No Models Evaluated Yet</p>
-          <p className="mt-1">Select an asset and rule family above, then click &quot;Run Purged Walk-Forward&quot;.</p>
+        <div className="h-64 flex flex-col items-center justify-center text-center text-[#AAB4BF] font-mono text-xs bg-[#222B36] border border-[#354251] rounded-lg">
+          <Brain className="w-8 h-8 text-[#354251] mb-2" />
+          <p className="text-[#E8E5DE] font-medium text-sm">No Models Evaluated Yet</p>
+          <p className="mt-1 text-[#AAB4BF]">Select an asset and rule family above, then click &quot;Run Purged Walk-Forward&quot;.</p>
         </div>
       )}
     </div>

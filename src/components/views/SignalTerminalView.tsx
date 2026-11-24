@@ -1,11 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
-  Compass,
-  ArrowUpRight,
-  ArrowDownRight,
   Clock,
   Target,
-  Shield,
   Activity,
   CheckCircle2,
   XCircle,
@@ -16,333 +12,483 @@ import {
   Lightbulb,
   TrendingUp,
   X,
-  ChevronDown,
-  ChevronUp,
   RefreshCw,
   Sparkles,
   Trash2,
   Globe,
   Layers,
-  Dna,
-  Cpu,
   Microscope,
+  Award,
+  AlertCircle,
+  Calendar,
+  Radio,
+  BarChart3,
+  ArrowUpRight,
+  ArrowDownRight,
+  Check,
+  ChevronRight,
+  History,
 } from 'lucide-react';
-import { AutopilotLog, MarketSessionInfo, ResearchSignal, SynthesizedStrategyGene, LossAutopsy, FOREX_PAIRS, StrategyPerformanceRecord } from '../../types/index.js';
-import { AutopilotStream } from '../AutopilotStream.tsx';
+import {
+  AutopilotLog,
+  MarketSessionId,
+  MarketSessionInfo,
+  ResearchSignal,
+  FOREX_PAIRS,
+  ForexSymbol,
+} from '../../types/index.js';
 import { AgiSelfLearningModal } from '../AgiSelfLearningModal.tsx';
+import { useFirebase } from '../../contexts/FirebaseContext.tsx';
 
 interface SignalTerminalViewProps {
   signals: ResearchSignal[];
+  latestPrices?: Record<string, number>;
+  marketSessions?: MarketSessionInfo[];
   autopilotLogs?: AutopilotLog[];
   onEvaluateSignals: () => void;
   isEvaluating: boolean;
 }
 
+type TerminalLayer = 'ACTIVE' | 'TODAY' | 'YESTERDAY' | 'DAILY_SESSIONS' | 'ALL' | 'SESSIONS';
+type TradeStatusFilter = 'ALL' | 'EXECUTED' | 'WIN' | 'LOSS';
+
+export interface DailySessionSummary {
+  dateKey: string;
+  displayDate: string;
+  dayOfWeek: string;
+  signals: ResearchSignal[];
+  executedTrades: ResearchSignal[];
+  settledTrades: ResearchSignal[];
+  activeTrades: ResearchSignal[];
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  netUnits: number;
+  grossPips: number;
+  isToday: boolean;
+  isYesterday: boolean;
+}
+
+/**
+ * Format any Date or ISO string into canonical Indian Standard Time (IST)
+ */
+function formatIstTime(d: Date | string | number | null | undefined): string {
+  if (!d) return '—';
+  try {
+    const dateObj = typeof d === 'object' ? d : new Date(d);
+    if (isNaN(dateObj.getTime())) return '—';
+    return (
+      dateObj.toLocaleTimeString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+      }) + ' IST'
+    );
+  } catch {
+    return '—';
+  }
+}
+
+function getIstDateKey(d: Date | string | number | null | undefined): string {
+  if (!d) return '';
+  try {
+    const dateObj = typeof d === 'object' ? d : new Date(d);
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(dateObj); // 'YYYY-MM-DD'
+  } catch {
+    return '';
+  }
+}
+
+function formatIstDateHeading(d: Date | string | number | null | undefined): string {
+  if (!d) return '';
+  try {
+    const dateObj = typeof d === 'object' ? d : new Date(d);
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    }).format(dateObj);
+  } catch {
+    return '';
+  }
+}
+
+function getSessionFromTimestamp(timestampUtc: Date | string | number): {
+  id: MarketSessionId;
+  name: string;
+  shortName: string;
+} {
+  const d = new Date(timestampUtc);
+  const hour = d.getUTCHours();
+  if (hour >= 12 && hour < 16) {
+    return { id: 'OVERLAP', name: 'London / New York Overlap', shortName: 'Overlap' };
+  } else if (hour >= 7 && hour < 12) {
+    return { id: 'LONDON', name: 'London Session', shortName: 'London' };
+  } else if (hour >= 16 && hour < 21) {
+    return { id: 'NEW_YORK', name: 'New York Session', shortName: 'New York' };
+  } else {
+    return { id: 'ASIA', name: 'Tokyo / Asian Session', shortName: 'Asia' };
+  }
+}
+
+interface ParsedTimings {
+  alertTimeIst: string;
+  entryTimeIst: string;
+  expiryTimeIst: string;
+  durationMinutes: number;
+  isActualFill: boolean;
+  isActualExit: boolean;
+  entryTimestampMs: number | null;
+  expiryTimestampMs: number | null;
+}
+
+function getSignalTimings(sig: ResearchSignal): ParsedTimings {
+  const duration = sig.expiryMinutes || 5;
+  const alertTimeIst = sig.predictionTimeIst || formatIstTime(sig.predictionTimeUtc);
+
+  let entryDate: Date | null = null;
+  let isActualFill = false;
+
+  if (sig.actualEntryTimeUtc) {
+    entryDate = new Date(sig.actualEntryTimeUtc);
+    isActualFill = true;
+  } else if (sig.candleOpenTimeUtc) {
+    entryDate = new Date(sig.candleOpenTimeUtc);
+  } else if (sig.entryWindowStartUtc) {
+    entryDate = new Date(sig.entryWindowStartUtc);
+  } else if (sig.predictionTimeUtc) {
+    const pMs = new Date(sig.predictionTimeUtc).getTime();
+    const next5m = Math.ceil(pMs / (5 * 60 * 1000)) * (5 * 60 * 1000);
+    entryDate = new Date(next5m);
+  }
+
+  const entryTimeIst = sig.candleOpenTimeIst || formatIstTime(entryDate);
+
+  let exitDate: Date | null = null;
+  let isActualExit = false;
+
+  if (sig.actualExitTimeUtc) {
+    exitDate = new Date(sig.actualExitTimeUtc);
+    isActualExit = true;
+  } else if (sig.plannedExitTimeUtc) {
+    exitDate = new Date(sig.plannedExitTimeUtc);
+  } else if (entryDate && !isNaN(entryDate.getTime())) {
+    exitDate = new Date(entryDate.getTime() + duration * 60 * 1000);
+  }
+
+  const expiryTimeIst = sig.candleCloseTimeIst || formatIstTime(exitDate);
+
+  return {
+    alertTimeIst,
+    entryTimeIst,
+    expiryTimeIst,
+    durationMinutes: duration,
+    isActualFill,
+    isActualExit,
+    entryTimestampMs: entryDate ? entryDate.getTime() : null,
+    expiryTimestampMs: exitDate ? exitDate.getTime() : null,
+  };
+}
+
 export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
   signals,
+  latestPrices = {},
+  marketSessions = [],
   autopilotLogs = [],
   onEvaluateSignals,
   isEvaluating,
 }) => {
-  const [filterState, setFilterState] = useState<'ACTIVE' | 'ALL' | 'CLOSED'>('ACTIVE');
+  // Layer Selection: ALL (default: never 0) vs TODAY vs YESTERDAY vs SESSIONS
+  const [activeLayer, setActiveLayer] = useState<TerminalLayer>('ALL');
+  const [pairFilter, setPairFilter] = useState<string>('ALL');
+  const [statusFilter, setStatusFilter] = useState<TradeStatusFilter>('ALL');
   const [selectedSignal, setSelectedSignal] = useState<ResearchSignal | null>(null);
-  const [selectedAutopsy, setSelectedAutopsy] = useState<LossAutopsy | null>(null);
-  const [showLearningModal, setShowLearningModal] = useState<boolean>(false);
-  const [showStrategiesModal, setShowStrategiesModal] = useState<boolean>(false);
-  const [showSessionsModal, setShowSessionsModal] = useState<boolean>(false);
-  const [showGenesisModal, setShowGenesisModal] = useState<boolean>(false);
+
+  // Auxiliary Modals
   const [showAgiModal, setShowAgiModal] = useState<boolean>(false);
-  const [showLogsAccordion, setShowLogsAccordion] = useState<boolean>(false);
   const [isClearingHistory, setIsClearingHistory] = useState<boolean>(false);
   const [showClearConfirm, setShowClearConfirm] = useState<boolean>(false);
-  const [sessionData, setSessionData] = useState<MarketSessionInfo[]>([]);
-  const [synthesizedStrategies, setSynthesizedStrategies] = useState<SynthesizedStrategyGene[]>([]);
-  const [strategyPerformance, setStrategyPerformance] = useState<StrategyPerformanceRecord[]>([]);
-  const [isEvolvingStrategy, setIsEvolvingStrategy] = useState<boolean>(false);
-  const [historyImportPair, setHistoryImportPair] = useState<string>('EUR/USD');
-  const [isImportingHistory, setIsImportingHistory] = useState<boolean>(false);
-  const [historyImportMessage, setHistoryImportMessage] = useState<string>('');
-  const [validatingGeneId, setValidatingGeneId] = useState<string | null>(null);
-  const [nowMs, setNowMs] = useState<number>(Date.now());
+  const [isScanningNow, setIsScanningNow] = useState<boolean>(false);
+  const { user, deleteClosedSignalsFromFirestore } = useFirebase();
 
-  // Real-time 1-second ticking timer for candle countdowns
+  const handleTriggerScan = async () => {
+    setIsScanningNow(true);
+    try {
+      await fetch('/api/scheduler/pulse', { method: 'POST' });
+      onEvaluateSignals();
+    } catch (err) {
+      console.error('Manual pulse failed:', err);
+    } finally {
+      setIsScanningNow(false);
+    }
+  };
+
+  // Live Clock & Time Math
+  const [nowMs, setNowMs] = useState<number>(Date.now());
+  const [sessionData, setSessionData] = useState<MarketSessionInfo[]>([]);
+
   useEffect(() => {
     const timer = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
 
-  // Sync session accuracy breakdown
-  const fetchSessions = async () => {
-    try {
-      const res = await fetch('/api/sessions/accuracy');
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.sessions) setSessionData(data.sessions);
-      }
-    } catch (e) {
-      console.warn('Failed to fetch session accuracy:', e);
-    }
-  };
-
-  // Sync synthesized evolutionary strategies
-  const fetchSynthesizedStrategies = async () => {
-    try {
-      const res = await fetch('/api/strategies/synthesized');
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.strategies) setSynthesizedStrategies(data.strategies);
-      }
-    } catch (e) {
-      console.warn('Failed to fetch synthesized strategies:', e);
-    }
-  };
-
-  const fetchStrategyPerformance = async () => {
-    try {
-      const res = await fetch('/api/strategies/performance');
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.strategies) setStrategyPerformance(data.strategies);
-      }
-    } catch (e) {
-      console.warn('Failed to fetch forward strategy performance:', e);
-    }
-  };
-
-  const getForwardPerformance = (strategyId?: string) =>
-    strategyPerformance.find(item => item.strategyId === (strategyId || '')) || null;
-
+  // Fetch session analytics
   useEffect(() => {
+    const fetchSessions = async () => {
+      try {
+        const sessRes = await fetch('/api/sessions/accuracy').then(r => r.json()).catch(() => ({ sessions: [] }));
+        if (sessRes?.sessions) setSessionData(sessRes.sessions);
+      } catch (err) {
+        console.warn('Failed to load session accuracy:', err);
+      }
+    };
     fetchSessions();
-    fetchSynthesizedStrategies();
-    fetchStrategyPerformance();
-  }, [signals]);
-
-  const handleEvolveStrategy = async () => {
-    setIsEvolvingStrategy(true);
-    try {
-      const res = await fetch('/api/strategies/evolve', { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        await fetchSynthesizedStrategies();
-        await fetchStrategyPerformance();
-        onEvaluateSignals();
-      }
-    } catch (err) {
-      console.error('Failed to evolve novel strategy:', err);
-    } finally {
-      setIsEvolvingStrategy(false);
-    }
-  };
-
-  const parseCsvLine = (line: string): string[] => {
-    const cells: string[] = [];
-    let value = '';
-    let quoted = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"' && line[i + 1] === '"' && quoted) { value += '"'; i++; }
-      else if (ch === '"') quoted = !quoted;
-      else if (ch === ',' && !quoted) { cells.push(value.trim()); value = ''; }
-      else value += ch;
-    }
-    cells.push(value.trim());
-    return cells;
-  };
-
-  const handleImportHistoricalFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    setIsImportingHistory(true);
-    setHistoryImportMessage('');
-    try {
-      const rawText = await file.text();
-      let candles: any[] = [];
-      if (file.name.toLowerCase().endsWith('.json')) {
-        const parsed = JSON.parse(rawText);
-        candles = Array.isArray(parsed) ? parsed : (parsed.candles || parsed.data || []);
-      } else {
-        const lines = rawText.split(/\r?\n/).filter(line => line.trim().length > 0);
-        if (lines.length < 2) throw new Error('CSV must include a header row and at least one candle.');
-        const headers = parseCsvLine(lines[0]).map(h => h.trim().toLowerCase().replace(/[ _-]/g, ''));
-        const indexOf = (...names: string[]) => headers.findIndex(h => names.includes(h));
-        const timeIndex = indexOf('timestamp', 'time', 'date', 'datetime', 'gmttime', 'timestampms');
-        const openIndex = indexOf('open', 'o');
-        const highIndex = indexOf('high', 'h');
-        const lowIndex = indexOf('low', 'l');
-        const closeIndex = indexOf('close', 'c');
-        const volumeIndex = indexOf('volume', 'vol', 'v');
-        if ([timeIndex, openIndex, highIndex, lowIndex, closeIndex].some(i => i < 0)) {
-          throw new Error('CSV headers must contain timestamp/time, open, high, low and close columns.');
-        }
-        candles = lines.slice(1).map(line => {
-          const cells = parseCsvLine(line);
-          return {
-            timestamp: cells[timeIndex],
-            open: Number(cells[openIndex]),
-            high: Number(cells[highIndex]),
-            low: Number(cells[lowIndex]),
-            close: Number(cells[closeIndex]),
-            volume: volumeIndex >= 0 ? Number(cells[volumeIndex]) : 0,
-          };
-        });
-      }
-      if (!candles.length) throw new Error('No candle rows were found in the selected file.');
-      const batchSize = 20_000;
-      let imported = 0;
-      let rejected = 0;
-      let totalStored = 0;
-      for (let offset = 0; offset < candles.length; offset += batchSize) {
-        const batch = candles.slice(offset, offset + batchSize);
-        const res = await fetch('/api/research/candles/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ symbol: historyImportPair, candles: batch }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || `Historical import failed at row ${offset + 1}.`);
-        imported += data.result.imported;
-        rejected += data.result.rejected;
-        totalStored = data.result.totalStored;
-        setHistoryImportMessage(
-          `Importing ${historyImportPair}: ${Math.min(offset + batch.length, candles.length).toLocaleString()} / ${candles.length.toLocaleString()} rows processed…`
-        );
-      }
-      setHistoryImportMessage(
-        `Imported ${imported.toLocaleString()} valid candles for ${historyImportPair}. Stored total: ${totalStored.toLocaleString()}. Rejected rows: ${rejected}.`
-      );
-    } catch (error: any) {
-      setHistoryImportMessage(error.message || 'Could not import historical candles.');
-    } finally {
-      setIsImportingHistory(false);
-      event.target.value = '';
-    }
-  };
-
-  const handleValidateGene = async (geneId: string, symbol?: string) => {
-    setValidatingGeneId(geneId);
-    setHistoryImportMessage('');
-    try {
-      const res = await fetch('/api/strategies/validate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ geneId, symbol: symbol || historyImportPair }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Strategy validation failed.');
-      await fetchSynthesizedStrategies();
-      setHistoryImportMessage(
-        `${data.gene.name}: untouched-test win rate ${data.gene.verifiedAccuracy}% from ${data.gene.sampleCount} trades. Status: ${data.gene.status}.`
-      );
-    } catch (error: any) {
-      setHistoryImportMessage(error.message || 'Strategy validation failed.');
-    } finally {
-      setValidatingGeneId(null);
-    }
-  };
-
-  const validatedGenes = synthesizedStrategies.filter(
-    gene => gene.accuracyStatus === 'BACKTESTED' && !!gene.backtestMetrics
-  );
-  const validatedGeneCount = validatedGenes.length;
-  const paperTradingGeneCount = synthesizedStrategies.filter(gene => gene.status === 'PAPER_TRADING').length;
-
-  // 5-Minute Candle Synchronization
-  const FIVE_MIN_MS = 5 * 60 * 1000;
-  const current5mOpenMs = Math.floor(nowMs / FIVE_MIN_MS) * FIVE_MIN_MS;
-  const next5mOpenMs = current5mOpenMs + FIVE_MIN_MS;
-  const secondsToNext5m = Math.max(0, Math.floor((next5mOpenMs - nowMs) / 1000));
-  const next5mMin = Math.floor(secondsToNext5m / 60);
-  const next5mSec = secondsToNext5m % 60;
-  const next5mCountdownStr = `${next5mMin.toString().padStart(2, '0')}:${next5mSec.toString().padStart(2, '0')}`;
-
-  const formatIST = (isoString?: string | null) => {
-    if (!isoString) return 'At Candle Open';
-    try {
-      const d = new Date(isoString);
-      return (
-        new Intl.DateTimeFormat('en-IN', {
-          timeZone: 'Asia/Kolkata',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hour12: true,
-        }).format(d).toUpperCase() + ' IST'
-      );
-    } catch {
-      return isoString;
-    }
-  };
-
-  const next5mOpenIST = new Intl.DateTimeFormat('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true,
-  }).format(new Date(next5mOpenMs)).toUpperCase() + ' IST';
+  }, [signals.length]);
 
   // Weekend Forex Market Status
   const nowDate = new Date(nowMs);
-  const dayOfWeek = nowDate.getUTCDay(); // 0 = Sun, 5 = Fri, 6 = Sat
+  const dayOfWeek = nowDate.getUTCDay();
   const currentUtcHour = nowDate.getUTCHours();
   const isWeekendClosed =
     (dayOfWeek === 5 && currentUtcHour >= 21) ||
     dayOfWeek === 6 ||
     (dayOfWeek === 0 && currentUtcHour < 21);
 
-  // Strict 24-Hour Rolling Filter:
-  // Trades older than 24 hours are automatically erased from daily accuracy and active history
-  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-  const recent24hSignals = signals.filter(s => {
-    const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
-    const ageMs = nowMs - timeMs;
-    if (ageMs > TWENTY_FOUR_HOURS_MS) return false;
-    // Don't show zombie active trades older than 1 hour as active
-    if (['WAITING_FOR_ENTRY', 'ACTIVE', 'ENTRY_TRIGGERED', 'EXIT_PENDING'].includes(s.lifecycleState)) {
-      if (ageMs > 60 * 60 * 1000) return false;
+  // 5-Minute Candle Boundary Synchronization
+  const currentMinute = nowDate.getUTCMinutes();
+  const currentSecond = nowDate.getUTCSeconds();
+  const minuteIn5mCycle = currentMinute % 5;
+  const secondsToNext5m = (4 - minuteIn5mCycle) * 60 + (60 - currentSecond);
+  const next5mCountdownStr = `${Math.floor(secondsToNext5m / 60)
+    .toString()
+    .padStart(2, '0')}m ${(secondsToNext5m % 60).toString().padStart(2, '0')}s`;
+  const isWithin3MinAdvanceWindow = secondsToNext5m <= 180 && secondsToNext5m >= 15;
+
+  // IST Date Strings for Partitioning
+  const todayIstKey = getIstDateKey(nowDate);
+  const yesterdayDate = new Date(nowMs - 24 * 60 * 60 * 1000);
+  const yesterdayIstKey = getIstDateKey(yesterdayDate);
+
+  // -------------------------------------------------------------
+  // ACTIVE & PENDING TRADES (ALWAYS RENDERED AT THE VERY TOP!)
+  // -------------------------------------------------------------
+
+  // 1. ACTIVE TRADES (Currently in market, live ticking before expiry)
+  const activeTrades = useMemo(() => {
+    const list = signals.filter(s => {
+      const exitTimeMs = s.plannedExitTimeUtc ? Date.parse(s.plannedExitTimeUtc) : 0;
+      const isNotYetExpired = exitTimeMs === 0 || nowMs < exitTimeMs;
+      return s.lifecycleState === 'ACTIVE' && s.actualEntryPrice !== null && isNotYetExpired;
+    });
+    const map = new Map<string, ResearchSignal>();
+    for (const s of list) {
+      if (s && s.id && !map.has(s.id)) {
+        map.set(s.id, s);
+      }
     }
-    return true;
-  });
+    return Array.from(map.values());
+  }, [signals, nowMs]);
 
-  // Overall Accuracy & Metrics strictly computed for Today (Rolling 24 Hours)
-  const historySignals = recent24hSignals.filter(s =>
-    ['CLOSED', 'EXPIRED', 'INVALIDATED'].includes(s.lifecycleState)
-  );
-  const completedSignals = recent24hSignals.filter(
-    s => s.lifecycleState === 'CLOSED' && ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult)
-  );
-  const closedSignals = completedSignals.filter(s => ['WIN', 'LOSS'].includes(s.outcomeResult));
-  const totalWins = closedSignals.filter(s => s.outcomeResult === 'WIN').length;
-  const totalLosses = closedSignals.filter(s => s.outcomeResult === 'LOSS').length;
-  const calculatedWinRate =
-    closedSignals.length > 0
-      ? ((totalWins / closedSignals.length) * 100).toFixed(1)
-      : 'No scored outcomes today';
-  const totalNetPips = Number(
-    completedSignals.reduce((acc, s) => acc + (s.netReturnPips || 0), 0).toFixed(1)
-  );
-
-  const activeSignals = recent24hSignals.filter(s =>
-    ['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE', 'EXIT_PENDING'].includes(s.lifecycleState)
-  );
-
-  const filteredSignals = recent24hSignals.filter(s => {
-    if (filterState === 'ACTIVE') {
-      return ['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE', 'EXIT_PENDING'].includes(
-        s.lifecycleState
+  // 2. SIGNAL ALERTS (Advance notices waiting for upcoming 5M open)
+  const signalAlerts = useMemo(() => {
+    const list = signals.filter(s => {
+      return (
+        s.actualEntryPrice === null &&
+        ['WAITING_FOR_ENTRY', 'DETECTED', 'ENTRY_TRIGGERED'].includes(s.lifecycleState)
       );
+    });
+    const map = new Map<string, ResearchSignal>();
+    for (const s of list) {
+      if (s && s.id && !map.has(s.id)) {
+        map.set(s.id, s);
+      }
     }
-    if (filterState === 'CLOSED') {
-      return ['CLOSED', 'EXPIRED', 'INVALIDATED'].includes(s.lifecycleState);
+    return Array.from(map.values());
+  }, [signals]);
+
+  // 3. RESULT VERIFYING (Past expiry, awaiting feed close tick)
+  const verifyingTrades = useMemo(() => {
+    const list = signals.filter(s => {
+      const exitTimeMs = s.plannedExitTimeUtc ? Date.parse(s.plannedExitTimeUtc) : 0;
+      const isPastExpiry = exitTimeMs > 0 && nowMs >= exitTimeMs;
+      const isExitPending =
+        s.lifecycleState === 'EXIT_PENDING' || (s.lifecycleState === 'ACTIVE' && isPastExpiry);
+      return isExitPending && s.actualEntryPrice !== null && s.outcomeResult === 'PENDING';
+    });
+    const map = new Map<string, ResearchSignal>();
+    for (const s of list) {
+      if (s && s.id && !map.has(s.id)) {
+        map.set(s.id, s);
+      }
     }
-    return true;
-  });
+    return Array.from(map.values());
+  }, [signals, nowMs]);
+
+  // -------------------------------------------------------------
+  // REAL HISTORICAL & LIVE SIGNAL PARTITIONS (NO FAKE / DUMMY DATA)
+  // -------------------------------------------------------------
+
+  // Helper filter function for pair and status filters
+  const applyFilters = (list: ResearchSignal[]) => {
+    return list.filter(s => {
+      if (pairFilter !== 'ALL' && s.symbol !== pairFilter) return false;
+      if (statusFilter === 'EXECUTED') {
+        return s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult);
+      }
+      if (statusFilter === 'WIN') return s.outcomeResult === 'WIN';
+      if (statusFilter === 'LOSS') return s.outcomeResult === 'LOSS';
+      return true;
+    });
+  };
+
+  // 1. ALL SIGNALS (Full Bot History - Never restarts to 0)
+  const allSignals = useMemo(() => signals, [signals]);
+  const allExecutedTrades = useMemo(() => {
+    return allSignals.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+  }, [allSignals]);
+  const allSettledTrades = useMemo(() => {
+    return allExecutedTrades.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+  }, [allExecutedTrades]);
+  const allWins = allSettledTrades.filter(t => t.outcomeResult === 'WIN').length;
+  const allLosses = allSettledTrades.filter(t => t.outcomeResult === 'LOSS').length;
+  const allScored = allWins + allLosses;
+  const allWinRate = allScored > 0 ? Number(((allWins / allScored) * 100).toFixed(1)) : null;
+  const allNetUnits = Number(allSettledTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
+  const allGrossPips = Number(allSettledTrades.reduce((acc, t) => acc + (t.grossReturnPips || 0), 0).toFixed(1));
+  const displayedAllSignals = useMemo(() => applyFilters(allSignals), [allSignals, pairFilter, statusFilter]);
+
+  // 2. DAILY SESSIONS GROUPING (Partitioned strictly by IST calendar day)
+  const dailySessions = useMemo<DailySessionSummary[]>(() => {
+    const groups = new Map<string, ResearchSignal[]>();
+
+    for (const sig of signals) {
+      const timeVal = sig.actualEntryTimeUtc || sig.candleOpenTimeUtc || sig.predictionTimeUtc;
+      const key = getIstDateKey(timeVal);
+      if (!key) continue;
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+      groups.get(key)!.push(sig);
+    }
+
+    // Sort descending by dateKey (newest days first)
+    const sortedKeys = Array.from(groups.keys()).sort((a, b) => b.localeCompare(a));
+
+    return sortedKeys.map(dateKey => {
+      const sigs = groups.get(dateKey) || [];
+      const sampleDate = new Date(`${dateKey}T12:00:00Z`);
+      const displayDate = formatIstDateHeading(sampleDate);
+      const dayOfWeek = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'long' }).format(sampleDate);
+
+      const executed = sigs.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+      const settled = executed.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+      const active = sigs.filter(s => s.lifecycleState === 'ACTIVE' || s.lifecycleState === 'WAITING_FOR_ENTRY' || s.lifecycleState === 'EXIT_PENDING');
+      const wins = settled.filter(s => s.outcomeResult === 'WIN').length;
+      const losses = settled.filter(s => s.outcomeResult === 'LOSS').length;
+      const scored = wins + losses;
+      const winRate = scored > 0 ? Number(((wins / scored) * 100).toFixed(1)) : null;
+      const netUnits = Number(settled.reduce((acc, s) => acc + (s.netReturnUnits || 0), 0).toFixed(2));
+      const grossPips = Number(settled.reduce((acc, s) => acc + (s.grossReturnPips || 0), 0).toFixed(1));
+
+      return {
+        dateKey,
+        displayDate,
+        dayOfWeek,
+        signals: sigs,
+        executedTrades: executed,
+        settledTrades: settled,
+        activeTrades: active,
+        wins,
+        losses,
+        winRate,
+        netUnits,
+        grossPips,
+        isToday: dateKey === todayIstKey,
+        isYesterday: dateKey === yesterdayIstKey,
+      };
+    });
+  }, [signals, todayIstKey, yesterdayIstKey]);
+
+  // Latest completed trading session (for fallback when yesterday had 0 trades e.g. weekends/holidays)
+  const latestCompletedSession = useMemo(() => {
+    return dailySessions.find(d => d.settledTrades.length > 0 && !d.isToday) || dailySessions.find(d => d.settledTrades.length > 0) || null;
+  }, [dailySessions]);
+
+  const [selectedSessionDate, setSelectedSessionDate] = useState<string>('ALL');
+
+  // 3. TODAY'S SIGNALS (Partitioned strictly by IST Today)
+  const todaySignals = useMemo(() => {
+    return signals.filter(s => {
+      const dateKey = getIstDateKey(s.actualEntryTimeUtc || s.candleOpenTimeUtc || s.predictionTimeUtc);
+      return dateKey === todayIstKey;
+    });
+  }, [signals, todayIstKey]);
+  const todayExecutedTrades = useMemo(() => {
+    return todaySignals.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+  }, [todaySignals]);
+  const todaySettledTrades = useMemo(() => {
+    return todayExecutedTrades.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+  }, [todayExecutedTrades]);
+  const todayWins = todaySettledTrades.filter(t => t.outcomeResult === 'WIN').length;
+  const todayLosses = todaySettledTrades.filter(t => t.outcomeResult === 'LOSS').length;
+  const todayScored = todayWins + todayLosses;
+  const todayWinRate = todayScored > 0 ? Number(((todayWins / todayScored) * 100).toFixed(1)) : null;
+  const todayNetUnits = Number(todaySettledTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
+  const todayGrossPips = Number(todaySettledTrades.reduce((acc, t) => acc + (t.grossReturnPips || 0), 0).toFixed(1));
+  const displayedTodaySignals = useMemo(() => applyFilters(todaySignals), [todaySignals, pairFilter, statusFilter]);
+
+  // 4. YESTERDAY'S SIGNALS (Strict IST Yesterday)
+  const yesterdaySignals = useMemo(() => {
+    return signals.filter(s => {
+      const dateKey = getIstDateKey(s.actualEntryTimeUtc || s.candleOpenTimeUtc || s.predictionTimeUtc);
+      return dateKey === yesterdayIstKey;
+    });
+  }, [signals, yesterdayIstKey]);
+  const yesterdayExecutedTrades = useMemo(() => {
+    return yesterdaySignals.filter(s => s.actualEntryPrice !== null || ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+  }, [yesterdaySignals]);
+  const yesterdaySettledTrades = useMemo(() => {
+    return yesterdayExecutedTrades.filter(s => ['WIN', 'LOSS', 'SCRATCH'].includes(s.outcomeResult));
+  }, [yesterdayExecutedTrades]);
+  const yesterdayWins = yesterdaySettledTrades.filter(t => t.outcomeResult === 'WIN').length;
+  const yesterdayLosses = yesterdaySettledTrades.filter(t => t.outcomeResult === 'LOSS').length;
+  const yesterdayScored = yesterdayWins + yesterdayLosses;
+  const yesterdayWinRate = yesterdayScored > 0 ? Number(((yesterdayWins / yesterdayScored) * 100).toFixed(1)) : null;
+  const yesterdayNetUnits = Number(yesterdaySettledTrades.reduce((acc, t) => acc + (t.netReturnUnits || 0), 0).toFixed(2));
+  const yesterdayGrossPips = Number(yesterdaySettledTrades.reduce((acc, t) => acc + (t.grossReturnPips || 0), 0).toFixed(1));
+  const displayedYesterdaySignals = useMemo(() => applyFilters(yesterdaySignals), [yesterdaySignals, pairFilter, statusFilter]);
+
+  // Live Pip Displacement Calculation for active trade cards
+  const calculateLiveDisplacement = (trade: ResearchSignal) => {
+    if (!trade) {
+      return { current: 0, diffPips: 0, isInTheMoney: false };
+    }
+    const symbol = trade.symbol || 'EUR/USD';
+    const entryPrice = trade.actualEntryPrice || trade.triggerPrice || 0;
+    const currentPrice = (latestPrices && latestPrices[symbol]) || entryPrice;
+    const isJpy = typeof symbol === 'string' && symbol.includes('JPY');
+    const pipMultiplier = isJpy ? 100 : 10000;
+    const diffPips = Number(((currentPrice - entryPrice) * pipMultiplier).toFixed(1));
+    const isBuy = trade.direction === 'BUY';
+    const isInTheMoney = isBuy ? diffPips > 0 : diffPips < 0;
+    return {
+      current: currentPrice,
+      diffPips: isBuy ? diffPips : -diffPips,
+      isInTheMoney,
+    };
+  };
 
   const handleClearHistory = async () => {
     setIsClearingHistory(true);
     try {
       await fetch('/api/signals/clear-history', { method: 'POST' });
+      if (user) {
+        await deleteClosedSignalsFromFirestore();
+      }
       onEvaluateSignals();
       setShowClearConfirm(false);
     } catch (err) {
@@ -352,1395 +498,1466 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
     }
   };
 
-  const getSignalAge = (isoString: string) => {
-    const diffSec = Math.max(0, Math.floor((nowMs - Date.parse(isoString)) / 1000));
-    if (diffSec < 60) return `${diffSec}s ago`;
-    const mins = Math.floor(diffSec / 60);
-    const secs = diffSec % 60;
-    return `${mins}m ${secs}s ago`;
-  };
+  const renderTradeTable = (tradeList: ResearchSignal[]) => {
+    if (tradeList.length === 0) {
+      return (
+        <div className="p-8 text-center text-xs font-mono text-[#AAB4BF]">
+          No matching signals found for current filter selection.
+        </div>
+      );
+    }
 
-  const getRemainingTime = (exitTimeIso: string | null) => {
-    if (!exitTimeIso) return '05m 00s';
-    const diffSec = Math.floor((Date.parse(exitTimeIso) - nowMs) / 1000);
-    if (diffSec <= 0) return '00m 00s (Closing...)';
-    const mins = Math.floor(diffSec / 60);
-    const secs = diffSec % 60;
-    return `${mins.toString().padStart(2, '0')}m ${secs.toString().padStart(2, '0')}s`;
+    return (
+      <div className="overflow-x-auto">
+        <table className="w-full text-left font-mono text-xs">
+          <thead className="bg-[#17212D] border-b border-[#354251] text-[#AAB4BF] uppercase text-[11px] font-bold">
+            <tr>
+              <th className="py-3.5 px-4">Status</th>
+              <th className="py-3.5 px-4">Pair &amp; Direction</th>
+              <th className="py-3.5 px-4">Alert Time (IST)</th>
+              <th className="py-3.5 px-4">5M Entry (IST)</th>
+              <th className="py-3.5 px-4">Expiry Time (IST)</th>
+              <th className="py-3.5 px-4 text-right">Entry Price</th>
+              <th className="py-3.5 px-4 text-right">Exit Price</th>
+              <th className="py-3.5 px-4 text-right">Net Return</th>
+              <th className="py-3.5 px-4 text-right">Audit</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#354251] bg-[#222B36]/60">
+            {tradeList.map((trade, idx) => {
+              const timings = getSignalTimings(trade);
+              const isWin = trade.outcomeResult === 'WIN';
+              const isLoss = trade.outcomeResult === 'LOSS';
+              const isActive = trade.lifecycleState === 'ACTIVE';
+              const isWaiting = trade.lifecycleState === 'WAITING_FOR_ENTRY';
+              const isVerifying = trade.lifecycleState === 'EXIT_PENDING';
+
+              return (
+                <tr key={`terminal_trade_${trade.id}_${idx}`} className="hover:bg-[#17212D]/60 transition-colors">
+                  <td className="py-3.5 px-4">
+                    {isWin && (
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-black bg-[#72A98B]/20 text-[#72A98B] border border-[#72A98B]/40">
+                        <Check className="w-3.5 h-3.5" />
+                        WON
+                      </span>
+                    )}
+                    {isLoss && (
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-black bg-[#B7797D]/20 text-[#B7797D] border border-[#B7797D]/40">
+                        <X className="w-3.5 h-3.5" />
+                        LOST
+                      </span>
+                    )}
+                    {isActive && (
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-black bg-[#72A98B]/20 text-[#72A98B] border border-[#72A98B]/40">
+                        <span className="w-2 h-2 rounded-full bg-[#72A98B] animate-ping" />
+                        ACTIVE
+                      </span>
+                    )}
+                    {isWaiting && (
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-bold bg-[#C5A36A]/20 text-[#C5A36A] border border-[#C5A36A]/40">
+                        <Timer className="w-3.5 h-3.5" />
+                        QUEUED
+                      </span>
+                    )}
+                    {isVerifying && (
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-bold bg-[#C5A36A]/20 text-[#C5A36A] border border-[#C5A36A]/40">
+                        <Activity className="w-3.5 h-3.5 animate-pulse" />
+                        VERIFYING
+                      </span>
+                    )}
+                    {!isWin && !isLoss && !isActive && !isWaiting && !isVerifying && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs bg-[#17212D] text-[#AAB4BF] border border-[#354251]">
+                        {trade.lifecycleState}
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-3.5 px-4">
+                    <span className="font-black text-base text-[#E8E5DE]">{trade.symbol}</span>
+                    <span className={`text-xs font-black ml-2.5 px-2 py-0.5 rounded-md ${trade.direction === 'BUY' ? 'bg-[#72A98B]/20 text-[#72A98B] border border-[#72A98B]/30' : 'bg-[#B7797D]/20 text-[#B7797D] border border-[#B7797D]/30'}`}>
+                      {trade.direction} ({trade.direction === 'BUY' ? 'CALL' : 'PUT'}) · {trade.expiryMinutes || 5}M
+                    </span>
+                  </td>
+                  <td className="py-3.5 px-4 text-xs font-medium text-[#AAB4BF]">{timings.alertTimeIst}</td>
+                  <td className="py-3.5 px-4 text-sm font-bold text-[#E8E5DE]">{timings.entryTimeIst}</td>
+                  <td className="py-3.5 px-4 text-sm font-bold text-[#6C9D91]">{timings.expiryTimeIst}</td>
+                  <td className="py-3.5 px-4 text-right font-bold text-sm text-[#E8E5DE]">
+                    {trade.actualEntryPrice?.toFixed(5) || (
+                      <span className="text-[#AAB4BF] text-xs">Trig: {trade.triggerPrice?.toFixed(5)}</span>
+                    )}
+                  </td>
+                  <td className="py-3.5 px-4 text-right font-bold text-sm text-[#E8E5DE]">
+                    {trade.actualExitPrice?.toFixed(5) || (
+                      <span className="text-[#AAB4BF] text-xs">
+                        {isActive ? 'In Market' : isWaiting ? 'Queued 5M' : isVerifying ? 'Verifying Tick' : 'Pending'}
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-3.5 px-4 text-right tabular-nums text-sm">
+                    {trade.netReturnUnits !== undefined && trade.netReturnUnits !== null ? (
+                      <span className={`font-black ${trade.netReturnUnits > 0 ? 'text-[#72A98B]' : trade.netReturnUnits < 0 ? 'text-[#B7797D]' : 'text-[#AAB4BF]'}`}>
+                        {trade.netReturnUnits > 0 ? `+${trade.netReturnUnits.toFixed(2)}` : trade.netReturnUnits.toFixed(2)} U
+                      </span>
+                    ) : (
+                      <span className="text-[#AAB4BF]">—</span>
+                    )}
+                  </td>
+                  <td className="py-3.5 px-4 text-right">
+                    <button
+                      onClick={() => setSelectedSignal(trade)}
+                      className="px-3 py-1.5 rounded-lg bg-[#17212D] hover:bg-[#354251] border border-[#354251] text-xs font-bold text-[#E8E5DE] cursor-pointer transition-colors"
+                    >
+                      Audit
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    );
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden bg-neutral-950 font-sans text-neutral-100">
-      {/* 1. TOP STATUS BAR: Zero clutter, essential numbers at a glance */}
-      <div className="bg-neutral-900/90 border-b border-neutral-800 px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0">
-        {/* Live 5M Candle Clock / Weekend Closed Status */}
-        <div className="flex items-center gap-2.5">
-          {isWeekendClosed ? (
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-950/80 border border-amber-800/80 text-amber-300 font-bold text-xs font-mono">
-                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                GLOBAL FX MARKET CLOSED (WEEKEND)
+    <div className="w-full bg-[#121820] text-[#E8E5DE] min-h-screen font-sans pb-20">
+      {/* ------------------------------------------------------------- */}
+      {/* 1. TOP HEADER & 24/7 BACKGROUND STATUS BAR */}
+      {/* ------------------------------------------------------------- */}
+      <header className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3 sticky top-16 z-20">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+          {/* Left: Engine Identity & 24/7 Background Indicator */}
+          <div className="flex flex-wrap items-center gap-2.5">
+            <span className="text-sm font-black font-mono tracking-wider text-[#E8E5DE] uppercase flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#6C9D91]" />
+              Signal Terminal
+            </span>
+            <span className="text-[#354251]">/</span>
+            <span className="px-2.5 py-0.5 rounded-full bg-[#72A98B]/15 border border-[#72A98B]/35 text-[#72A98B] font-bold text-[10px] flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#72A98B] animate-pulse" />
+              24/5 AUTONOMOUS ENGINE ACTIVE (CRON READY)
+            </span>
+          </div>
+
+          {/* Right: IST Clock, 5M Countdown, and Sync Button */}
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div className="flex items-center gap-1.5 px-3 py-1 rounded bg-[#222B36] border border-[#354251] text-[#E8E5DE] font-bold">
+              <Clock className="w-3.5 h-3.5 text-[#6C9D91]" />
+              <span>{formatIstTime(nowDate)}</span>
+            </div>
+
+            {isWeekendClosed ? (
+              <span className="px-2.5 py-1 rounded bg-[#C5A36A]/15 border border-[#C5A36A]/40 text-[#C5A36A] font-bold text-[11px]">
+                WEEKEND PAUSED (MON 02:30 AM IST)
               </span>
-              <span className="text-xs text-neutral-400 font-mono hidden sm:inline">
-                Trading bots paused · Reopens Sunday 21:00 UTC (Monday 02:30 AM IST)
+            ) : (
+              <span className="px-2.5 py-1 rounded bg-[#222B36] border border-[#354251] text-[#AAB4BF] text-[11px]">
+                Next 5M Open in <strong className="text-[#E8E5DE]">{next5mCountdownStr}</strong>
+              </span>
+            )}
+
+            <button
+              onClick={onEvaluateSignals}
+              disabled={isEvaluating}
+              className="px-3 py-1 rounded bg-[#222B36] hover:bg-[#354251] border border-[#354251] text-[#AAB4BF] hover:text-[#E8E5DE] font-bold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isEvaluating ? 'animate-spin text-[#6C9D91]' : ''}`} />
+              <span>Sync</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* ------------------------------------------------------------- */}
+      {/* 2. DEDICATED HIGH-VISIBILITY SIGNAL ALERT BROADCAST LAYER */}
+      {/* ------------------------------------------------------------- */}
+      <section className="bg-gradient-to-b from-[#222B36] to-[#17212D] border-b border-[#354251] px-4 lg:px-8 py-5">
+        <div className="max-w-7xl mx-auto space-y-4">
+          {/* Header Row */}
+          <div className="flex flex-wrap items-center justify-between gap-3 font-mono">
+            <div className="flex items-center gap-2.5">
+              <span className="w-3 h-3 rounded-full bg-[#72A98B] animate-ping" />
+              <h2 className="text-base sm:text-lg font-black text-[#E8E5DE] uppercase tracking-wider flex items-center gap-2">
+                <Zap className="w-5 h-5 text-[#C4A574]" />
+                <span>SIGNAL ALERT BROADCAST LAYER</span>
+              </h2>
+              <span className="text-xs text-[#AAB4BF] font-semibold hidden md:inline">
+                ({signalAlerts.length} Advance Alerts · {activeTrades.length} Active Trades · {verifyingTrades.length} Verifying)
               </span>
             </div>
-          ) : (
-            <>
-              <span className="relative flex h-3 w-3">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500" />
-              </span>
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs sm:text-sm font-bold text-white uppercase tracking-wide">
-                  Next 5M Trade Open In:
-                </span>
-                <span className="text-sm sm:text-base font-extrabold font-mono text-emerald-400 tabular-nums">
-                  {next5mCountdownStr}
-                </span>
-                <span className="text-[11px] text-neutral-400 font-mono hidden xs:inline">
-                  ({next5mOpenIST})
-                </span>
-                <span
-                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold font-mono border flex items-center gap-1 ${
-                    secondsToNext5m <= 180
-                      ? 'bg-amber-950/80 border-amber-500/80 text-amber-300 animate-pulse'
-                      : 'bg-neutral-900 border-neutral-800 text-neutral-400'
-                  }`}
-                  title="Only generate signals strictly 3 minutes in advance of 5M candle open"
-                >
-                  <Clock className="w-3 h-3 text-amber-400" />
-                  {secondsToNext5m <= 180
-                    ? '⚡ Strict 3M Window Active'
-                    : `3M Window in ${Math.floor((secondsToNext5m - 180) / 60)}m ${((secondsToNext5m - 180) % 60).toString().padStart(2, '0')}s`}
-                </span>
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Global Accuracy Pill */}
-        <div className="flex items-center gap-2">
-          <div className="px-2.5 py-1 rounded-lg bg-emerald-950/80 border border-emerald-800/80 flex items-center gap-2">
-            <Target className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="text-xs font-bold text-emerald-300 font-mono">
-              {closedSignals.length ? `${calculatedWinRate}% Today's 24H Win Rate` : 'No completed trades in last 24h'}
-            </span>
-            <span className="text-[10px] text-neutral-400 font-mono hidden sm:inline">
-              ({totalWins}W / {totalLosses}L · Auto-resets daily)
-            </span>
-          </div>
-
-          <button
-            onClick={onEvaluateSignals}
-            disabled={isEvaluating}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold text-neutral-200 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg transition-colors disabled:opacity-50"
-            title="Scan market and sync signals"
-          >
-            <RefreshCw className={`w-3 h-3 ${isEvaluating ? 'animate-spin text-emerald-400' : ''}`} />
-            <span className="hidden xs:inline">{isEvaluating ? 'Scanning...' : 'Sync'}</span>
-          </button>
-        </div>
-      </div>
-
-      {/* SESSION ACCURACY STRIP (ASIA · LONDON · OVERLAP · NEW YORK) */}
-      <div className="bg-neutral-900/60 border-b border-neutral-800/80 px-3 sm:px-5 py-1.5 flex items-center justify-between gap-2 overflow-x-auto text-[11px] font-mono scrollbar-none shrink-0">
-        <div className="flex items-center gap-2 text-neutral-400 shrink-0">
-          <Globe className="w-3.5 h-3.5 text-cyan-400" />
-          <span className="font-bold text-neutral-300 uppercase text-[10px] tracking-wider">Forward Session Outcomes:</span>
-        </div>
-        <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-          {sessionData.length === 0 ? (
-            <span className="text-neutral-500">No completed forward session outcomes yet</span>
-          ) : sessionData.map(s => (
-            <button
-              key={s.id}
-              onClick={() => setShowSessionsModal(true)}
-              className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md border transition-all ${
-                s.isActive
-                  ? 'bg-emerald-950/80 border-emerald-500 text-emerald-300 font-bold shadow-xs'
-                  : 'bg-neutral-950/70 border-neutral-800/80 text-neutral-400 hover:text-neutral-200'
-              }`}
-            >
-              {s.isActive && (
-                <span className="relative flex h-2 w-2">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
-                </span>
-              )}
-              <span>{s.shortName}:</span>
-              <strong className={s.isActive ? 'text-emerald-400' : 'text-neutral-200'}>{s.hasMeasuredData ? `${s.winRate}%` : '—'}</strong>
-              <span className="text-[9px] text-neutral-500">n={s.totalTrades}</span>
-              {s.isActive && <span className="text-[9px] uppercase px-1 rounded bg-emerald-500/20 text-emerald-400">Live</span>}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Weekend Market Closed Notice Banner */}
-      {isWeekendClosed && (
-        <div className="bg-amber-950/40 border-b border-amber-800/80 px-3 sm:px-5 py-2.5 flex items-center justify-between gap-3 text-amber-200 shrink-0">
-          <div className="flex items-center gap-2.5 text-xs">
-            <span className="p-1 rounded-md bg-amber-900/60 text-amber-400 shrink-0">
-              <Clock className="w-4 h-4" />
-            </span>
-            <p className="leading-snug">
-              <strong className="text-amber-300 font-bold">Global Forex Market Closed for Weekend:</strong> Interbank forex trading is closed globally from Friday 21:00 UTC until Sunday 21:00 UTC (Monday 02:30 AM IST). The live trading bot generator is paused. Backtesting, Model Lab, and strategy discovery remain operational.
-            </p>
-          </div>
-          <div className="hidden lg:flex items-center gap-2 shrink-0">
-            <span className="text-[11px] font-mono font-bold text-amber-300 bg-amber-900/60 px-2.5 py-1 rounded-lg border border-amber-800/80">
-              Next Reopen: Sunday 21:00 UTC · Monday 02:30 AM IST
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* 2. SECONDARY CONTROLS & INFO BUTTONS */}
-      <div className="bg-neutral-950 px-3 sm:px-5 py-2 border-b border-neutral-800/70 flex flex-wrap items-center justify-between gap-2 shrink-0">
-        {/* Filters: Active | All | History */}
-        <div className="flex items-center gap-1 bg-neutral-900 p-1 rounded-lg border border-neutral-800 text-xs font-medium">
-          <button
-            onClick={() => setFilterState('ACTIVE')}
-            className={`px-3 py-1 rounded-md transition-colors font-bold flex items-center gap-1.5 ${
-              filterState === 'ACTIVE'
-                ? 'bg-emerald-500 text-neutral-950 shadow-sm'
-                : 'text-neutral-400 hover:text-white'
-            }`}
-          >
-            <Zap className="w-3 h-3" />
-            <span>Active Signals ({activeSignals.length})</span>
-          </button>
-
-          <button
-            onClick={() => setFilterState('ALL')}
-            className={`px-3 py-1 rounded-md transition-colors ${
-              filterState === 'ALL'
-                ? 'bg-neutral-800 text-white font-bold'
-                : 'text-neutral-400 hover:text-white'
-            }`}
-          >
-            <span>All 24H ({recent24hSignals.length})</span>
-          </button>
-
-          <button
-            onClick={() => setFilterState('CLOSED')}
-            className={`px-3 py-1 rounded-md transition-colors ${
-              filterState === 'CLOSED'
-                ? 'bg-neutral-800 text-white font-bold'
-                : 'text-neutral-400 hover:text-white'
-            }`}
-            title="Today's completed trade outcomes (erased automatically every 24 hours)"
-          >
-            <span>Today's History ({historySignals.length})</span>
-          </button>
-        </div>
-
-        {/* Secondary Actions & Clear History */}
-        <div className="flex items-center gap-2">
-          {filterState === 'CLOSED' && historySignals.length > 0 && (
-            <button
-              onClick={() => setShowClearConfirm(true)}
-              disabled={isClearingHistory}
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 border border-rose-800/60 text-xs text-rose-300 font-medium transition-colors disabled:opacity-50"
-              title="Clear today's completed trade history (also auto-erases every 24 hours)"
-            >
-              <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-              <span>{isClearingHistory ? 'Clearing...' : 'Clear 24H History'}</span>
-            </button>
-          )}
-
-          <button
-            onClick={() => setShowGenesisModal(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-cyan-950/60 hover:bg-cyan-900/80 border border-cyan-600/80 text-xs text-cyan-200 font-bold transition-all shadow-xs"
-            title="Inspect strategy candidates and validation evidence"
-          >
-            <Dna className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
-            <span className="hidden sm:inline">Candidates</span>
-            <span className="sm:hidden">Candidates</span>
-            <span className="px-1.5 py-0.2 rounded bg-cyan-500/20 text-[10px] text-cyan-300 font-mono font-bold">
-              {synthesizedStrategies.filter(s => s.status === 'PROMOTED_ACTIVE').length}
-            </span>
-          </button>
-
-          <button
-            onClick={() => setShowSessionsModal(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/40 hover:bg-emerald-900/60 border border-emerald-800/80 text-xs text-emerald-300 font-medium transition-colors"
-          >
-            <Globe className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="hidden sm:inline">Sessions</span>
-            <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-[10px] text-emerald-400 font-mono font-bold">
-              {sessionData.find(s => s.isActive)?.shortName || 'Live'}
-            </span>
-          </button>
-
-          <button
-            onClick={() => setShowAgiModal(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-purple-950/60 hover:bg-purple-900/80 border border-purple-600/80 text-xs text-purple-200 font-bold transition-all shadow-xs"
-            title="Inspect AGI closed-loop self-learning telemetry"
-          >
-            <Brain className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
-            <span className="hidden sm:inline">AGI Self-Learning</span>
-            <span className="sm:hidden">AGI</span>
-            <span className="px-1.5 py-0.2 rounded bg-purple-500/20 text-[10px] text-purple-300 font-mono font-bold">
-              ONLINE
-            </span>
-          </button>
-
-          <button
-            onClick={() => setShowLearningModal(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-xs text-neutral-300 font-medium transition-colors"
-          >
-            <Brain className="w-3.5 h-3.5 text-cyan-400" />
-            <span className="hidden sm:inline">What AI Learns</span>
-            <span className="sm:hidden">AI Brain</span>
-          </button>
-
-          <button
-            onClick={() => setShowStrategiesModal(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-xs text-neutral-300 font-medium transition-colors"
-          >
-            <Lightbulb className="w-3.5 h-3.5 text-amber-400" />
-            <span className="hidden sm:inline">Strategies</span>
-            <span className="sm:hidden">Strategies</span>
-          </button>
-        </div>
-      </div>
-
-      {/* 3. MAIN SIGNALS FEED: BOLD, UNCLUTTERED, DIRECT TRADING TICKETS */}
-      <div className="flex-1 overflow-y-auto p-3 sm:p-5 space-y-4">
-        {/* HISTORY SUMMARY BANNER (Shown when viewing History tab) */}
-        {filterState === 'CLOSED' && historySignals.length > 0 && (
-          <div className="bg-neutral-900/90 border border-neutral-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
-                <Target className="w-6 h-6" />
-              </div>
-              <div>
-                <span className="text-[11px] text-neutral-400 uppercase tracking-wider font-bold block">
-                  Closed Trades Performance
-                </span>
-                <div className="text-xl sm:text-2xl font-black font-mono text-white">
-                  {closedSignals.length ? `${calculatedWinRate}% forward paper win rate` : 'No completed forward outcomes'}
-                </div>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-4 text-xs font-mono">
-              <div className="text-center bg-neutral-950 px-3 py-1.5 rounded-xl border border-neutral-800">
-                <span className="text-[10px] text-neutral-400 block uppercase">Total Trades</span>
-                <span className="font-bold text-white text-sm">{historySignals.length}</span>
-              </div>
-              <div className="text-center bg-neutral-950 px-3 py-1.5 rounded-xl border border-emerald-900/50">
-                <span className="text-[10px] text-emerald-400 block uppercase">Wins</span>
-                <span className="font-bold text-emerald-300 text-sm">{totalWins}</span>
-              </div>
-              <div className="text-center bg-neutral-950 px-3 py-1.5 rounded-xl border border-rose-900/50">
-                <span className="text-[10px] text-rose-400 block uppercase">Losses</span>
-                <span className="font-bold text-rose-300 text-sm">{totalLosses}</span>
-              </div>
-              <div className="text-center bg-neutral-950 px-3 py-1.5 rounded-xl border border-neutral-800">
-                <span className="text-[10px] text-neutral-400 block uppercase">Net Return</span>
-                <span className={`font-bold text-sm ${totalNetPips >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {totalNetPips > 0 ? '+' : ''}{totalNetPips} Pips
-                </span>
-              </div>
+              <button
+                onClick={handleTriggerScan}
+                disabled={isScanningNow}
+                className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-[#6C9D91] hover:bg-[#72A98B] text-[#17212D] font-bold text-xs transition-all shadow-sm cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isScanningNow ? 'animate-spin' : ''}`} />
+                <span>{isScanningNow ? 'Scanning 20 Pairs...' : 'Scan Markets Now'}</span>
+              </button>
             </div>
           </div>
-        )}
 
-        {filteredSignals.length === 0 ? (
-          <div className="min-h-[280px] flex flex-col items-center justify-center text-center bg-neutral-900/30 border-2 border-dashed border-neutral-800 rounded-2xl p-6">
-            <Clock className="w-12 h-12 text-emerald-500 mb-3 animate-pulse" />
-            <h3 className="text-lg font-bold text-white">
-              {filterState === 'CLOSED'
-                ? 'No Closed Trades in History Yet'
-                : 'Bot Is Scanning for the Next 5-Minute Setup'}
-            </h3>
-            <p className="mt-2 text-xs sm:text-sm text-neutral-400 max-w-md leading-relaxed">
-              {filterState === 'CLOSED'
-                ? 'When active 5-minute trades reach their expiry, their full trade execution, entry fill, exit fill, and win/loss pips will appear here.'
-                : 'Every trade strictly opens at the 5-minute candle opening (:00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55) with dynamic expiry duration.'}
-            </p>
-            <button
-              onClick={() => setFilterState(filterState === 'CLOSED' ? 'ACTIVE' : 'ALL')}
-              className="mt-4 px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-white rounded-lg text-xs font-semibold"
-            >
-              {filterState === 'CLOSED' ? `View Active Signals (${activeSignals.length})` : `View All Signals (${signals.length})`}
-            </button>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filteredSignals.map(sig => {
-              const isBuy = sig.direction === 'BUY';
-              const isWaiting = sig.lifecycleState === 'WAITING_FOR_ENTRY';
-              const isActive = ['ACTIVE', 'ENTRY_TRIGGERED'].includes(sig.lifecycleState);
-              const isClosed = sig.lifecycleState === 'CLOSED';
-              const isWin = sig.outcomeResult === 'WIN';
-              const isLoss = sig.outcomeResult === 'LOSS';
+          {/* ------------------------------------------------------------- */}
+          {/* A. 3-MINUTE ADVANCE SIGNAL ALERT HERO CARDS (WAITING FOR ENTRY) */}
+          {/* ------------------------------------------------------------- */}
+          {signalAlerts.length > 0 && (
+            <div className="space-y-3">
+              <div className="text-xs font-mono text-[#C4A574] font-black uppercase tracking-wider flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-[#C4A574] animate-pulse" />
+                <span>🔔 HIGH-PRIORITY PRE-ENTRY ALERT — PREPARE FOR 5M CANDLE OPEN ENTRY</span>
+              </div>
+              <div className="grid grid-cols-1 gap-4">
+                {signalAlerts.map((alert, idx) => {
+                  const timings = getSignalTimings(alert);
+                  const isBuy = alert.direction === 'BUY';
+                  const livePrice = latestPrices[alert.symbol] || alert.triggerPrice;
+                  const entryMs = timings.entryTimestampMs || (alert.candleOpenTimeUtc ? Date.parse(alert.candleOpenTimeUtc) : 0);
+                  const msToEntry = entryMs ? Math.max(0, entryMs - nowMs) : 0;
+                  const secToEntry = Math.floor(msToEntry / 1000);
+                  const countdownToEntryStr = secToEntry > 0
+                    ? `${Math.floor(secToEntry / 60)}m ${(secToEntry % 60).toString().padStart(2, '0')}s`
+                    : 'Entering Now';
 
-              return (
-                <div
-                  key={sig.id}
-                  onClick={() => setSelectedSignal(sig)}
-                  className={`border-2 rounded-2xl p-4 sm:p-5 flex flex-col justify-between transition-all cursor-pointer shadow-lg relative ${
-                    isActive
-                      ? 'bg-neutral-900/95 border-emerald-500 shadow-emerald-950/40 ring-1 ring-emerald-500/40'
-                      : isWaiting
-                      ? 'bg-neutral-900/95 border-amber-500/80 shadow-amber-950/20'
-                      : 'bg-neutral-900/70 border-neutral-800 hover:border-neutral-700'
-                  }`}
-                >
-                  <div className="space-y-3.5">
-                    {/* ROW 1: PAIR + DIRECTION (MASSIVE & UNMISSABLE) */}
-                    <div className="flex items-center justify-between pb-3 border-b border-neutral-800">
-                      <div>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-2xl sm:text-3xl font-black font-mono tracking-tight text-white">
-                            {sig.symbol}
+                  return (
+                    <div
+                      key={`terminal_alert_${alert.id}_${idx}`}
+                      className="bg-[#17212D] border-2 border-[#C4A574] rounded-2xl p-5 sm:p-6 shadow-2xl space-y-4 font-mono relative overflow-hidden"
+                    >
+                      {/* Top Accent Strip */}
+                      <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-[#C4A574] via-[#6C9D91] to-[#72A98B]" />
+
+                      {/* Row 1: Pair & Direction in Massive Typography */}
+                      <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                        <div className="flex items-center gap-3 sm:gap-4">
+                          <span className="text-3xl sm:text-5xl font-black text-[#E8E5DE] tracking-tight">
+                            {alert.symbol}
                           </span>
-                          <span className="px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/40 text-[10px] font-bold text-amber-300">
-                            3m Advance
-                          </span>
-                          {sig.marketSessionName && (
-                            <span className="px-2 py-0.5 rounded-full bg-cyan-950/80 border border-cyan-800/80 text-[10px] font-bold text-cyan-300 font-mono">
-                              {sig.marketSessionName.split(' ')[0]} Session
-                            </span>
-                          )}
-                          {sig.isNovelAiSynthesized && (
-                            <span className="px-2 py-0.5 rounded-full bg-linear-to-r from-cyan-950 to-emerald-950 border border-cyan-500 text-[10px] font-black text-cyan-300 font-mono shadow-xs flex items-center gap-1">
-                              <Dna className="w-2.5 h-2.5 text-cyan-400 animate-pulse" />
-                              Formula Candidate
-                            </span>
-                          )}
-                          {sig.isStackedStrategy && !sig.isNovelAiSynthesized && (
-                            <span className="px-2 py-0.5 rounded-full bg-purple-950/80 border border-purple-700/80 text-[10px] font-bold text-purple-300 font-mono">
-                              Stacked ({sig.confluenceScore || 2} Models)
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-[11px] text-neutral-400 font-mono mt-0.5">
-                          {getSignalAge(sig.predictionTimeUtc)} · Expiry: <strong className="text-amber-300">{sig.expiryMinutes || 5} Min Dynamic</strong>
-                        </div>
-                      </div>
-
-                      <div
-                        className={`px-3.5 py-1.5 rounded-xl font-black text-sm sm:text-base flex items-center gap-1.5 shadow-md ${
-                          isBuy
-                            ? 'bg-emerald-500 text-neutral-950 shadow-emerald-500/30'
-                            : 'bg-rose-500 text-white shadow-rose-500/30'
-                        }`}
-                      >
-                        {isBuy ? (
-                          <ArrowUpRight className="w-5 h-5 stroke-[3]" />
-                        ) : (
-                          <ArrowDownRight className="w-5 h-5 stroke-[3]" />
-                        )}
-                        <span>{isBuy ? 'BUY (CALL)' : 'SELL (PUT)'}</span>
-                      </div>
-                    </div>
-
-                    {/* ROW 2: PROMINENT STATUS BANNER & COUNTDOWN */}
-                    {isWaiting && (
-                      <div className="bg-amber-950/60 border border-amber-500/80 rounded-xl p-2.5 text-xs text-amber-200 flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <Clock className="w-4 h-4 text-amber-400 animate-pulse shrink-0" />
-                          <div>
-                            <span className="font-extrabold text-amber-300 block">
-                              🔔 3-MIN ADVANCE NOTICE
-                            </span>
-                            <span className="text-[10px] text-amber-400/90 font-mono">
-                              Entry at 5M Candle Open ({sig.candleOpenTimeIst || next5mOpenIST})
-                            </span>
-                          </div>
-                        </div>
-                        <span className="font-mono text-xs font-black text-white bg-amber-900/80 px-2 py-1 rounded border border-amber-600 shrink-0 ml-2">
-                          Opens in {next5mCountdownStr}
-                        </span>
-                      </div>
-                    )}
-
-                    {isActive && (
-                      <div className="bg-emerald-950/70 border border-emerald-500 rounded-xl p-2.5 text-xs text-emerald-200 flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="relative flex h-2.5 w-2.5 shrink-0">
-                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
-                          </span>
-                          <div>
-                            <span className="font-bold text-emerald-300 block">
-                              TRADE ACTIVE IN PROGRESS
-                            </span>
-                            <span className="text-[10px] text-emerald-400/90 font-mono">
-                              Dynamic {sig.expiryMinutes || 5} Min Expiry Duration
-                            </span>
-                          </div>
-                        </div>
-                        <span className="font-mono text-xs font-black text-white bg-emerald-900 px-2 py-1 rounded border border-emerald-600 shrink-0 ml-2">
-                          {getRemainingTime(sig.plannedExitTimeUtc)}
-                        </span>
-                      </div>
-                    )}
-
-                    {isClosed && (
-                      <div
-                        className={`rounded-xl p-3 text-xs flex flex-col gap-2 border ${
-                          isWin
-                            ? 'bg-emerald-950/60 border-emerald-500/80 text-emerald-200 shadow-md ring-1 ring-emerald-500/30'
-                            : isLoss
-                            ? 'bg-rose-950/60 border-rose-500/80 text-rose-200 shadow-md ring-1 ring-rose-500/30'
-                            : 'bg-neutral-800 border-neutral-700 text-neutral-300'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5 font-black text-sm">
-                            {isWin ? (
-                              <>
-                                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                                <span className="text-emerald-300">TRADE WON</span>
-                              </>
-                            ) : isLoss ? (
-                              <>
-                                <XCircle className="w-5 h-5 text-rose-400" />
-                                <span className="text-rose-300">TRADE LOST</span>
-                              </>
-                            ) : (
-                              <>
-                                <AlertTriangle className="w-4 h-4 text-amber-400" />
-                                <span>{sig.lifecycleState}</span>
-                              </>
-                            )}
-                          </div>
-                          <span className="font-mono text-sm font-black px-2 py-0.5 rounded bg-neutral-950 border border-neutral-800">
-                            {sig.netReturnPips !== null ? `${sig.netReturnPips > 0 ? '+' : ''}${sig.netReturnPips} Pips` : (sig.outcomeResult || 'CLOSED')}
+                          <span
+                            className={`px-4 py-1.5 rounded-xl text-sm sm:text-base font-black flex items-center gap-2 shadow-md ${
+                              isBuy
+                                ? 'bg-[#72A98B] text-[#17212D]'
+                                : 'bg-[#B7797D] text-[#17212D]'
+                            }`}
+                          >
+                            {isBuy ? <ArrowUpRight className="w-5 h-5 stroke-[3]" /> : <ArrowDownRight className="w-5 h-5 stroke-[3]" />}
+                            <span>{alert.direction} / {isBuy ? 'CALL (BUY)' : 'PUT (SELL)'}</span>
                           </span>
                         </div>
 
-                        {sig.actualEntryPrice && (
-                          <div className="flex justify-between items-center text-[11px] font-mono border-t border-neutral-800/80 pt-1.5 text-neutral-300">
-                            <span>Entry Fill: <strong className="text-white">{sig.actualEntryPrice}</strong></span>
-                            <span>Exit Fill: <strong className="text-white">{sig.actualExitPrice || '—'}</strong></span>
-                          </div>
-                        )}
-
-                        {isLoss && (
-                          <div className="mt-2 pt-2 border-t border-rose-900/60 space-y-1.5">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[10px] font-black uppercase text-rose-300 flex items-center gap-1 font-mono">
-                                <Microscope className="w-3.5 h-3.5 text-rose-400" />
-                                Loss Diagnostics
-                              </span>
-                              <span className="text-[9px] px-1.5 py-0.5 rounded bg-rose-900/40 text-rose-300 font-mono">
-                                {sig.lossAutopsy ? sig.lossAutopsy.rootCause.replace(/_/g, ' ') : 'Self-Evolved Antidote'}
-                              </span>
-                            </div>
-                            {sig.lossAutopsy && (
-                              <div className="p-2 rounded-lg bg-neutral-950/80 border border-rose-900/40 text-[10px] space-y-1 font-mono">
-                                <div className="text-neutral-300">
-                                  <strong className="text-amber-400">Lesson:</strong> {sig.lossAutopsy.lessonsLearned[0]}
-                                </div>
-                                <div className="text-cyan-300 truncate">
-                                  <strong className="text-neutral-400">Unvalidated Filter Candidate:</strong> {sig.lossAutopsy.antidoteStrategyName}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* ROW 3: THE TWO ESSENTIAL TIMINGS (HIGH CONTRAST BOXES) */}
-                    <div className="grid grid-cols-2 gap-2 text-xs font-mono">
-                      {/* ENTRY BOX */}
-                      <div className="bg-neutral-950 p-2.5 rounded-xl border border-neutral-800 flex flex-col justify-between">
-                        <span className="text-[10px] text-emerald-400 font-bold uppercase tracking-wider flex items-center gap-1">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                          ENTRY (5M OPEN)
-                        </span>
-                        <div className="text-sm sm:text-base font-extrabold text-white mt-1 tabular-nums">
-                          {sig.candleOpenTimeIst || formatIST(sig.actualEntryTimeUtc || sig.entryWindowStartUtc)}
-                        </div>
-                        <span className="text-[10px] text-neutral-400 mt-0.5">Strict 5M Open</span>
-                      </div>
-
-                      {/* EXIT / EXPIRY BOX */}
-                      <div className="bg-neutral-950 p-2.5 rounded-xl border border-neutral-800 flex flex-col justify-between">
-                        <span className="text-[10px] text-rose-400 font-bold uppercase tracking-wider flex items-center gap-1">
-                          <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-                          EXPIRY ({sig.expiryMinutes || 5} MIN)
-                        </span>
-                        <div className="text-sm sm:text-base font-extrabold text-white mt-1 tabular-nums">
-                          {sig.candleCloseTimeIst || formatIST(sig.plannedExitTimeUtc)}
-                        </div>
-                        <span className="text-[10px] text-neutral-400 mt-0.5">Dynamic Close</span>
-                      </div>
-                    </div>
-
-                    {/* ROW 4: STRATEGY & WIN RATE BANNER */}
-                    <div className="bg-neutral-950/80 p-2.5 rounded-xl border border-neutral-800/80 space-y-1.5 text-xs">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-1.5 truncate">
-                          {sig.isNovelAiSynthesized ? (
-                            <Dna className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                          ) : (
-                            <Lightbulb className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                          )}
-                          <span className="text-neutral-200 font-semibold truncate text-[11px]">
-                            {sig.strategyName || '5-Min Momentum Breakout'}
+                        <div className="flex items-center gap-2 text-right">
+                          <span className="px-3.5 py-1.5 rounded-full text-xs font-bold bg-[#C4A574]/20 border border-[#C4A574]/50 text-[#C4A574] flex items-center gap-2 shadow-inner">
+                            <span className="w-2 h-2 rounded-full bg-[#C4A574] animate-ping" />
+                            <span>⏳ Enters in {countdownToEntryStr}</span>
+                            <span className="text-[#AAB4BF] font-normal border-l border-[#C4A574]/30 pl-1.5">3-Min Advance</span>
                           </span>
                         </div>
-                        <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/80 font-mono text-[11px] font-bold shrink-0">
-                          {sig.paperOnly ? 'PAPER ONLY · NOT APPROVED' : (sig.strategyEvidenceStatus === 'BACKTESTED' && typeof sig.strategyWinRate === 'number' ? `${sig.strategyWinRate.toFixed(1)}% Historical test WR · n=${sig.strategyHistoricalSampleSize || 0}` : 'Historical result not validated')}
-                        </span>
                       </div>
 
-                      {(() => {
-                        const forward = getForwardPerformance(sig.strategyId);
-                        const scoredTrades = forward ? forward.wins + forward.losses : 0;
-                        return (
-                          <div className="text-[10px] font-mono text-neutral-400 pt-1">
-                            Forward paper results: {forward && forward.trades > 0
-                              ? `${scoredTrades > 0 ? `${((forward.wins / scoredTrades) * 100).toFixed(1)}% across ${scoredTrades} scored outcomes` : 'No scored outcomes'} · ${forward.scratches} scratches · ${forward.netPips > 0 ? '+' : ''}${forward.netPips.toFixed(1)} modeled net pips`
-                              : 'No completed forward outcomes yet'}
+                      {/* Row 2: 4 Primary Financial Execution Pillars in Large Typography */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                        {/* 1. Scheduled 5M Entry Time in IST */}
+                        <div className="p-4 rounded-xl bg-[#222B36] border border-[#354251] space-y-1">
+                          <span className="text-[11px] font-bold text-[#AAB4BF] uppercase block tracking-wider">
+                            5M Candle Open Entry (IST)
+                          </span>
+                          <div className="text-xl sm:text-2xl font-black text-[#E8E5DE] tabular-nums">
+                            {timings.entryTimeIst}
                           </div>
-                        );
-                      })()}
-
-                      {sig.mathematicalFormula && (
-                        <div className="mt-1 p-2 rounded-lg bg-cyan-950/40 border border-cyan-800/70 font-mono text-[10px] text-cyan-200 flex items-center justify-between gap-1 overflow-x-auto scrollbar-none">
-                          <span className="text-cyan-400 font-bold shrink-0">Equation:</span>
-                          <span className="truncate">{sig.mathematicalFormula}</span>
-                          <span className="text-[9px] px-1 py-0.2 bg-cyan-500/20 text-cyan-300 rounded shrink-0 font-bold">Formula</span>
+                          <span className="text-[10px] text-[#72A98B] font-bold block flex items-center gap-1.5">
+                            <span>⏳ Enters in {countdownToEntryStr}</span>
+                            <span className="text-[#AAB4BF] font-normal">({timings.alertTimeIst} alert)</span>
+                          </span>
                         </div>
-                      )}
 
-                      {sig.confluenceStrategies && sig.confluenceStrategies.length > 0 && (
-                        <div className="flex flex-wrap gap-1 pt-1 border-t border-neutral-800/60">
-                          {sig.confluenceStrategies.map((c, i) => (
-                            <span key={i} className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-[9px] text-neutral-300 font-mono flex items-center gap-1">
-                              <span className="text-emerald-400">✓</span> {c}
+                        {/* 2. Target Expiry Time in IST */}
+                        <div className="p-4 rounded-xl bg-[#222B36] border border-[#354251] space-y-1">
+                          <span className="text-[11px] font-bold text-[#AAB4BF] uppercase block tracking-wider">
+                            Target Contract Expiry (IST)
+                          </span>
+                          <div className="text-xl sm:text-2xl font-black text-[#6C9D91] tabular-nums">
+                            {timings.expiryTimeIst}
+                          </div>
+                          <span className="text-[10px] text-[#AAB4BF] block">
+                            {alert.expiryMinutes || 5}-Minute Binary Horizon
+                          </span>
+                        </div>
+
+                        {/* 3. Causal Trigger Level */}
+                        <div className="p-4 rounded-xl bg-[#222B36] border border-[#354251] space-y-1">
+                          <span className="text-[11px] font-bold text-[#AAB4BF] uppercase block tracking-wider">
+                            Causal Trigger Price
+                          </span>
+                          <div className="text-2xl sm:text-3xl font-black text-[#72A98B] tabular-nums">
+                            {alert.triggerPrice?.toFixed(5)}
+                          </div>
+                          <span className="text-[10px] text-[#AAB4BF] block">
+                            Live market: {livePrice?.toFixed(5)}
+                          </span>
+                        </div>
+
+                        {/* 4. AI Machine Conviction */}
+                        <div className="p-4 rounded-xl bg-[#222B36] border border-[#354251] space-y-1">
+                          <span className="text-[11px] font-bold text-[#AAB4BF] uppercase block tracking-wider">
+                            AI Conviction Score
+                          </span>
+                          <div className="text-xl sm:text-2xl font-black text-[#E8E5DE] tabular-nums">
+                            {((alert.confidence || 0.8) * 100).toFixed(1)}%
+                          </div>
+                          <span className="text-[10px] text-[#C4A574] font-bold block truncate">
+                            {alert.strategyName || 'Multi-Model Confluence'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Row 3: Confluences & Details Footer */}
+                      <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-[#354251] text-xs">
+                        <div className="flex flex-wrap items-center gap-2 text-[#AAB4BF]">
+                          <span className="font-bold text-[#E8E5DE]">Mathematical Confluences:</span>
+                          {(alert.confluenceStrategies || ['EMA Alignment', 'Liquidity Sweep', 'Order Flow']).slice(0, 3).map((conf, cIdx) => (
+                            <span key={`conf_${alert.id}_${cIdx}`} className="px-2 py-0.5 rounded bg-[#222B36] border border-[#354251] text-[#E8E5DE] text-[11px]">
+                              {conf}
                             </span>
                           ))}
                         </div>
-                      )}
+
+                        <button
+                          onClick={() => setSelectedSignal(alert)}
+                          className="px-4 py-2 rounded-lg bg-[#222B36] hover:bg-[#354251] text-[#6C9D91] hover:text-[#E8E5DE] border border-[#354251] font-bold text-xs transition-colors cursor-pointer"
+                        >
+                          Inspect Setup &amp; Audit Trail →
+                        </button>
+                      </div>
                     </div>
-                  </div>
-
-                  {/* CARD FOOTER: Tap hint & Confidence */}
-                  <div className="pt-2.5 mt-3 border-t border-neutral-800/60 flex items-center justify-between text-[11px] text-neutral-400">
-                    <span className="font-mono">
-                      Signal score (not a probability):{' '}
-                      <strong className="text-emerald-400">
-                        {(sig.confidence * 100).toFixed(0)}%
-                      </strong>
-                    </span>
-                    <span className="text-[10px] text-neutral-500 hover:text-white underline">
-                      View Candle Proof →
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {/* 4. OPTIONAL LIVE AUTOPILOT STREAM (COLLAPSIBLE AT BOTTOM) */}
-        <div className="mt-6 border border-neutral-800/80 rounded-xl bg-neutral-900/40 overflow-hidden">
-          <button
-            onClick={() => setShowLogsAccordion(prev => !prev)}
-            className="w-full px-4 py-2.5 flex items-center justify-between text-xs font-mono text-neutral-400 hover:text-white transition-colors"
-          >
-            <div className="flex items-center gap-2">
-              <Activity className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Live AI Brain Background Activity ({autopilotLogs.length} events)</span>
+                  );
+                })}
+              </div>
             </div>
-            {showLogsAccordion ? (
-              <ChevronUp className="w-4 h-4 text-neutral-500" />
-            ) : (
-              <ChevronDown className="w-4 h-4 text-neutral-500" />
-            )}
-          </button>
-          {showLogsAccordion && (
-            <div className="p-3 border-t border-neutral-800/80">
-              <AutopilotStream logs={autopilotLogs} activeSignalsCount={activeSignals.length} />
+          )}
+
+          {/* ------------------------------------------------------------- */}
+          {/* B. ACTIVE IN-MARKET TRADE HERO CARDS (REAL-TIME CLOCK TICKING) */}
+          {/* ------------------------------------------------------------- */}
+          {activeTrades.length > 0 && (
+            <div className="space-y-3">
+              <div className="text-xs font-mono text-[#72A98B] font-black uppercase tracking-wider flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#72A98B] animate-ping" />
+                <span>🔥 LIVE ACTIVE TRADES IN MARKET — COUNTDOWN TICKING</span>
+              </div>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {activeTrades.map((trade, idx) => {
+                  const timings = getSignalTimings(trade);
+                  const disp = calculateLiveDisplacement(trade);
+                  const isBuy = trade.direction === 'BUY';
+                  const remMs = timings.expiryTimestampMs ? timings.expiryTimestampMs - nowMs : 0;
+                  const remSec = Math.max(0, Math.floor(remMs / 1000));
+                  const remMinStr = `${Math.floor(remSec / 60).toString().padStart(2, '0')}:${(remSec % 60).toString().padStart(2, '0')}`;
+
+                  return (
+                    <div
+                      key={`terminal_active_${trade.id}_${idx}`}
+                      className="bg-[#17212D] border-2 border-[#72A98B] rounded-2xl p-5 sm:p-6 shadow-2xl space-y-4 font-mono relative"
+                    >
+                      {/* Top Row: Symbol, Direction, Expiry Time */}
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <span className="text-3xl sm:text-4xl font-black text-[#E8E5DE]">
+                            {trade.symbol}
+                          </span>
+                          <span
+                            className={`px-3 py-1 rounded-xl text-xs sm:text-sm font-black flex items-center gap-1.5 ${
+                              isBuy ? 'bg-[#72A98B] text-[#17212D]' : 'bg-[#B7797D] text-[#17212D]'
+                            }`}
+                          >
+                            {isBuy ? <ArrowUpRight className="w-4 h-4 stroke-[3]" /> : <ArrowDownRight className="w-4 h-4 stroke-[3]" />}
+                            <span>{trade.direction} / {isBuy ? 'CALL' : 'PUT'}</span>
+                          </span>
+                        </div>
+
+                        <div className="text-right">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-bold">Target Expiry (IST)</span>
+                          <span className="text-base font-black text-[#6C9D91]">{timings.expiryTimeIst}</span>
+                        </div>
+                      </div>
+
+                      {/* 3-Metric Live Ticking Strip in Large Typography */}
+                      <div className="grid grid-cols-3 gap-3">
+                        <div className="p-3 rounded-xl bg-[#222B36] border border-[#354251]">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-bold">Entry Fill</span>
+                          <div className="text-lg sm:text-xl font-black text-[#E8E5DE] mt-0.5 tabular-nums">
+                            {trade.actualEntryPrice?.toFixed(5) || trade.triggerPrice?.toFixed(5)}
+                          </div>
+                        </div>
+
+                        <div className="p-3 rounded-xl bg-[#222B36] border border-[#354251]">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-bold">Live Feed</span>
+                          <div className="text-lg sm:text-xl font-black text-[#E8E5DE] mt-0.5 tabular-nums">
+                            {(disp.current ?? 0).toFixed(5)}
+                          </div>
+                        </div>
+
+                        <div className="p-3 rounded-xl bg-[#222B36] border border-[#354251]">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-bold">P&amp;L Displacement</span>
+                          <div className={`text-lg sm:text-xl font-black mt-0.5 tabular-nums ${disp.isInTheMoney ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                            {(disp.diffPips ?? 0) >= 0 ? `+${disp.diffPips ?? 0}` : (disp.diffPips ?? 0)} pips
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Animated Progress Bar & Settlement Countdown */}
+                      <div className="space-y-1.5 p-3 rounded-xl bg-[#222B36] border border-[#354251]">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-[#AAB4BF] flex items-center gap-1.5 font-bold">
+                            <Timer className="w-4 h-4 text-[#72A98B]" />
+                            <span>Time to Contract Settlement:</span>
+                          </span>
+                          <span className="font-black text-[#E8E5DE] text-sm tabular-nums">
+                            {remMinStr} remaining
+                          </span>
+                        </div>
+                        <div className="h-2 w-full rounded-full bg-[#17212D] overflow-hidden border border-[#354251]">
+                          <div
+                            style={{
+                              width: `${Math.min(100, Math.max(0, (remSec / (trade.expiryMinutes * 60)) * 100))}%`,
+                            }}
+                            className="h-full bg-[#72A98B] transition-all"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Footer Actions */}
+                      <div className="flex items-center justify-between pt-1 border-t border-[#354251] text-xs">
+                        <span className="text-[#AAB4BF] truncate max-w-[280px]">
+                          Strategy: <strong className="text-[#E8E5DE]">{trade.strategyName || trade.ruleFamily}</strong>
+                        </span>
+                        <button
+                          onClick={() => setSelectedSignal(trade)}
+                          className="text-xs text-[#6C9D91] hover:underline font-bold cursor-pointer"
+                        >
+                          Audit Signal Details →
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ------------------------------------------------------------- */}
+          {/* C. VERIFYING TRADES ALERT */}
+          {/* ------------------------------------------------------------- */}
+          {verifyingTrades.length > 0 && (
+            <div className="bg-[#17212D] border border-[#C4A574] rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+              <div className="flex items-center gap-2.5">
+                <Clock className="w-4 h-4 text-[#C4A574] animate-spin" />
+                <span className="text-[#E8E5DE] font-bold text-sm">
+                  {verifyingTrades.length} Trade(s) Past Expiry:
+                </span>
+                <span className="text-[#AAB4BF]">
+                  Awaiting 1-minute closed candle tick from broker feed to verify final settlement.
+                </span>
+              </div>
+              <span className="px-3 py-1 rounded-md bg-[#C4A574]/20 text-[#C4A574] font-bold text-xs">
+                RESULT VERIFYING
+              </span>
+            </div>
+          )}
+
+          {/* ------------------------------------------------------------- */}
+          {/* D. STANDBY 5M RADAR (WHEN NO ACTIVE OR WAITING TRADES) */}
+          {/* ------------------------------------------------------------- */}
+          {activeTrades.length === 0 && signalAlerts.length === 0 && verifyingTrades.length === 0 && (
+            <div className="bg-[#17212D] border border-[#354251] rounded-2xl p-6 flex flex-col md:flex-row md:items-center justify-between gap-4 font-mono text-xs shadow-lg">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 rounded-xl bg-[#222B36] border border-[#6C9D91]/40 flex items-center justify-center text-[#6C9D91] shrink-0">
+                  <Radio className="w-6 h-6 animate-pulse" />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-sm sm:text-base font-black text-[#E8E5DE] flex items-center gap-2">
+                    <span>AUTONOMOUS 5M SIGNAL SCANNER ACTIVE</span>
+                    <span className="px-2 py-0.5 rounded text-[10px] bg-[#72A98B]/20 text-[#72A98B] font-bold">
+                      20 PAIRS MONITORED
+                    </span>
+                  </div>
+                  <p className="text-[#AAB4BF] text-xs leading-relaxed max-w-2xl">
+                    Signals trigger strictly 3 minutes prior to 5-minute candle openings (:02, :07, :12, :17, :22, :27, :32, :37, :42, :47, :52, :57).
+                    Live alerts appear here immediately upon causal setup detection.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 shrink-0">
+                <div className="p-3 rounded-xl bg-[#222B36] border border-[#354251] text-right font-mono">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-bold">Next 5M Entry Window</span>
+                  <span className="text-base font-black text-[#E8E5DE]">{next5mCountdownStr}</span>
+                </div>
+                <button
+                  onClick={handleTriggerScan}
+                  disabled={isScanningNow}
+                  className="px-4 py-2.5 rounded-xl bg-[#6C9D91] hover:bg-[#72A98B] text-[#17212D] font-black text-xs transition-all shadow-md cursor-pointer disabled:opacity-50"
+                >
+                  {isScanningNow ? 'Scanning...' : 'Trigger Scan Setup'}
+                </button>
+              </div>
             </div>
           )}
         </div>
-      </div>
+      </section>
 
-      {/* MODAL 1: WHAT MACHINE LEARNING IS LEARNING (PLAIN ENGLISH) */}
-      {showLearningModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-neutral-700 rounded-2xl max-w-xl w-full p-5 sm:p-6 text-neutral-200 space-y-4 max-h-[90vh] overflow-y-auto shadow-2xl">
-            <div className="flex justify-between items-center pb-3 border-b border-neutral-800">
-              <div className="flex items-center gap-2">
-                <Brain className="w-6 h-6 text-emerald-400" />
-                <h3 className="text-lg font-bold text-white">What The AI Is Learning</h3>
-              </div>
-              <button
-                onClick={() => setShowLearningModal(false)}
-                className="text-neutral-400 hover:text-white p-1 rounded-lg"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs sm:text-sm text-neutral-300 leading-relaxed">
-              <div className="bg-neutral-950 p-3.5 rounded-xl border border-purple-800/80 space-y-2">
-                <span className="font-bold text-purple-400 block text-sm flex items-center gap-1.5">
-                  <Layers className="w-4 h-4" />
-                  1. Signal Confluence (Strength Score, Not Win Probability)
-                </span>
-                <p>
-                  The current rule-based signal engine combines technical confluences such as trend direction, wick geometry, RSI and range expansion. A larger confluence count is only a signal-strength heuristic; it does not establish a win rate. Performance is calculated separately from uploaded historical tests and completed forward paper outcomes.
-                </p>
-              </div>
-
-              <div className="bg-neutral-950 p-3.5 rounded-xl border border-cyan-800/80 space-y-2">
-                <span className="font-bold text-cyan-400 block text-sm flex items-center gap-1.5">
-                  <Globe className="w-4 h-4" />
-                  2. Session-Segmented Calibration (Asia / London / Overlap / New York)
-                </span>
-                <p>
-                  Completed forward paper outcomes are grouped by their recorded market session. A session with no completed outcomes shows no win rate; a strategy-specific leader is withheld until at least 20 scored forward paper outcomes exist.
-                </p>
-              </div>
-
-              <div className="bg-neutral-950 p-3.5 rounded-xl border border-emerald-800/80 space-y-2">
-                <span className="font-bold text-emerald-400 block text-sm flex items-center gap-1.5">
-                  <Brain className="w-4 h-4" />
-                  3. Every Closed Trade Is Forward Paper Evidence
-                </span>
-                <p>
-                  When a trade finishes, its observed result is stored in a per-strategy forward outcome ledger and tagged as a single live-trade record. One trade does not update historical accuracy or qualify a strategy for promotion; performance is reported with its accumulated sample count.
-                </p>
-              </div>
-
-              <div className="bg-neutral-950 p-3.5 rounded-xl border border-amber-800/80 space-y-2">
-                <span className="font-bold text-amber-400 block text-sm flex items-center gap-1.5">
-                  <Clock className="w-4 h-4" />
-                  4. Dynamic Expiry (5m to 30m) & Strict 5M Open Entry
-                </span>
-                <p>
-                  Every trade takes entry strictly on the 5-minute candle opening (:00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55) with 3 minutes advance notice. The bot selects dynamic expiries from <strong>5m to 30m</strong> based on the setup's velocity and time-horizon conviction.
-                </p>
-              </div>
-
-              <div className="bg-neutral-950 p-3.5 rounded-xl border border-cyan-800/80 space-y-2">
-                <span className="font-bold text-cyan-300 block text-sm flex items-center gap-1.5">
-                  <Dna className="w-4 h-4 text-cyan-400" />
-                  5. Strategy Candidate Generation and Validation
-                </span>
-                <p>
-                  The candidate generator samples operator families and coefficients and stores the exact executable parameters with each formula. Candidate generation alone provides no evidence of an edge; candidates must pass the untouched historical test and subsequent forward observation before promotion.
-                </p>
-              </div>
-
-              <div className="bg-emerald-950/40 p-3.5 rounded-xl border border-emerald-800/80 flex items-center justify-between">
-                <div>
-                  <div className="text-xs text-neutral-400">Completed forward paper outcomes:</div>
-                  <div className="text-2xl font-extrabold text-emerald-400 font-mono">
-                    {closedSignals.length ? `${calculatedWinRate}% forward paper win rate` : 'No completed forward outcomes'}
-                  </div>
-                </div>
-                <div className="text-right text-xs text-neutral-300 font-mono">
-                  <div>{totalWins} Wins</div>
-                  <div className="text-rose-400">{totalLosses} Losses</div>
-                </div>
-              </div>
-            </div>
+      {/* ------------------------------------------------------------- */}
+      {/* 3. DEDICATED SEPARATE LAYERS BAR: TODAY vs YESTERDAY vs DAILY SESSIONS */}
+      {/* ------------------------------------------------------------- */}
+      <nav className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4">
+          {/* Interactive Layer Switcher (6 Distinct Views) */}
+          <div className="flex flex-wrap items-center bg-[#222B36] border border-[#354251] p-1 rounded-xl gap-1">
+            <button
+              onClick={() => setActiveLayer('ACTIVE')}
+              className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer ${
+                activeLayer === 'ACTIVE'
+                  ? 'bg-[#17212D] text-[#72A98B] border border-[#72A98B]/50 shadow-sm'
+                  : 'text-[#AAB4BF] hover:text-[#E8E5DE]'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5 text-[#72A98B] animate-pulse" />
+              <span>ACTIVE &amp; ADVANCE</span>
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-[#72A98B]/20 text-[#72A98B]">
+                {activeTrades.length + signalAlerts.length}
+              </span>
+            </button>
 
             <button
-              onClick={() => setShowLearningModal(false)}
-              className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white font-bold rounded-xl transition-colors text-xs"
+              onClick={() => setActiveLayer('TODAY')}
+              className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer ${
+                activeLayer === 'TODAY'
+                  ? 'bg-[#17212D] text-[#6C9D91] border border-[#6C9D91]/50 shadow-sm'
+                  : 'text-[#AAB4BF] hover:text-[#E8E5DE]'
+              }`}
             >
-              Close
+              <Zap className="w-3.5 h-3.5 text-[#6C9D91]" />
+              <span>TODAY ({formatIstDateHeading(nowDate)})</span>
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-[#6C9D91]/20 text-[#6C9D91]">
+                {todaySignals.length}
+              </span>
             </button>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL 2: DISCOVERED STRATEGIES */}
-      {showStrategiesModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-neutral-700 rounded-2xl max-w-xl w-full p-5 sm:p-6 text-neutral-200 space-y-4 max-h-[90vh] overflow-y-auto shadow-2xl">
-            <div className="flex justify-between items-center pb-3 border-b border-neutral-800">
-              <div className="flex items-center gap-2">
-                <Lightbulb className="w-6 h-6 text-amber-400" />
-                <h3 className="text-lg font-bold text-white">Top Discovered Strategies</h3>
-              </div>
-              <button
-                onClick={() => setShowStrategiesModal(false)}
-                className="text-neutral-400 hover:text-white p-1 rounded-lg"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="space-y-3">
-              {/* Strategy 1 */}
-              <div className="bg-neutral-950 p-4 rounded-xl border border-emerald-800/80 space-y-2">
-                <div className="flex justify-between items-start">
-                  <div>
-                    <h4 className="font-bold text-white text-sm">1. 5-Minute Momentum Breakout</h4>
-                    <span className="text-[11px] text-neutral-400">Expiry: 5 Minutes · Best Pairs: EUR/USD, GBP/USD, EUR/JPY</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-mono font-bold">
-                    Not validated
-                  </span>
-                </div>
-                <p className="text-xs text-neutral-300 leading-relaxed">
-                  Enters at the exact opening of the next 5-minute candle when the setup candle closed with high directional volume and a body filling &gt;60% of total candle range. Exits at 5m candle close.
-                </p>
-              </div>
-
-              {/* Strategy 2 */}
-              <div className="bg-neutral-950 p-4 rounded-xl border border-neutral-800 space-y-2">
-                <div className="flex justify-between items-start">
-                  <div>
-                    <h4 className="font-bold text-white text-sm">2. 10-Minute Liquidity Wick Reversal</h4>
-                    <span className="text-[11px] text-neutral-400">Expiry: 10 Minutes · Best Pairs: USD/JPY, AUD/USD, AUD/CAD</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 text-xs font-mono font-bold">
-                    Not validated
-                  </span>
-                </div>
-                <p className="text-xs text-neutral-300 leading-relaxed">
-                  Candidate hypothesis: a long rejection wick (more than half the candle range) near a recent high or low may precede a short-term reversal. The configured 5M-open entry and 10-minute expiry are test settings, not proof of an edge.
-                </p>
-              </div>
-
-              {/* Strategy 3 */}
-              <div className="bg-neutral-950 p-4 rounded-xl border border-cyan-800/80 space-y-2">
-                <div className="flex justify-between items-start">
-                  <div>
-                    <h4 className="font-bold text-white text-sm">3. 15-Minute Statistical Mean Reversion</h4>
-                    <span className="text-[11px] text-neutral-400">Expiry: 15 Minutes · Best Pairs: EUR/GBP, USD/CAD</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 text-xs font-mono font-bold">
-                    Not validated
-                  </span>
-                </div>
-                <p className="text-xs text-neutral-300 leading-relaxed">
-                  Candidate hypothesis: price more than 8 pips from its 20-period moving average may revert toward the average. This needs historical and forward testing with the configured 5M-open entry and 15-minute expiry.
-                </p>
-              </div>
-
-              {/* Strategy 4 */}
-              <div className="bg-neutral-950 p-4 rounded-xl border border-purple-800/80 space-y-2">
-                <div className="flex justify-between items-start">
-                  <div>
-                    <h4 className="font-bold text-white text-sm">4. 20-to-30 Minute Volatility Breakout</h4>
-                    <span className="text-[11px] text-neutral-400">Expiry: 20–30 Minutes · Best Pairs: GBP/USD, EUR/JPY</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 text-xs font-mono font-bold">
-                    Not validated
-                  </span>
-                </div>
-                <p className="text-xs text-neutral-300 leading-relaxed">
-                  Candidate hypothesis: a break beyond a multi-candle consolidation may continue. It must pass a purged historical test and forward paper observation before it can be approved; configured expiry options are 20 or 30 minutes.
-                </p>
-              </div>
-            </div>
 
             <button
-              onClick={() => setShowStrategiesModal(false)}
-              className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white font-bold rounded-xl transition-colors text-xs"
+              onClick={() => setActiveLayer('YESTERDAY')}
+              className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer ${
+                activeLayer === 'YESTERDAY'
+                  ? 'bg-[#17212D] text-[#C4A574] border border-[#C4A574]/50 shadow-sm'
+                  : 'text-[#AAB4BF] hover:text-[#E8E5DE]'
+              }`}
             >
-              Close
+              <History className="w-3.5 h-3.5 text-[#C4A574]" />
+              <span>
+                {yesterdaySignals.length > 0
+                  ? `YESTERDAY (${formatIstDateHeading(yesterdayDate)})`
+                  : `YESTERDAY / LATEST (${latestCompletedSession?.displayDate || 'Session'})`}
+              </span>
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-[#C4A574]/20 text-[#C4A574]">
+                {yesterdaySignals.length > 0 ? yesterdaySignals.length : (latestCompletedSession?.settledTrades.length || 0)}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setActiveLayer('DAILY_SESSIONS')}
+              className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer ${
+                activeLayer === 'DAILY_SESSIONS'
+                  ? 'bg-[#17212D] text-[#72A98B] border border-[#72A98B]/50 shadow-sm'
+                  : 'text-[#AAB4BF] hover:text-[#E8E5DE]'
+              }`}
+            >
+              <Calendar className="w-3.5 h-3.5 text-[#72A98B]" />
+              <span>DAILY SESSIONS</span>
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-[#72A98B]/20 text-[#72A98B]">
+                {dailySessions.length} Days
+              </span>
+            </button>
+
+            <button
+              onClick={() => setActiveLayer('ALL')}
+              className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer ${
+                activeLayer === 'ALL'
+                  ? 'bg-[#17212D] text-[#E8E5DE] border border-[#354251] shadow-sm'
+                  : 'text-[#AAB4BF] hover:text-[#E8E5DE]'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5 text-[#AAB4BF]" />
+              <span>ALL BOT TRADES</span>
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-[#354251]/40 text-[#AAB4BF]">
+                {allSignals.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setActiveLayer('SESSIONS')}
+              className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer ${
+                activeLayer === 'SESSIONS'
+                  ? 'bg-[#17212D] text-[#6C9D91] border border-[#6C9D91]/50 shadow-sm'
+                  : 'text-[#AAB4BF] hover:text-[#E8E5DE]'
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5 text-[#6C9D91]" />
+              <span>SESSION MATRIX</span>
             </button>
           </div>
-        </div>
-      )}
 
-      {/* MODAL 3: SIGNAL DETAILS & VERIFICATION AUDIT */}
-      {selectedSignal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-neutral-700 rounded-2xl max-w-lg w-full p-5 text-xs font-mono text-neutral-300 space-y-4 max-h-[85vh] overflow-y-auto shadow-2xl">
-            <div className="flex justify-between items-center pb-3 border-b border-neutral-800">
-              <div className="flex items-center gap-2">
-                <span className="text-xl font-black text-white">{selectedSignal.symbol}</span>
-                <span
-                  className={`px-2.5 py-0.5 rounded-lg font-black ${
-                    selectedSignal.direction === 'BUY'
-                      ? 'bg-emerald-500 text-neutral-950'
-                      : 'bg-rose-500 text-white'
-                  }`}
-                >
-                  {selectedSignal.direction} ({selectedSignal.expiryMinutes || 5}M)
-                </span>
-                <span className="text-neutral-400 text-[11px]">[{selectedSignal.lifecycleState}]</span>
-              </div>
+          {/* Quick Sub-Filters for Status and Pairs */}
+          {activeLayer !== 'SESSIONS' && (
+            <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+              <span className="text-[#AAB4BF] text-[11px]">Status:</span>
               <button
-                onClick={() => setSelectedSignal(null)}
-                className="text-neutral-400 hover:text-white p-1 text-sm font-bold"
+                onClick={() => setStatusFilter('ALL')}
+                className={`px-2.5 py-1 rounded cursor-pointer transition-colors ${
+                  statusFilter === 'ALL'
+                    ? 'bg-[#E8E5DE] text-[#17212D] font-bold'
+                    : 'bg-[#222B36] text-[#AAB4BF] hover:text-[#E8E5DE] border border-[#354251]'
+                }`}
               >
-                ✕
+                All
               </button>
+              <button
+                onClick={() => setStatusFilter('EXECUTED')}
+                className={`px-2.5 py-1 rounded cursor-pointer transition-colors ${
+                  statusFilter === 'EXECUTED'
+                    ? 'bg-[#6C9D91] text-[#17212D] font-bold'
+                    : 'bg-[#222B36] text-[#6C9D91] hover:text-[#E8E5DE] border border-[#354251]'
+                }`}
+              >
+                Executed Fills
+              </button>
+              <button
+                onClick={() => setStatusFilter('WIN')}
+                className={`px-2.5 py-1 rounded cursor-pointer transition-colors ${
+                  statusFilter === 'WIN'
+                    ? 'bg-[#72A98B] text-[#17212D] font-bold'
+                    : 'bg-[#222B36] text-[#72A98B] hover:text-[#E8E5DE] border border-[#354251]'
+                }`}
+              >
+                Won
+              </button>
+              <button
+                onClick={() => setStatusFilter('LOSS')}
+                className={`px-2.5 py-1 rounded cursor-pointer transition-colors ${
+                  statusFilter === 'LOSS'
+                    ? 'bg-[#B7797D] text-[#17212D] font-bold'
+                    : 'bg-[#222B36] text-[#B7797D] hover:text-[#E8E5DE] border border-[#354251]'
+                }`}
+              >
+                Lost
+              </button>
+
+              <select
+                value={pairFilter}
+                onChange={e => setPairFilter(e.target.value)}
+                className="bg-[#222B36] border border-[#354251] text-[#E8E5DE] rounded px-2 py-1 text-xs outline-none cursor-pointer"
+              >
+                <option value="ALL">All Pairs (20)</option>
+                {FOREX_PAIRS.map(p => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+      </nav>
+
+      {/* ------------------------------------------------------------- */}
+      {/* 4. LAYER CONTENT: TODAY vs YESTERDAY vs SESSIONS */}
+      {/* ------------------------------------------------------------- */}
+      <main className="max-w-7xl mx-auto px-4 lg:px-8 py-6 space-y-6">
+        {/* ========================================================= */}
+        {/* LAYER: ACTIVE & ADVANCE SIGNALS */}
+        {/* ========================================================= */}
+        {activeLayer === 'ACTIVE' && (
+          <div className="space-y-6 animate-in fade-in duration-150">
+            {/* Active Execution Scorecard */}
+            <div className="bg-[#222B36] border border-[#354251] rounded-2xl p-5 sm:p-6 shadow-xl space-y-4 font-mono">
+              <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#354251] gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[#72A98B] animate-ping" />
+                  <h2 className="text-base font-black text-[#E8E5DE] uppercase tracking-wider">
+                    ACTIVE IN-MARKET TRADES &amp; 3-MINUTE PRE-ENTRY ALERTS
+                  </h2>
+                </div>
+                <div className="text-xs text-[#72A98B] font-bold">
+                  24/5 Autonomous Execution Active • Live Multi-Feed Prices
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Active In-Market</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#72A98B] mt-1 tabular-nums">
+                    {activeTrades.length}
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Live ticking contracts</span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">3M Advance Alerts</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#C4A574] mt-1 tabular-nums">
+                    {signalAlerts.length}
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Pre-entry setup window</span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Settling / Verifying</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#6C9D91] mt-1 tabular-nums">
+                    {verifyingTrades.length}
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Awaiting broker close</span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Next 5M Entry</span>
+                  <div className="text-2xl sm:text-3xl font-black text-[#E8E5DE] mt-1 tabular-nums">
+                    {next5mCountdownStr}
+                  </div>
+                  <span className="text-[10px] text-[#72A98B] mt-1 block">Autonomous cycle online</span>
+                </div>
+              </div>
             </div>
 
-            {/* Timings */}
-            <div className="bg-neutral-950 p-3.5 rounded-xl border border-neutral-800 space-y-2">
-              <div className="text-neutral-400 text-[10px] uppercase font-bold tracking-wider">
-                5-MINUTE CANDLE SCHEDULE
-              </div>
-              <div className="flex justify-between text-neutral-200 text-xs">
-                <span>Entry Time (5M Open):</span>
-                <strong className="text-emerald-400">
-                  {selectedSignal.candleOpenTimeIst || formatIST(selectedSignal.actualEntryTimeUtc || selectedSignal.entryWindowStartUtc)}
-                </strong>
-              </div>
-              <div className="flex justify-between text-neutral-200 text-xs">
-                <span>Expiry Time ({selectedSignal.expiryMinutes || 5}M Close):</span>
-                <strong className="text-rose-400">
-                  {selectedSignal.candleCloseTimeIst || formatIST(selectedSignal.plannedExitTimeUtc)}
-                </strong>
-              </div>
-              <div className="flex justify-between text-neutral-400 text-xs">
-                <span>Duration:</span>
-                <span>{selectedSignal.expiryMinutes || 5} Minutes Dynamic Expiry</span>
-              </div>
-              {selectedSignal.actualEntryPrice && (
-                <div className="flex justify-between text-neutral-200 pt-1 border-t border-neutral-800">
-                  <span>Entry Open Fill Price:</span>
-                  <span className="text-white font-bold">{selectedSignal.actualEntryPrice}</span>
+            {/* Active Trades Table */}
+            <div className="space-y-4">
+              <h3 className="text-sm font-black font-mono text-[#E8E5DE] uppercase tracking-wider flex items-center gap-2">
+                <Activity className="w-4 h-4 text-[#72A98B]" />
+                <span>Active &amp; Advance Signal Ledger</span>
+              </h3>
+              {activeTrades.length === 0 && signalAlerts.length === 0 ? (
+                <div className="bg-[#222B36] border border-[#354251] rounded-2xl p-8 text-center text-xs font-mono text-[#AAB4BF] space-y-3">
+                  <Radio className="w-8 h-8 text-[#6C9D91] mx-auto animate-pulse" />
+                  <div className="text-base font-black text-[#E8E5DE]">
+                    NO ACTIVE CONTRACTS IN MARKET AT THIS SECOND
+                  </div>
+                  <p className="max-w-md mx-auto">
+                    The 24/5 scanner runs every 20 seconds. Next 5-minute candle opening in{' '}
+                    <strong className="text-[#E8E5DE]">{next5mCountdownStr}</strong>.
+                    Pre-entry alerts trigger strictly 3 minutes prior (:02, :07, :12...).
+                  </p>
                 </div>
-              )}
-              {selectedSignal.actualExitPrice && (
-                <div className="flex justify-between text-neutral-200">
-                  <span>Exit Close Price:</span>
-                  <span className="text-white font-bold">{selectedSignal.actualExitPrice}</span>
-                </div>
+              ) : (
+                renderTradeTable(applyFilters([...activeTrades, ...signalAlerts, ...verifyingTrades]))
               )}
             </div>
+          </div>
+        )}
 
-            {/* Strategy & Confluence Stacking */}
-            <div className="bg-neutral-950 p-3 rounded-xl border border-neutral-800 space-y-2">
-              <div className="flex justify-between items-center text-neutral-400 text-[10px] uppercase font-bold">
-                <span>Quantitative Strategy</span>
-                {selectedSignal.marketSessionName && (
-                  <span className="text-cyan-400 font-mono font-normal">
-                    {selectedSignal.marketSessionName}
+        {/* ========================================================= */}
+        {/* LAYER 1: ALL BOT TRADES (NEVER RESETS TO ZERO) */}
+        {/* ========================================================= */}
+        {activeLayer === 'ALL' && (
+          <div className="space-y-6 animate-in fade-in duration-150">
+            {/* All-Time Performance Scorecard */}
+            <div className="bg-[#222B36] border border-[#354251] rounded-2xl p-5 sm:p-6 shadow-xl space-y-4 font-mono">
+              <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#354251] gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[#6C9D91]" />
+                  <h2 className="text-base font-black text-[#E8E5DE] uppercase tracking-wider">
+                    ALL BOT TRADES &amp; PERSISTENT AUDIT SCORECARD
+                  </h2>
+                </div>
+                <div className="text-xs text-[#AAB4BF]">
+                  Complete Multi-Day Persistent Memory • Never Erased on Window Close
+                </div>
+              </div>
+
+              {/* 4-Stat High-Visibility Strip */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Overall Win Rate</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
+                    {allWinRate !== null ? `${allWinRate}%` : '—'}
+                  </div>
+                  <span className="text-[10px] text-[#72A98B] font-bold mt-1 block">
+                    {allWins} Wins · {allLosses} Losses
                   </span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Executed Fills</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
+                    {allExecutedTrades.length}
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                    {allSignals.length} total signals emitted
+                  </span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Net Stake Units</span>
+                  <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${allNetUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                    {allNetUnits >= 0 ? `+${allNetUnits}` : allNetUnits} U
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Audited contract payouts</span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Gross Displacement</span>
+                  <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${allGrossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                    {allGrossPips >= 0 ? `+${allGrossPips}` : allGrossPips} pips
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Cumulative price delta</span>
+                </div>
+              </div>
+            </div>
+
+            {/* All Trades Ledger */}
+            <div className="bg-[#222B36] border border-[#354251] rounded-2xl overflow-hidden shadow-xl">
+              <div className="p-4 bg-[#17212D] border-b border-[#354251] flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+                <div className="flex items-center gap-2">
+                  <strong className="text-sm font-black text-[#E8E5DE]">
+                    ALL SIGNALS &amp; TRADES AUDIT LEDGER ({displayedAllSignals.length})
+                  </strong>
+                  <span className="text-[#AAB4BF]">· Filter: {statusFilter}</span>
+                </div>
+                {allExecutedTrades.length > 0 && (
+                  <button
+                    onClick={() => setShowClearConfirm(true)}
+                    className="text-xs text-[#B7797D] hover:underline flex items-center gap-1 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Clear All History</span>
+                  </button>
                 )}
               </div>
-              <div className="flex justify-between items-center">
-                <span className="font-bold text-white">
-                  {selectedSignal.strategyName || '5-Min Momentum Breakout'}
-                </span>
-                <span className="text-emerald-400 font-bold">
-                  {selectedSignal.paperOnly ? 'PAPER ONLY · NOT APPROVED' : (selectedSignal.strategyEvidenceStatus === 'BACKTESTED' && typeof selectedSignal.strategyWinRate === 'number' ? `${selectedSignal.strategyWinRate.toFixed(1)}% Historical test WR · n=${selectedSignal.strategyHistoricalSampleSize || 0}` : 'Historical result not validated')}
-                </span>
+
+              {renderTradeTable(displayedAllSignals)}
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* LAYER 2: TODAY'S CALENDAR DAY TRADES */}
+        {/* ========================================================= */}
+        {activeLayer === 'TODAY' && (
+          <div className="space-y-6 animate-in fade-in duration-150">
+            {/* Today's Executive Scorecard */}
+            <div className="bg-[#222B36] border border-[#354251] rounded-2xl p-5 sm:p-6 shadow-xl space-y-4 font-mono">
+              <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#354251] gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[#72A98B]" />
+                  <h2 className="text-base font-black text-[#E8E5DE] uppercase">
+                    TODAY&apos;S SETTLED PERFORMANCE SCORECARD
+                  </h2>
+                  <span className="text-xs text-[#AAB4BF]">({formatIstDateHeading(nowDate)})</span>
+                </div>
+                <div className="text-xs text-[#6C9D91]">
+                  Strictly Today&apos;s Calendar Day • Indian Standard Time
+                </div>
               </div>
-              {(() => {
-                const forward = getForwardPerformance(selectedSignal.strategyId);
-                const scoredTrades = forward ? forward.wins + forward.losses : 0;
-                return (
-                  <div className="text-[11px] text-neutral-400 pt-2">
-                    Forward paper results: {forward && forward.trades > 0
-                      ? `${scoredTrades > 0 ? `${((forward.wins / scoredTrades) * 100).toFixed(1)}% across ${scoredTrades} scored outcomes` : 'No scored outcomes'} · ${forward.scratches} scratches · ${forward.netPips > 0 ? '+' : ''}${forward.netPips.toFixed(1)} modeled net pips`
-                      : 'No completed forward outcomes yet'}
+
+              {/* 4-Stat High-Visibility Strip */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Win Rate</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
+                    {todayWinRate !== null ? `${todayWinRate}%` : '—'}
                   </div>
-                );
-              })()}
-              {selectedSignal.confluenceStrategies && selectedSignal.confluenceStrategies.length > 0 && (
-                <div className="pt-2 border-t border-neutral-850 space-y-1">
-                  <span className="text-[10px] text-purple-400 font-bold uppercase block">
-                    Confluence Confirmations ({selectedSignal.confluenceScore || selectedSignal.confluenceStrategies.length} Stacked Models):
+                  <span className="text-[10px] text-[#72A98B] font-bold mt-1 block">
+                    {todayWins} Wins · {todayLosses} Losses
                   </span>
-                  <div className="flex flex-wrap gap-1">
-                    {selectedSignal.confluenceStrategies.map((c, i) => (
-                      <span key={i} className="px-2 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-[10px] text-neutral-200">
-                        ✓ {c}
-                      </span>
-                    ))}
-                  </div>
                 </div>
-              )}
 
-              {/* GENERATED STRATEGY CANDIDATE FORMULA */}
-              {selectedSignal.mathematicalFormula && (
-                <div className="pt-2 border-t border-neutral-850 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-cyan-400 uppercase font-black tracking-wider flex items-center gap-1.5">
-                      <Dna className="w-3.5 h-3.5" />
-                      GENERATED STRATEGY CANDIDATE FORMULA
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono text-[9px] font-bold">
-                      Evolved Strategy Candidates
-                    </span>
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Executed Fills</span>
+                  <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
+                    {todayExecutedTrades.length}
                   </div>
-                  <div className="p-2.5 rounded-lg bg-cyan-950/40 font-mono text-cyan-200 text-xs border border-cyan-800/70 overflow-x-auto">
-                    {selectedSignal.mathematicalFormula}
-                  </div>
-                  {selectedSignal.whyHumansMissThis && (
-                    <div className="text-[11px] text-neutral-300 leading-relaxed bg-neutral-900/80 p-2.5 rounded-lg border border-neutral-800">
-                      <strong className="text-amber-400 block mb-0.5">Candidate Design Rationale:</strong>
-                      {selectedSignal.whyHumansMissThis}
-                    </div>
-                  )}
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                    {todaySignals.length} signals generated today
+                  </span>
                 </div>
-              )}
 
-              {selectedSignal.lifecycleState === 'CLOSED' && (
-                <div className="pt-2 border-t border-neutral-850 flex justify-between items-center text-[10px] text-neutral-400">
-                  <span>Forward Signal Observation:</span>
-                  <span className="text-cyan-300 font-mono">exp_live_{selectedSignal.id}</span>
-                </div>
-              )}
-
-              {/* RULE-BASED LOSS DIAGNOSTICS */}
-              {selectedSignal.lossAutopsy && (
-                <div className="pt-2 border-t border-rose-900/60 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-rose-400 uppercase font-black tracking-wider flex items-center gap-1.5 font-mono">
-                      <Microscope className="w-3.5 h-3.5 text-rose-400" />
-                      RULE-BASED LOSS DIAGNOSTICS
-                    </span>
-                    <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 font-mono text-[9px] font-bold">
-                      {selectedSignal.lossAutopsy.rootCause.replace(/_/g, ' ')}
-                    </span>
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Net Stake Units</span>
+                  <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${todayNetUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                    {todayNetUnits >= 0 ? `+${todayNetUnits}` : todayNetUnits} U
                   </div>
-                  <div className="p-3 rounded-xl bg-rose-950/30 border border-rose-900/60 text-xs text-neutral-300 space-y-2">
-                    <div>
-                      <strong className="text-rose-300 block mb-1 text-[11px]">Rule-based Diagnostic:</strong>
-                      <p className="leading-relaxed text-[11px] text-neutral-300">
-                        {selectedSignal.lossAutopsy.rootCauseExplanation}
-                      </p>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">After broker payout ratio</span>
+                </div>
+
+                <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Today&apos;s Gross Pip Move</span>
+                  <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${todayGrossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                    {todayGrossPips >= 0 ? `+${todayGrossPips}` : todayGrossPips} pips
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">Displacement total</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Information Banner if Today has 0 settled trades */}
+            {todaySettledTrades.length === 0 && (
+              <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4 text-xs font-mono text-[#AAB4BF] flex flex-wrap items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <strong className="text-[#E8E5DE] block">
+                    Session In Progress ({formatIstDateHeading(nowDate)})
+                  </strong>
+                  <p>
+                    {todaySignals.length > 0
+                      ? `${todaySignals.length} signal(s) active/queued in market today. Completed binary contract outcomes will appear once 5M expiries settle.`
+                      : 'Today\'s 5M autonomous scanner is actively monitoring 20 Forex pairs.'}
+                  </p>
+                </div>
+                {latestCompletedSession && (
+                  <button
+                    onClick={() => setActiveLayer('YESTERDAY')}
+                    className="px-3.5 py-2 rounded-lg bg-[#6C9D91] hover:bg-[#72A98B] text-[#17212D] text-xs font-black whitespace-nowrap transition-colors cursor-pointer"
+                  >
+                    View Latest Completed Session ({latestCompletedSession.displayDate} · {latestCompletedSession.winRate}% WR) →
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Today's Completed Trades Table */}
+            <div className="bg-[#222B36] border border-[#354251] rounded-2xl overflow-hidden shadow-xl">
+              <div className="p-4 bg-[#17212D] border-b border-[#354251] flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+                <div className="flex items-center gap-2">
+                  <strong className="text-sm font-black text-[#E8E5DE]">
+                    TODAY&apos;S TRADES LEDGER ({displayedTodaySignals.length})
+                  </strong>
+                  <span className="text-[#AAB4BF]">· Never mixed with yesterday&apos;s trades</span>
+                </div>
+              </div>
+
+              {renderTradeTable(displayedTodaySignals)}
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* TAB 2: YESTERDAY'S AUDITED ARCHIVE LAYER */}
+        {/* ========================================================= */}
+        {activeLayer === 'YESTERDAY' && (
+          <div className="space-y-6 animate-in fade-in duration-150">
+            {/* Fallback Notice if Yesterday had 0 settled trades */}
+            {yesterdaySignals.length === 0 && latestCompletedSession && (
+              <div className="bg-[#222B36] border border-[#C4A574]/60 rounded-2xl p-4 sm:p-5 font-mono text-xs space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-[#C4A574] animate-pulse" />
+                  <span className="text-[#C4A574] font-black text-sm uppercase">
+                    CALENDAR YESTERDAY ({formatIstDateHeading(yesterdayDate)}): 0 SIGNALS LOGGED
+                  </span>
+                </div>
+                <p className="text-[#AAB4BF] leading-relaxed">
+                  Forex market was off-cycle or closed during yesterday&apos;s 24-hour calendar window.
+                  Displaying <strong className="text-[#E8E5DE]">Latest Audited Trading Session ({latestCompletedSession.displayDate})</strong> below so all verified trades and accuracy statistics are readily available.
+                </p>
+                <div className="flex flex-wrap items-center gap-3 pt-1">
+                  <span className="px-2.5 py-1 rounded bg-[#17212D] text-[#72A98B] border border-[#72A98B]/40 font-bold">
+                    {latestCompletedSession.displayDate} · {latestCompletedSession.settledTrades.length} Trades · {latestCompletedSession.winRate}% Win Rate · {latestCompletedSession.netUnits >= 0 ? `+${latestCompletedSession.netUnits}` : latestCompletedSession.netUnits} U
+                  </span>
+                  <button
+                    onClick={() => setActiveLayer('DAILY_SESSIONS')}
+                    className="text-xs text-[#6C9D91] hover:underline font-bold cursor-pointer"
+                  >
+                    View All {dailySessions.length} Daily Sessions →
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Yesterday / Latest Session Executive Scorecard */}
+            {(() => {
+              const displaySigs = yesterdaySignals.length > 0 ? displayedYesterdaySignals : (latestCompletedSession ? applyFilters(latestCompletedSession.signals) : []);
+              const sessionTitle = yesterdaySignals.length > 0 ? formatIstDateHeading(yesterdayDate) : (latestCompletedSession ? `${latestCompletedSession.displayDate} (Latest Session)` : 'Historical Session');
+              const winRate = yesterdaySignals.length > 0 ? yesterdayWinRate : (latestCompletedSession?.winRate ?? null);
+              const wins = yesterdaySignals.length > 0 ? yesterdayWins : (latestCompletedSession?.wins ?? 0);
+              const losses = yesterdaySignals.length > 0 ? yesterdayLosses : (latestCompletedSession?.losses ?? 0);
+              const execCount = yesterdaySignals.length > 0 ? yesterdayExecutedTrades.length : (latestCompletedSession?.executedTrades.length ?? 0);
+              const totalLogged = yesterdaySignals.length > 0 ? yesterdaySignals.length : (latestCompletedSession?.signals.length ?? 0);
+              const netUnits = yesterdaySignals.length > 0 ? yesterdayNetUnits : (latestCompletedSession?.netUnits ?? 0);
+              const grossPips = yesterdaySignals.length > 0 ? yesterdayGrossPips : (latestCompletedSession?.grossPips ?? 0);
+
+              return (
+                <div className="space-y-6">
+                  <div className="bg-[#222B36] border-2 border-[#C4A574]/60 rounded-2xl p-5 sm:p-6 shadow-xl space-y-4 font-mono">
+                    <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#354251] gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="w-2.5 h-2.5 rounded-full bg-[#C4A574]" />
+                        <h2 className="text-base font-black text-[#E8E5DE] uppercase">
+                          {yesterdaySignals.length > 0 ? 'YESTERDAY\'S AUDITED PERFORMANCE SCORECARD' : 'LATEST AUDITED SESSION SCORECARD'}
+                        </h2>
+                        <span className="text-xs text-[#C4A574] font-bold">({sessionTitle})</span>
+                      </div>
+                      <div className="text-xs text-[#AAB4BF]">
+                        Completely Isolated Historical Archive Layer
+                      </div>
                     </div>
 
-                    <div className="pt-1.5 border-t border-rose-900/40">
-                      <strong className="text-amber-400 block mb-1 text-[11px]">Algorithmic Lessons Learned:</strong>
-                      <ul className="list-disc list-inside space-y-1 text-[11px] text-neutral-300">
-                        {selectedSignal.lossAutopsy.lessonsLearned.map((l, i) => (
-                          <li key={i}>{l}</li>
-                        ))}
-                      </ul>
-                    </div>
+                    {/* 4-Stat High-Visibility Strip */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Audited Win Rate</span>
+                        <div className="text-3xl sm:text-4xl font-black text-[#C4A574] mt-1 tabular-nums">
+                          {winRate !== null ? `${winRate}%` : '—'}
+                        </div>
+                        <span className="text-[10px] text-[#72A98B] font-bold mt-1 block">
+                          {wins} Wins · {losses} Losses
+                        </span>
+                      </div>
 
-                    <div className="pt-1.5 border-t border-rose-900/40">
-                      <strong className="text-cyan-400 block mb-1 text-[11px]">Autonomously Evolved Antidote Strategy:</strong>
-                      <div className="p-2 rounded-lg bg-neutral-950 border border-cyan-800/60 font-mono text-[10px] text-cyan-300 space-y-0.5">
-                        <span className="font-bold text-white block">{selectedSignal.lossAutopsy.antidoteStrategyName}</span>
-                        <span>{selectedSignal.lossAutopsy.antidoteFormula}</span>
+                      <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Executed Trades</span>
+                        <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
+                          {execCount}
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                          {totalLogged} total signals logged
+                        </span>
+                      </div>
+
+                      <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Net Return Units</span>
+                        <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${netUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                          {netUnits >= 0 ? `+${netUnits}` : netUnits} U
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] mt-1 block">Audited contract payouts</span>
+                      </div>
+
+                      <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Gross Displacement</span>
+                        <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${grossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                          {grossPips >= 0 ? `+${grossPips}` : grossPips} pips
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] mt-1 block">Cumulative market move</span>
                       </div>
                     </div>
                   </div>
-                </div>
-              )}
-            </div>
 
-            {/* Audit History */}
-            <div className="space-y-1.5">
-              <div className="text-neutral-400 text-[10px] uppercase font-bold">Audit Log</div>
-              <div className="bg-neutral-950 rounded-xl p-3 border border-neutral-800 space-y-1.5 text-[11px] max-h-36 overflow-y-auto">
-                {selectedSignal.lifecycleHistory?.map((evt, idx) => (
-                  <div key={idx} className="border-b border-neutral-850 pb-1 last:border-0 last:pb-0">
-                    <div className="flex justify-between text-neutral-500 text-[10px]">
-                      <span>{evt.fromState} → {evt.toState}</span>
-                      <span>{formatIST(evt.timestamp)}</span>
+                  {/* Completed Trades Table */}
+                  <div className="bg-[#222B36] border border-[#354251] rounded-2xl overflow-hidden shadow-xl">
+                    <div className="p-4 bg-[#17212D] border-b border-[#354251] flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+                      <div className="flex items-center gap-2">
+                        <strong className="text-sm font-black text-[#E8E5DE]">
+                          {yesterdaySignals.length > 0 ? 'YESTERDAY\'S AUDITED TRADES LEDGER' : `LATEST AUDITED SESSION LEDGER (${sessionTitle})`} ({displaySigs.length})
+                        </strong>
+                        <span className="text-[#C4A574]">· 100% Real Audited Data</span>
+                      </div>
+                      <div className="text-xs text-[#AAB4BF]">
+                        Immutable Historical Ledger
+                      </div>
                     </div>
-                    <p className="text-neutral-300 text-[10px] mt-0.5">{evt.reason}</p>
+
+                    {renderTradeTable(displaySigs)}
                   </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* TAB: DAILY SESSIONS BREAKDOWN & MULTI-DAY EXPLORER */}
+        {/* ========================================================= */}
+        {activeLayer === 'DAILY_SESSIONS' && (
+          <div className="space-y-6 animate-in fade-in duration-150">
+            {/* Header & Day Selector Strip */}
+            <div className="bg-[#222B36] border border-[#354251] rounded-2xl p-5 sm:p-6 shadow-xl space-y-4 font-mono">
+              <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#354251] gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-[#72A98B]" />
+                  <h2 className="text-base font-black text-[#E8E5DE] uppercase tracking-wider">
+                    DAILY SESSIONS AUDIT MATRIX &amp; CALENDAR BREAKDOWN
+                  </h2>
+                </div>
+                <div className="text-xs text-[#72A98B] font-bold">
+                  {dailySessions.length} Recorded Calendar Sessions • 100% Real Audited Data (IST)
+                </div>
+              </div>
+
+              {/* Day Selector Buttons */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  onClick={() => setSelectedSessionDate('ALL')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    selectedSessionDate === 'ALL'
+                      ? 'bg-[#72A98B] text-[#17212D] shadow-sm'
+                      : 'bg-[#17212D] text-[#AAB4BF] hover:text-[#E8E5DE] border border-[#354251]'
+                  }`}
+                >
+                  All Days ({dailySessions.length})
+                </button>
+
+                {dailySessions.map(session => (
+                  <button
+                    key={session.dateKey}
+                    onClick={() => setSelectedSessionDate(session.dateKey)}
+                    className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                      selectedSessionDate === session.dateKey
+                        ? 'bg-[#6C9D91] text-[#17212D] shadow-sm'
+                        : 'bg-[#17212D] text-[#AAB4BF] hover:text-[#E8E5DE] border border-[#354251]'
+                    }`}
+                  >
+                    <span>{session.displayDate}</span>
+                    <span className="px-1.5 py-0.2 rounded text-[10px] bg-[#121820]/40 text-current">
+                      {session.signals.length} {session.winRate !== null ? `· ${session.winRate}%` : ''}
+                    </span>
+                  </button>
                 ))}
               </div>
             </div>
 
-            <button
-              onClick={() => setSelectedSignal(null)}
-              className="w-full py-2 bg-neutral-800 hover:bg-neutral-700 text-white font-bold rounded-xl transition-colors"
-            >
-              Close
-            </button>
+            {/* Selected Session (or Daily Summary Cards) */}
+            {selectedSessionDate === 'ALL' ? (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 font-mono">
+                {dailySessions.map(session => (
+                  <div
+                    key={`card_${session.dateKey}`}
+                    onClick={() => setSelectedSessionDate(session.dateKey)}
+                    className="bg-[#222B36] hover:bg-[#222B36]/90 border border-[#354251] hover:border-[#6C9D91] rounded-2xl p-5 space-y-4 shadow-lg cursor-pointer transition-all"
+                  >
+                    <div className="flex items-center justify-between pb-2 border-b border-[#354251]">
+                      <div>
+                        <div className="text-base font-black text-[#E8E5DE]">{session.displayDate}</div>
+                        <div className="text-[11px] text-[#AAB4BF]">{session.dayOfWeek}</div>
+                      </div>
+                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                        session.isToday
+                          ? 'bg-[#72A98B]/20 text-[#72A98B] border border-[#72A98B]/40'
+                          : session.isYesterday
+                          ? 'bg-[#C4A574]/20 text-[#C4A574] border border-[#C4A574]/40'
+                          : 'bg-[#354251]/40 text-[#AAB4BF]'
+                      }`}>
+                        {session.isToday ? 'TODAY' : session.isYesterday ? 'YESTERDAY' : 'AUDITED'}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 text-xs">
+                      <div className="bg-[#17212D] border border-[#354251] p-3 rounded-xl">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Win Rate</span>
+                        <div className="text-2xl font-black text-[#E8E5DE] mt-0.5">
+                          {session.winRate !== null ? `${session.winRate}%` : 'Active'}
+                        </div>
+                        <span className="text-[10px] text-[#72A98B] block mt-0.5">
+                          {session.wins}W · {session.losses}L
+                        </span>
+                      </div>
+
+                      <div className="bg-[#17212D] border border-[#354251] p-3 rounded-xl">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Net Units</span>
+                        <div className={`text-2xl font-black mt-0.5 ${session.netUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                          {session.netUnits >= 0 ? `+${session.netUnits}` : session.netUnits} U
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] block mt-0.5">
+                          {session.executedTrades.length} fills
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs text-[#6C9D91] pt-1">
+                      <span>{session.signals.length} Total Signals Emitted</span>
+                      <span className="font-bold">Inspect Day →</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              /* Specific Day Selected: Detailed Scorecard */
+              (() => {
+                const cur = dailySessions.find(d => d.dateKey === selectedSessionDate) || dailySessions[0];
+                if (!cur) return null;
+                const filteredSigs = applyFilters(cur.signals);
+
+                return (
+                  <div className="space-y-6">
+                    <div className="bg-[#222B36] border-2 border-[#6C9D91]/60 rounded-2xl p-5 sm:p-6 shadow-xl space-y-4 font-mono">
+                      <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#354251] gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2.5 h-2.5 rounded-full bg-[#6C9D91]" />
+                          <h2 className="text-base font-black text-[#E8E5DE] uppercase">
+                            SESSION AUDIT: {cur.displayDate} ({cur.dayOfWeek})
+                          </h2>
+                          <span className="text-xs text-[#6C9D91] font-bold">
+                            {cur.isToday ? 'TODAY' : cur.isYesterday ? 'YESTERDAY' : 'COMPLETED SESSION'}
+                          </span>
+                        </div>
+                        <button
+                          onClick={() => setSelectedSessionDate('ALL')}
+                          className="text-xs text-[#AAB4BF] hover:text-[#E8E5DE] underline cursor-pointer"
+                        >
+                          ← View All Days
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Day Win Rate</span>
+                          <div className="text-3xl sm:text-4xl font-black text-[#6C9D91] mt-1 tabular-nums">
+                            {cur.winRate !== null ? `${cur.winRate}%` : '—'}
+                          </div>
+                          <span className="text-[10px] text-[#72A98B] font-bold mt-1 block">
+                            {cur.wins} Wins · {cur.losses} Losses
+                          </span>
+                        </div>
+
+                        <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Executed Trades</span>
+                          <div className="text-3xl sm:text-4xl font-black text-[#E8E5DE] mt-1 tabular-nums">
+                            {cur.executedTrades.length}
+                          </div>
+                          <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                            {cur.signals.length} total signals
+                          </span>
+                        </div>
+
+                        <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Day Net Units</span>
+                          <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${cur.netUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                            {cur.netUnits >= 0 ? `+${cur.netUnits}` : cur.netUnits} U
+                          </div>
+                          <span className="text-[10px] text-[#AAB4BF] mt-1 block">Binary contract returns</span>
+                        </div>
+
+                        <div className="bg-[#17212D] border border-[#354251] rounded-xl p-4">
+                          <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Gross Displacement</span>
+                          <div className={`text-3xl sm:text-4xl font-black mt-1 tabular-nums ${cur.grossPips >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                            {cur.grossPips >= 0 ? `+${cur.grossPips}` : cur.grossPips} pips
+                          </div>
+                          <span className="text-[10px] text-[#AAB4BF] mt-1 block">Pips move</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-[#222B36] border border-[#354251] rounded-2xl overflow-hidden shadow-xl">
+                      <div className="p-4 bg-[#17212D] border-b border-[#354251] flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+                        <strong className="text-sm font-black text-[#E8E5DE]">
+                          {cur.displayDate} AUDITED TRADES LEDGER ({filteredSigs.length})
+                        </strong>
+                        <span className="text-[#AAB4BF]">Indian Standard Time (IST)</span>
+                      </div>
+                      {renderTradeTable(filteredSigs)}
+                    </div>
+                  </div>
+                );
+              })()
+            )}
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* TAB 3: SESSION ACCURACY MATRIX */}
+        {/* ========================================================= */}
+        {activeLayer === 'SESSIONS' && (
+          <div className="space-y-6 animate-in fade-in duration-150">
+            <div className="bg-[#222B36] border border-[#354251] rounded-2xl p-5 space-y-2 font-mono text-xs">
+              <h2 className="text-base font-black text-[#E8E5DE] uppercase">
+                GLOBAL MARKET SESSIONS MATRIX (IST SYNCHRONIZED)
+              </h2>
+              <p className="text-[#AAB4BF]">
+                Live accuracy breakdown by geographic market session window.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 font-mono text-xs">
+              {[
+                {
+                  id: 'ASIA',
+                  name: 'Tokyo / Asian Session',
+                  ist: '05:30 AM – 12:30 PM IST',
+                  desc: 'Consolidation, JPY/AUD flows',
+                },
+                {
+                  id: 'LONDON',
+                  name: 'London / European Session',
+                  ist: '12:30 PM – 05:30 PM IST',
+                  desc: 'High institutional volume',
+                },
+                {
+                  id: 'OVERLAP',
+                  name: 'London / NY Overlap',
+                  ist: '05:30 PM – 09:30 PM IST',
+                  desc: 'Peak global liquidity',
+                },
+                {
+                  id: 'NEW_YORK',
+                  name: 'New York Session',
+                  ist: '09:30 PM – 02:30 AM IST',
+                  desc: 'USD momentum announcements',
+                },
+              ].map((sess, sIdx) => {
+                const sessionTrades = signals.filter(s => {
+                  if (s.lifecycleState !== 'CLOSED') return false;
+                  const t = s.actualEntryTimeUtc || s.predictionTimeUtc;
+                  return s.marketSession ? s.marketSession === sess.id : getSessionFromTimestamp(t).id === sess.id;
+                });
+                const wins = sessionTrades.filter(s => s.outcomeResult === 'WIN').length;
+                const losses = sessionTrades.filter(s => s.outcomeResult === 'LOSS').length;
+                const scored = wins + losses;
+                const wr = scored > 0 ? Number(((wins / scored) * 100).toFixed(1)) : null;
+
+                return (
+                  <div
+                    key={`terminal_sess_${sess.id}_${sIdx}`}
+                    className="bg-[#222B36] border border-[#354251] rounded-xl p-5 space-y-3 flex flex-col justify-between"
+                  >
+                    <div>
+                      <span className="text-[10px] text-[#6C9D91] font-bold uppercase">{sess.id}</span>
+                      <h3 className="text-base font-bold text-[#E8E5DE] mt-0.5">{sess.name}</h3>
+                      <div className="text-[11px] text-[#AAB4BF] mt-0.5">{sess.ist}</div>
+                    </div>
+
+                    <div className="p-3.5 rounded-lg bg-[#17212D] border border-[#354251]">
+                      <div className="text-2xl font-black text-[#E8E5DE] tabular-nums">
+                        {wr !== null ? `${wr}% Win Rate` : '—'}
+                      </div>
+                      <div className="text-[10px] text-[#72A98B] mt-0.5 font-semibold">
+                        {scored > 0 ? `${wins} Wins / ${losses} Losses` : 'No settled trades yet'}
+                      </div>
+                    </div>
+
+                    <div className="text-[10px] text-[#AAB4BF]">{sess.desc}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* ------------------------------------------------------------- */}
+      {/* 5. AUDIT INSPECTOR MODAL */}
+      {/* ------------------------------------------------------------- */}
+      {selectedSignal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-[#222B36] border border-[#354251] rounded-2xl w-full max-w-2xl overflow-hidden shadow-2xl text-xs font-sans">
+            <div className="p-5 bg-[#17212D] border-b border-[#354251] flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <span className="text-2xl font-black font-mono text-[#E8E5DE]">{selectedSignal.symbol}</span>
+                <span
+                  className={`px-2.5 py-1 rounded text-xs font-black font-mono ${
+                    selectedSignal.direction === 'BUY' ? 'bg-[#72A98B] text-[#17212D]' : 'bg-[#B7797D] text-[#17212D]'
+                  }`}
+                >
+                  {selectedSignal.direction}
+                </span>
+                <span className="text-xs font-mono text-[#AAB4BF]">ID: {selectedSignal.id}</span>
+              </div>
+              <button
+                onClick={() => setSelectedSignal(null)}
+                className="p-1.5 rounded-lg bg-[#222B36] text-[#AAB4BF] hover:text-[#E8E5DE] border border-[#354251] cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4 font-mono text-xs max-h-[75vh] overflow-y-auto">
+              {(() => {
+                const timings = getSignalTimings(selectedSignal);
+                return (
+                  <div className="p-4 rounded-xl bg-[#17212D] border border-[#354251] space-y-2">
+                    <div className="text-[10px] text-[#6C9D91] uppercase font-bold tracking-wider">
+                      Indian Standard Time (IST) Execution Trail
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 text-xs">
+                      <div>Alert Generated: <strong className="text-[#E8E5DE]">{timings.alertTimeIst}</strong></div>
+                      <div>Entry Fill: <strong className="text-[#E8E5DE]">{timings.entryTimeIst}</strong></div>
+                      <div>Target Expiry: <strong className="text-[#E8E5DE]">{timings.expiryTimeIst}</strong></div>
+                      <div>Duration: <strong className="text-[#E8E5DE]">{timings.durationMinutes} Minutes</strong></div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-center">
+                <div className="p-3 rounded-xl bg-[#17212D] border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block">Entry Price</span>
+                  <span className="text-sm font-bold text-[#E8E5DE]">
+                    {selectedSignal.actualEntryPrice?.toFixed(5) || selectedSignal.triggerPrice?.toFixed(5)}
+                  </span>
+                </div>
+                <div className="p-3 rounded-xl bg-[#17212D] border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block">Exit Price</span>
+                  <span className="text-sm font-bold text-[#E8E5DE]">
+                    {selectedSignal.actualExitPrice?.toFixed(5) || 'Pending'}
+                  </span>
+                </div>
+                <div className="p-3 rounded-xl bg-[#17212D] border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block">Payout Ratio</span>
+                  <span className="text-sm font-bold text-[#E8E5DE]">{selectedSignal.payoutPct || 85}%</span>
+                </div>
+                <div className="p-3 rounded-xl bg-[#17212D] border border-[#354251]">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block">Result</span>
+                  <span className="text-sm font-bold text-[#72A98B]">
+                    {selectedSignal.outcomeResult || selectedSignal.lifecycleState}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-4 rounded-xl bg-[#17212D] border border-[#354251] space-y-1">
+                <div className="text-[10px] text-[#AAB4BF] uppercase font-bold">Strategy Logic</div>
+                <div className="text-sm font-bold text-[#E8E5DE]">
+                  {selectedSignal.strategyName || selectedSignal.ruleFamily}
+                </div>
+                <p className="text-[#AAB4BF] text-[11px] pt-1">{selectedSignal.entryCondition}</p>
+              </div>
+
+              {selectedSignal.lossAutopsy && (
+                <div className="p-4 rounded-xl bg-[#B7797D]/10 border border-[#B7797D]/40 space-y-1.5">
+                  <div className="flex items-center gap-2 text-[#B7797D] font-bold text-xs uppercase">
+                    <Microscope className="w-4 h-4 text-[#B7797D]" />
+                    <span>Forensic Loss Autopsy</span>
+                  </div>
+                  <div className="text-xs text-[#E8E5DE]">
+                    <strong className="text-[#B7797D]">Root Cause:</strong> {selectedSignal.lossAutopsy.rootCause}
+                  </div>
+                  <p className="text-[#E8E5DE]/85 text-[11px] leading-relaxed">
+                    {selectedSignal.lossAutopsy.rootCauseExplanation}
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 bg-[#17212D] border-t border-[#354251] flex justify-end">
+              <button
+                onClick={() => setSelectedSignal(null)}
+                className="px-4 py-2 bg-[#222B36] hover:bg-[#354251] text-[#E8E5DE] border border-[#354251] rounded-lg text-xs font-bold cursor-pointer"
+              >
+                Close Audit Inspector
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      {/* MODAL 4: CLEAR HISTORY CONFIRMATION */}
+      {/* Clear Confirmation Modal */}
       {showClearConfirm && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-neutral-700 rounded-2xl max-w-sm w-full p-5 text-neutral-200 space-y-4 shadow-2xl">
-            <div className="flex items-center gap-2 text-rose-400">
-              <Trash2 className="w-5 h-5" />
-              <h3 className="text-base font-bold text-white">Clear Trade History?</h3>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-[#222B36] border border-[#B7797D]/50 rounded-2xl w-full max-w-md p-6 space-y-4 shadow-2xl text-xs font-sans">
+            <div className="flex items-center gap-3 text-[#B7797D]">
+              <div className="p-2 rounded-lg bg-[#17212D] border border-[#B7797D]/40">
+                <Trash2 className="w-5 h-5 text-[#B7797D]" />
+              </div>
+              <h3 className="text-base font-bold text-[#E8E5DE]">Reset Today&apos;s Trade Counter?</h3>
             </div>
-            <p className="text-xs text-neutral-400 leading-relaxed">
-              This will remove all {historySignals.length} completed trade records and reset win/loss statistics. Active trades in progress will not be affected.
+            <p className="text-[#AAB4BF] leading-relaxed text-xs">
+              This resets today&apos;s trade list to 0. Yesterday&apos;s archive layer and historical statistics remain preserved.
             </p>
-            <div className="flex items-center justify-end gap-2 pt-2">
+            <div className="flex items-center justify-end gap-3 pt-2">
               <button
                 onClick={() => setShowClearConfirm(false)}
-                className="px-3 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs font-semibold"
+                className="px-4 py-2 rounded-lg bg-[#17212D] hover:bg-[#354251] border border-[#354251] text-[#AAB4BF] hover:text-[#E8E5DE] font-semibold cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 onClick={handleClearHistory}
                 disabled={isClearingHistory}
-                className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold transition-colors disabled:opacity-50"
+                className="px-4 py-2 rounded-lg bg-[#B7797D] hover:bg-[#B7797D]/80 text-[#17212D] font-bold cursor-pointer"
               >
-                {isClearingHistory ? 'Clearing...' : 'Yes, Clear History'}
+                {isClearingHistory ? 'Resetting...' : 'Confirm Reset'}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* MODAL 5: MARKET SESSIONS ACCURACY MATRIX */}
-      {showSessionsModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-neutral-700 rounded-2xl max-w-2xl w-full p-5 sm:p-6 text-neutral-200 space-y-4 max-h-[90vh] overflow-y-auto shadow-2xl">
-            <div className="flex justify-between items-center pb-3 border-b border-neutral-800">
-              <div className="flex items-center gap-2">
-                <Globe className="w-6 h-6 text-cyan-400" />
-                <div>
-                  <h3 className="text-lg font-bold text-white">Forward Market Session Outcomes</h3>
-                  <p className="text-xs text-neutral-400">Session grouping of completed forward paper outcomes</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowSessionsModal(false)}
-                className="text-neutral-400 hover:text-white p-1 rounded-lg"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <p className="text-xs text-neutral-300 leading-relaxed">
-              Closed paper outcomes are grouped by the session recorded at entry. This is a descriptive breakdown; it does not prove that a session causes better performance or that the model optimizes separately by session:
-            </p>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {sessionData.length === 0 ? (
-                <div className="col-span-2 p-5 rounded-xl border border-neutral-800 bg-neutral-950 text-sm text-neutral-400">
-                  No completed forward outcomes are available yet. Session win rates appear only after a paper signal reaches its modeled expiry.
-                </div>
-              ) : sessionData.map(sess => (
-                <div
-                  key={sess.id}
-                  className={`p-3.5 rounded-xl border flex flex-col justify-between space-y-2.5 ${
-                    sess.isActive
-                      ? 'bg-neutral-950 border-emerald-500 ring-1 ring-emerald-500/40 shadow-lg'
-                      : 'bg-neutral-950/60 border-neutral-800'
-                  }`}
-                >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-bold text-white text-sm">{sess.name}</span>
-                      </div>
-                      <span className="text-[10px] text-neutral-400 font-mono block mt-0.5">
-                        {sess.istRange} ({sess.utcRange})
-                      </span>
-                    </div>
-                    {sess.isActive ? (
-                      <span className="px-2 py-0.5 rounded-full bg-emerald-500 text-neutral-950 font-black text-[10px] uppercase flex items-center gap-1 shadow-xs">
-                        <span className="w-1.5 h-1.5 rounded-full bg-neutral-950 animate-ping" />
-                        Active Now
-                      </span>
-                    ) : (
-                      <span className="text-[10px] text-neutral-500 font-mono">Closed</span>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2 pt-2 border-t border-neutral-800/80 text-xs font-mono">
-                    <div className="bg-neutral-900/80 p-2 rounded-lg border border-neutral-800">
-                      <span className="text-[10px] text-neutral-400 block uppercase">Win Rate</span>
-                      <span className="text-base font-extrabold text-emerald-400">{sess.hasMeasuredData ? `${sess.winRate}%` : "No data"}</span>
-                    </div>
-                    <div className="bg-neutral-900/80 p-2 rounded-lg border border-neutral-800">
-                      <span className="text-[10px] text-neutral-400 block uppercase">Observed Paper Net Pips</span>
-                      <span className={`text-sm font-bold ${sess.netPips >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {sess.netPips > 0 ? '+' : ''}{sess.netPips} Pips
-                      </span>
-                      <span className="text-[9px] text-neutral-500 block">({sess.wins}W / {sess.losses}L / {sess.scratches} scratches · {sess.totalTrades} total)</span>
-                    </div>
-                  </div>
-
-                  <div className="text-[11px] bg-neutral-900/60 p-2 rounded-lg border border-neutral-800/60">
-                    <span className="text-neutral-400 block text-[10px] uppercase font-bold text-amber-400/90">
-                      Top Strategy:
-                    </span>
-                    <span className="text-neutral-200 font-medium">{sess.bestStrategy}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <button
-              onClick={() => setShowSessionsModal(false)}
-              className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-700 font-semibold text-white rounded-xl text-xs transition-colors"
-            >
-              Close
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL 6: STRATEGY CANDIDATE RESEARCH */}
-      {showGenesisModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-neutral-900 border border-neutral-700 rounded-2xl max-w-3xl w-full p-5 sm:p-6 text-neutral-200 space-y-4 max-h-[90vh] overflow-y-auto shadow-2xl">
-            <div className="flex justify-between items-center pb-3 border-b border-neutral-800">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 rounded-xl bg-cyan-950/80 border border-cyan-700/80 text-cyan-400">
-                  <Dna className="w-6 h-6 animate-pulse" />
-                </div>
-                <div>
-                  <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                    <span>Strategy Candidate Research</span>
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono">
-                      Candidate formula search
-                    </span>
-                  </h3>
-                  <p className="text-xs text-neutral-400">
-                    Randomized formula candidates with historical validation and forward paper-trading evidence
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowGenesisModal(false)}
-                className="text-neutral-400 hover:text-white p-1 rounded-lg"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* GENESIS CONTROLS & STATS BAR */}
-            <div className="bg-neutral-950 p-4 rounded-xl border border-cyan-900/60 space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="space-y-0.5">
-                  <span className="text-xs font-bold text-white uppercase tracking-wider block">
-                    Candidate Formula Generator
-                  </span>
-                  <p className="text-[11px] text-neutral-400">
-                    Generates candidate formulas. Validation and promotion require out-of-sample evidence from uploaded historical candles.
-                  </p>
-                </div>
-                <button
-                  onClick={handleEvolveStrategy}
-                  disabled={isEvolvingStrategy}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-linear-to-r from-cyan-600 to-emerald-600 hover:from-cyan-500 hover:to-emerald-500 text-neutral-950 font-black text-xs transition-all shadow-lg shadow-cyan-950/50 disabled:opacity-50"
-                >
-                  <Sparkles className={`w-4 h-4 ${isEvolvingStrategy ? 'animate-spin' : ''}`} />
-                  <span>{isEvolvingStrategy ? 'Evolving Next Generation...' : '🧬 Evolve New Strategy Now'}</span>
-                </button>
-              </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-2 border-t border-neutral-850 text-xs font-mono">
-                <div className="bg-neutral-900/80 p-2 rounded-lg border border-neutral-800">
-                  <span className="text-[10px] text-neutral-400 block uppercase">Forward Approved</span>
-                  <span className="text-sm font-extrabold text-cyan-400">
-                    {synthesizedStrategies.filter(s => s.status === 'PROMOTED_ACTIVE').length} Strategies
-                  </span>
-                </div>
-                <div className="bg-neutral-900/80 p-2 rounded-lg border border-neutral-800">
-                  <span className="text-[10px] text-neutral-400 block uppercase">Generation</span>
-                  <span className="text-sm font-extrabold text-white">
-                    {synthesizedStrategies[0]?.generation ? `Gen-${synthesizedStrategies[0].generation}+` : '—'}
-                  </span>
-                </div>
-                <div className="bg-neutral-900/80 p-2 rounded-lg border border-neutral-800">
-                  <span className="text-[10px] text-neutral-400 block uppercase">Backtested Candidates</span>
-                  <span className="text-sm font-extrabold text-emerald-400">{validatedGeneCount}</span>
-                </div>
-                <div className="bg-neutral-900/80 p-2 rounded-lg border border-neutral-800">
-                  <span className="text-[10px] text-neutral-400 block uppercase">Paper Trading</span>
-                  <span className="text-sm font-extrabold text-amber-300">{paperTradingGeneCount} Candidates</span>
-                </div>
-                <div className="bg-neutral-900/80 p-2 rounded-lg border border-neutral-800">
-                  <span className="text-[10px] text-neutral-400 block uppercase">Operators</span>
-                  <span className="text-sm font-extrabold text-purple-400">
-                    Non-Linear (4)
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-neutral-950 border border-neutral-800 rounded-xl p-4 space-y-3">
-              <div>
-                <h4 className="text-sm font-bold text-white">Import externally sourced historical candles</h4>
-                <p className="text-[11px] text-neutral-400 mt-1">Upload 1-minute CSV or JSON candles. Validation requires at least 10,000 structurally valid M1 rows. Synthetic fallback candles are rejected. The app checks OHLC and timestamps but cannot independently authenticate an uploaded file's provider or contents; import only genuine broker/provider exports.</p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <select
-                  value={historyImportPair}
-                  onChange={e => setHistoryImportPair(e.target.value)}
-                  className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-xs text-white"
-                >
-                  {FOREX_PAIRS.map(pair => <option key={pair} value={pair}>{pair}</option>)}
-                </select>
-                <label className="px-3 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-xs text-white cursor-pointer">
-                  {isImportingHistory ? 'Importing…' : 'Choose CSV / JSON'}
-                  <input type="file" accept=".csv,.json,application/json,text/csv" className="hidden" disabled={isImportingHistory} onChange={handleImportHistoricalFile} />
-                </label>
-              </div>
-              {historyImportMessage && <p className="text-[11px] text-cyan-200 break-words">{historyImportMessage}</p>}
-            </div>
-
-            {/* CANDIDATE VALIDATION POLICY */}
-            <div className="p-3.5 rounded-xl bg-cyan-950/20 border border-cyan-800/40 text-xs text-neutral-300 space-y-1.5 leading-relaxed">
-              <strong className="text-cyan-300 font-bold flex items-center gap-1.5">
-                <Cpu className="w-4 h-4 text-cyan-400" />
-                How candidates become forward-approved:
-              </strong>
-              <p>
-                The generator samples four executable operator families and stores the exact coefficients used by the live evaluator. A generated equation is only a candidate: it starts unvalidated, must pass a chronological historical test using the scheduled entry/expiry model, and then must accumulate at least 200 scored forward paper outcomes before it can be marked forward-approved.
-              </p>
-            </div>
-
-            {/* LIST OF SYNTHESIZED GENETIC STRATEGIES */}
-            <div className="space-y-3">
-              <div className="flex items-center justify-between text-xs font-mono text-neutral-400">
-                <span className="uppercase font-bold tracking-wider">
-                  Strategy Candidate Pool ({synthesizedStrategies.length})
-                </span>
-                <span className="text-[11px] text-neutral-400">Promotion requires untouched-test evidence</span>
-              </div>
-
-              {synthesizedStrategies.map((gene, idx) => {
-                const isPromoted = gene.status === 'PROMOTED_ACTIVE';
-                const isPaperTrading = gene.status === 'PAPER_TRADING';
-                return (
-                  <div
-                    key={gene.id || idx}
-                    className={`p-4 rounded-xl border space-y-3 transition-all ${
-                      isPromoted
-                        ? 'bg-neutral-950 border-cyan-700/80 shadow-md ring-1 ring-cyan-500/20'
-                        : 'bg-neutral-950/70 border-neutral-800'
-                    }`}
-                  >
-                    {/* Header */}
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div className="space-y-0.5">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="px-2 py-0.5 rounded bg-cyan-950 border border-cyan-600/80 font-mono text-xs font-black text-cyan-300">
-                            GEN-{gene.generation}
-                          </span>
-                          <span className="font-bold text-white text-sm">{gene.name}</span>
-                        </div>
-                        <span className="text-[11px] text-neutral-400 font-mono block">
-                          Optimal Horizon: <strong className="text-amber-300">{gene.optimalHorizonMinutes} Min Dynamic Expiry</strong> · Session: <strong className="text-cyan-300">{gene.sessionAffinity}</strong>
-                        </span>
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        {isPromoted ? (
-                          <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-mono font-bold">
-                            FORWARD APPROVED
-                          </span>
-                        ) : isPaperTrading ? (
-                          <span className="px-2 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800 text-xs font-mono font-bold">
-                            PAPER TRADING
-                          </span>
-                        ) : gene.status === 'REJECTED' ? (
-                          <span className="px-2 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-800 text-xs font-mono">
-                            REJECTED
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.5 rounded bg-neutral-800 text-neutral-400 text-xs font-mono">
-                            UNVALIDATED / RESEARCH
-                          </span>
-                        )}
-                        <span className="px-2.5 py-0.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-800/80 text-xs font-mono font-black">
-                          {gene.backtestMetrics ? `${(gene.backtestMetrics.testWinRate * 100).toFixed(1)}% Test WR · scored n=${gene.backtestMetrics.testScoredSampleSize}` : 'UNVALIDATED'}
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* Mathematical Formula Box */}
-                    <div className="p-3 rounded-lg bg-neutral-900 border border-cyan-900/60 font-mono text-cyan-200 text-xs space-y-1">
-                      <div className="flex items-center justify-between text-[10px] text-neutral-400 uppercase tracking-wider pb-1 border-b border-neutral-800">
-                        <span className="text-cyan-400 font-bold">Mathematical Equation:</span>
-                        <span className="px-1.5 py-0.2 rounded bg-purple-900/40 text-purple-300 text-[9px]">
-                          Operator: {gene.nonLinearOperator}
-                        </span>
-                      </div>
-                      <div className="text-sm font-bold text-cyan-300 pt-1 overflow-x-auto">
-                        {gene.mathematicalFormula}
-                      </div>
-                    </div>
-
-                    {gene.backtestMetrics && (
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px] font-mono bg-neutral-900/60 border border-neutral-800 rounded-lg p-3">
-                        <div><span className="text-neutral-500 block">Train · scored n={gene.backtestMetrics.trainScoredSampleSize} / total n={gene.backtestMetrics.trainSampleSize}</span><strong className="text-neutral-200">{(gene.backtestMetrics.trainWinRate * 100).toFixed(1)}%</strong></div>
-                        <div><span className="text-neutral-500 block">Validation · scored n={gene.backtestMetrics.validationScoredSampleSize} / total n={gene.backtestMetrics.validationSampleSize}</span><strong className="text-neutral-200">{(gene.backtestMetrics.validationWinRate * 100).toFixed(1)}%</strong></div>
-                        <div><span className="text-neutral-500 block">Untouched test · scored n={gene.backtestMetrics.testScoredSampleSize} / total n={gene.backtestMetrics.testSampleSize}</span><strong className="text-emerald-300">{(gene.backtestMetrics.testWinRate * 100).toFixed(1)}%</strong></div>
-                        <div><span className="text-neutral-500 block">EV / Profit factor</span><strong className="text-neutral-200">{gene.backtestMetrics.expectedValueUnits.toFixed(4)} stake units/trade · {gene.backtestMetrics.profitFactor.toFixed(2)}</strong></div>
-                        <div className="col-span-2 sm:col-span-4 text-neutral-500">95% Wilson interval for net-positive WR: {(gene.backtestMetrics.confidenceInterval95[0] * 100).toFixed(1)}%–{(gene.backtestMetrics.confidenceInterval95[1] * 100).toFixed(1)}%</div>
-                      </div>
-                    )}
-                    {gene.forwardPerformance && (
-                      <div className="text-[11px] font-mono text-neutral-300 bg-neutral-900/60 border border-neutral-800 rounded-lg p-3">
-                        Forward paper results: {gene.forwardPerformance.wins}W / {gene.forwardPerformance.losses}L / {gene.forwardPerformance.scratches} scratches · {gene.forwardPerformance.trades} completed trades · {gene.forwardPerformance.netPips > 0 ? '+' : ''}{gene.forwardPerformance.netPips.toFixed(1)} net pips
-                      </div>
-                    )}
-                    {gene.accuracyStatus !== 'BACKTESTED' && (
-                      gene.operatorParameters ? (
-                        <button
-                          onClick={() => handleValidateGene(gene.id, gene.symbol)}
-                          disabled={validatingGeneId === gene.id}
-                          className="px-3 py-2 rounded-lg bg-cyan-900/60 border border-cyan-700 text-cyan-200 text-[11px] font-semibold disabled:opacity-50"
-                        >
-                          {validatingGeneId === gene.id ? 'Validating against imported history…' : `Validate against ${gene.symbol || historyImportPair} history`}
-                        </button>
-                      ) : (
-                        <span className="text-[10px] text-neutral-500">Legacy candidate has no stored executable coefficients. Generate a new candidate to validate it.</span>
-                      )
-                    )}
-
-                    {/* Parents & Lineage */}
-                    <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
-                      <span className="text-neutral-400 uppercase font-bold text-[10px]">Genetic Parents:</span>
-                      {gene.parents.map((p, pIdx) => (
-                        <span
-                          key={pIdx}
-                          className="px-2 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-300 text-[10px]"
-                        >
-                          {pIdx > 0 ? '⨉ ' : ''}{p}
-                        </span>
-                      ))}
-                    </div>
-
-                    {/* Why Humans Miss This & Hypothesis */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
-                      <div className="p-2.5 rounded-lg bg-neutral-900/70 border border-neutral-800 space-y-1">
-                        <span className="text-[10px] uppercase font-bold text-amber-400 block">
-                          Why Humans Miss This:
-                        </span>
-                        <p className="text-neutral-300 text-[11px] leading-relaxed">
-                          {gene.whyHumansMissThis}
-                        </p>
-                      </div>
-                      <div className="p-2.5 rounded-lg bg-neutral-900/70 border border-neutral-800 space-y-1">
-                        <span className="text-[10px] uppercase font-bold text-cyan-400 block">
-                          Scientific Hypothesis:
-                        </span>
-                        <p className="text-neutral-300 text-[11px] leading-relaxed">
-                          {gene.scientificHypothesis}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <button
-              onClick={() => setShowGenesisModal(false)}
-              className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-700 font-semibold text-white rounded-xl text-xs transition-colors"
-            >
-              Close
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* AGI Closed-Loop Self-Learning Telemetry Modal */}
-      <AgiSelfLearningModal
-        isOpen={showAgiModal}
-        onClose={() => setShowAgiModal(false)}
-      />
+      {/* AGI Self-Learning Modal */}
+      <AgiSelfLearningModal isOpen={showAgiModal} onClose={() => setShowAgiModal(false)} />
     </div>
   );
 };

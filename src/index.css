@@ -1,39 +1,67 @@
 @import "tailwindcss";
 
-@layer base {
-  :root {
-    --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
-  }
+@theme {
+  --color-sf-navy: #17212D;
+  --color-sf-graphite: #222B36;
+  --color-sf-slate: #354251;
+  --color-sf-ivory: #E8E5DE;
+  --color-sf-silver: #AAB4BF;
 
-  body {
-    font-family: var(--font-sans);
-    background-color: #0b0f17;
-    color: #e2e8f0;
-    overflow-x: hidden;
-  }
-
-  /* Universal Tabular Figures for high-density financial metrics */
-  .tabular-nums {
-    font-variant-numeric: tabular-nums;
-  }
+  --color-sf-teal: #6C9D91;
+  --color-sf-champagne: #C4A574;
+  --color-sf-emerald: #72A98B;
+  --color-sf-crimson: #B7797D;
+  --color-sf-amber: #C5A36A;
 }
 
-/* Sleek quantitative scrollbars */
+:root {
+  --sf-navy: #17212D;
+  --sf-graphite: #222B36;
+  --sf-slate: #354251;
+  --sf-ivory: #E8E5DE;
+  --sf-silver: #AAB4BF;
+
+  --sf-teal: #6C9D91;
+  --sf-champagne: #C4A574;
+  --sf-emerald: #72A98B;
+  --sf-crimson: #B7797D;
+  --sf-amber: #C5A36A;
+
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #17212D;
+  color: #E8E5DE;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Universal Tabular Figures for high-density financial metrics */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Institutional quiet scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #0f172a;
+  background: #17212D;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1e293b;
-  border-radius: 3px;
+  background: #354251;
+  border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+  background: #4a5c6f;
 }
