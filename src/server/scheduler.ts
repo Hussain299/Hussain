@@ -24,8 +24,23 @@ import { behaviouralEngine } from './behaviouralEngine.js';
 import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
 
+const FIVE_MINUTE_MS = 5 * 60 * 1000;
+
+/**
+ * Whether a pulse request arrived inside the strict 3-minute advance discovery
+ * window (210–145 seconds before the next 5-minute candle open).
+ */
+export function isWithinStrictSignalDiscoveryWindow(timestampMs: number): boolean {
+  if (!Number.isFinite(timestampMs)) return false;
+  const next5mOpenMs = (Math.floor(timestampMs / FIVE_MINUTE_MS) + 1) * FIVE_MINUTE_MS;
+  const msUntilNextOpen = next5mOpenMs - timestampMs;
+  return msUntilNextOpen <= 210_000 && msUntilNextOpen >= 145_000;
+}
+
 export class AutonomousScheduler {
   private isRunningCycle = false;
+  // Preserve exact/cron scan requests when a slower sensing cycle currently owns the scheduler.
+  private pendingSignalScan = false;
   private autopilotTimer: NodeJS.Timeout | null = null;
   private advanceTimer: NodeJS.Timeout | null = null;
   private autopilotIntervalMs = 25 * 1000; // Poll configured pairs every 25 seconds (plus exact 3M advance timer)
@@ -98,7 +113,10 @@ export class AutonomousScheduler {
 
     this.advanceTimer = setTimeout(() => {
       if (this.isRunning()) {
-        this.executeAutopilotPulse('EXACT_3M_ADVANCE_TRIGGER');
+        // Queue the scan before invoking the pulse: the current 29-pair sensing
+        // cycle may still be running, and executeAutopilotPulse must not drop it.
+        this.pendingSignalScan = true;
+        void this.executeAutopilotPulse('EXACT_3M_ADVANCE_TRIGGER');
         this.scheduleNext3MinuteAdvancePulse();
       }
     }, delayMs);
@@ -242,6 +260,21 @@ export class AutonomousScheduler {
     experimentsRun: number;
     topExperiment: ResearchExperiment | null;
   }> {
+    const pulseRequestedAtMs = Date.now();
+    const isForcedScanRequest = [
+      'WARMUP',
+      'MANUAL_TRIGGER',
+      'SCAN_NOW',
+      'SERVICE_WORKER_BACKGROUND_PULSE',
+      'EXACT_3M_ADVANCE_TRIGGER',
+    ].includes(triggerSource);
+
+    // Capture eligibility before data fetching. A 29-pair provider sweep can
+    // take longer than the remaining part of the 65-second discovery window.
+    if (isWithinStrictSignalDiscoveryWindow(pulseRequestedAtMs) || isForcedScanRequest) {
+      this.pendingSignalScan = true;
+    }
+
     if (this.isRunningCycle) {
       return {
         durationMs: 0,
@@ -262,6 +295,7 @@ export class AutonomousScheduler {
       const marketState = isForexMarketOpen(new Date());
       if (!marketState.isOpen) {
         // Safely sweep and reconcile any stale active/waiting signals from Friday, and send Telegram Audit Reports for any settled trades
+        this.pendingSignalScan = false;
         const weekendSwept = entryExitEngine.sweepStaleActiveSignals();
         const weekendAuditDispatches: Array<Promise<any>> = [];
         for (const sig of weekendSwept) {
@@ -500,14 +534,21 @@ export class AutonomousScheduler {
       // Active between 210s and 145s prior to 5M candle open (65-second window centered at 180s / 3 minutes).
       // A 65-second window guarantees that ANY 1-minute external 24/5 cron pinger lands inside the window
       // every 5-minute candle cycle without ever missing a setup or emitting rushed/late signals.
-      const isWithin3MinAdvanceWindow = msUntilNextOpen <= 210 * 1000 && msUntilNextOpen >= 145 * 1000;
+      const isWithin3MinAdvanceWindow =
+        isWithinStrictSignalDiscoveryWindow(pulseRequestedAtMs) ||
+        isWithinStrictSignalDiscoveryWindow(nowMs);
       const isManualOrWarmup =
         triggerSource === 'WARMUP' ||
         triggerSource === 'MANUAL_TRIGGER' ||
         triggerSource === 'SCAN_NOW' ||
         triggerSource === 'SERVICE_WORKER_BACKGROUND_PULSE' ||
         triggerSource === 'EXACT_3M_ADVANCE_TRIGGER';
-      const shouldScanForSignals = isWithin3MinAdvanceWindow || isManualOrWarmup;
+      const shouldScanForSignals =
+        this.pendingSignalScan || isWithin3MinAdvanceWindow || isManualOrWarmup;
+
+      // Consume the queued request only when reaching discovery. Any earlier
+      // failure leaves it queued for the next pulse to retry.
+      if (shouldScanForSignals) this.pendingSignalScan = false;
 
       if (!shouldScanForSignals && inFlightTrades.length < 6) {
         const secondsUntil3m = msUntilNextOpen > 210 * 1000
@@ -522,6 +563,13 @@ export class AutonomousScheduler {
       }
 
       // Emit new setups when capacity permits (up to 6 concurrent in-flight slots)
+      if (shouldScanForSignals && inFlightTrades.length >= 6) {
+        this.logMind(
+          'AUDITOR',
+          `[SIGNAL DISCOVERY BLOCKED] All 6 in-flight slots are occupied; ${inFlightSymbols.size} currency pairs already have pending contracts.`
+        );
+      }
+
       if (shouldScanForSignals && inFlightTrades.length < 6) {
         for (const symbol of FOREX_PAIRS) {
           // Strict Pair Isolation: If this pair already has an active in-flight trade, NEVER create another!
@@ -977,6 +1025,14 @@ export class AutonomousScheduler {
             break; // Single high-conviction setup per pulse to prevent burst clutter
           }
         }
+      }
+
+      if (shouldScanForSignals && createdSignals.length === 0) {
+        const freshPairs = FOREX_PAIRS.filter(pair => (candlesMap[pair]?.length || 0) >= 35).length;
+        this.logMind(
+          'AUDITOR',
+          `[SIGNAL DISCOVERY EMPTY] Fresh real-feed pairs with 35+ M1 candles: ${freshPairs}/${FOREX_PAIRS.length}; pending pairs: ${inFlightSymbols.size}; in-flight slots: ${inFlightTrades.length}/6. No setup passed the existing confluence/adaptive filters.`
+        );
       }
 
       // 4. Autonomous ML Walk-Forward Experimentation (every 3rd pulse)
