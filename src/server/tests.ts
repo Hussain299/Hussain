@@ -12,6 +12,7 @@ import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS 
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { buildAccuracyReport } from '../utils/accuracyAnalytics.js';
+import { sanitizeOlympTradeBridgeStatus } from '../services/olympTradeBridge.js';
 import { telegramService } from './telegramService.js';
 import { isWithinStrictSignalDiscoveryWindow } from './scheduler.js';
 import {
@@ -196,6 +197,36 @@ export async function runAllVerificationTests(): Promise<{
     }
     if (report.pairs.length !== FOREX_PAIRS.length) {
       throw new Error('Pair accuracy must render every configured currency pair, including pairs with no data.');
+    }
+  });
+
+  await runTest('DATA', 'Olymp Trade browser bridge accepts only normalized read-only instrument data', () => {
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true,
+      extensionVersion: '1.0.0',
+      platformTabOpen: true,
+      connected: true,
+      sessionState: 'READY',
+      capturedAt: new Date().toISOString(),
+      ageMs: 1000,
+      instruments: [
+        { pair: 'eur/usd', payoutPct: 87.5, availability: 'AVAILABLE', evidence: 'MEDIUM' },
+        { pair: 'EUR/USD', payoutPct: 92, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'EURUSD', payoutPct: 99, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'GBP/JPY', payoutPct: 145, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'USD/CHF', payoutPct: 45, availability: 'AVAILABLE', evidence: 'HIGH' },
+      ],
+      password: 'must-not-be-forwarded',
+    });
+    const eurUsd = status.instruments.find(row => row.pair === 'EUR/USD');
+    const gbpJpy = status.instruments.find(row => row.pair === 'GBP/JPY');
+    const usdChf = status.instruments.find(row => row.pair === 'USD/CHF');
+    if (!status.connected || status.instruments.length !== 3 || eurUsd?.payoutPct !== 92 ||
+        eurUsd.evidence !== 'HIGH' || gbpJpy?.payoutPct !== null || usdChf?.payoutPct !== null) {
+      throw new Error('The browser bridge failed to deduplicate pairs or reject malformed/unreliable payout values.');
+    }
+    if ('password' in status) {
+      throw new Error('Credential-like fields must never be included in the SignalForge broker snapshot.');
     }
   });
 
