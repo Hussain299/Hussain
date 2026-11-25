@@ -5,6 +5,7 @@ import { OverviewView } from './components/views/OverviewView.tsx';
 import { SignalTerminalView } from './components/views/SignalTerminalView.tsx';
 import { HistoryView } from './components/views/HistoryView.tsx';
 import { AnalyticsView } from './components/views/AnalyticsView.tsx';
+import { AccuracyView } from './components/views/AccuracyView.tsx';
 import { BrainView } from './components/views/BrainView.tsx';
 import { SystemView } from './components/views/SystemView.tsx';
 import { ManualControlsView } from './components/views/ManualControlsView.tsx';
@@ -374,6 +375,9 @@ export default function App() {
           {activeTab === 'analytics' && (
             <AnalyticsView signals={signals} experiments={experiments} />
           )}
+
+          {/* 5. ACCURACY: Verified outcome rates by market session and currency pair */}
+          {activeTab === 'accuracy' && <AccuracyView signals={signals} />}
 
           {/* 5. BRAIN: Research, learning and model intelligence */}
           {(activeTab === 'brain' || activeTab === 'behaviour') && (
