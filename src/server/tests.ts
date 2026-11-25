@@ -6,7 +6,7 @@
 
 import { Candle, ForexSymbol, FOREX_PAIRS, ResearchExperiment, ResearchSignal, VerificationTestResult } from '../types/index.js';
 import { summarizeForwardObservations, summarizeSignalAccounting } from '../utils/tradeAccounting.js';
-import { dataFeedEngine, filterFreshRealCandles, getFreshRealCandleWindow, LIVE_CANDLE_MAX_AGE_MS } from './dataFeeds.js';
+import { dataFeedEngine, filterFreshRealCandles, getFreshRealCandleWindow, hasFreshRealProviderCandles, LIVE_CANDLE_MAX_AGE_MS } from './dataFeeds.js';
 import { db } from './db.js';
 import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
@@ -489,6 +489,36 @@ export async function runAllVerificationTests(): Promise<{
     const pointFresh = filterFreshRealCandles(history, 'EUR/USD', nowMs);
     if (pointFresh.length > 2 || pointFresh.length === 0) {
       throw new Error('Point freshness filter unexpectedly changed its strict per-candle behavior.');
+    }
+  });
+
+  await runTest('DATA', 'Stale provider responses are rejected before fallback selection', () => {
+    const nowMs = Date.now();
+    const freshHistory: Candle[] = Array.from({ length: 40 }, (_, index) => {
+      const timestampMs = nowMs - ((39 - index) * 60_000) - 30_000;
+      return {
+        symbol: 'EUR/USD',
+        timestamp: new Date(timestampMs).toISOString(),
+        timestampMs,
+        open: 1.0850,
+        high: 1.0860,
+        low: 1.0840,
+        close: 1.0855,
+        volume: 100,
+        source: 'yahoo' as const,
+      };
+    });
+    const staleHistory = freshHistory.map(candle => ({
+      ...candle,
+      timestampMs: candle.timestampMs - 120_000,
+      timestamp: new Date(candle.timestampMs - 120_000).toISOString(),
+    }));
+
+    if (!hasFreshRealProviderCandles(freshHistory, 'EUR/USD', nowMs)) {
+      throw new Error('A provider response with a fresh newest M1 candle should be accepted.');
+    }
+    if (hasFreshRealProviderCandles(staleHistory, 'EUR/USD', nowMs)) {
+      throw new Error('A non-empty but stale provider response must be rejected so the next provider is attempted.');
     }
   });
 
