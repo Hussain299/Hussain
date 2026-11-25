@@ -2671,6 +2671,96 @@ export async function runAllVerificationTests(): Promise<{
     }
   });
 
+  await runTest('SYSTEM', 'Self-Healing Supervisor: Repairs zombie waiting signals, missing settlement units, and corrupt candles automatically', async () => {
+    const { SelfHealingSupervisor } = await import('./selfHealingSupervisor.js');
+
+    const nowMs = Date.now();
+    const zombieCandle = makeM1TestCandles('CAD/CHF', 1)[0];
+    // Insert a zombie signal whose entry window expired 20 minutes ago without fill (using isolated pair CAD/CHF)
+    const insertedZombie = db.addSignal({
+      id: 'sig_selfheal_zombie_1',
+      symbol: 'CAD/CHF',
+      direction: 'BUY',
+      predictionTimeUtc: new Date(nowMs - 30 * 60_000).toISOString(),
+      predictionTimeIst: '',
+      signalCandleTime: zombieCandle.timestamp,
+      entryCondition: 'NEXT_5M_OPEN',
+      entryWindowStartUtc: new Date(nowMs - 25 * 60_000).toISOString(),
+      entryWindowEndUtc: new Date(nowMs - 20 * 60_000).toISOString(),
+      triggerPrice: zombieCandle.close,
+      invalidationPrice: zombieCandle.close - 0.002,
+      actualEntryTimeUtc: null,
+      actualEntryPrice: null,
+      entrySource: null,
+      expiryMinutes: 15,
+      plannedExitTimeUtc: null,
+      actualExitTimeUtc: null,
+      actualExitPrice: null,
+      confidence: 0.78,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'WAITING_FOR_ENTRY',
+      lifecycleHistory: [],
+      grossReturnPips: null,
+      estimatedSpreadPips: 1.2,
+      netReturnPips: null,
+      outcomeResult: 'PENDING',
+      ruleFamily: 'order_flow_imbalance',
+      modelVersion: 'vTest',
+    });
+    if (!insertedZombie || insertedZombie.id !== 'sig_selfheal_zombie_1') {
+      throw new Error(`Expected test zombie fixture inserted cleanly, got ${JSON.stringify(insertedZombie)}`);
+    }
+
+    // Insert a closed WIN trade missing netReturnUnits
+    db.addSignal({
+      id: 'sig_selfheal_settlement_1',
+      symbol: 'USD/JPY',
+      direction: 'BUY',
+      predictionTimeUtc: new Date(nowMs - 40 * 60_000).toISOString(),
+      predictionTimeIst: '',
+      signalCandleTime: zombieCandle.timestamp,
+      entryCondition: 'NEXT_5M_OPEN',
+      entryWindowStartUtc: new Date(nowMs - 35 * 60_000).toISOString(),
+      entryWindowEndUtc: new Date(nowMs - 30 * 60_000).toISOString(),
+      triggerPrice: 150.0,
+      invalidationPrice: 149.8,
+      actualEntryTimeUtc: new Date(nowMs - 35 * 60_000).toISOString(),
+      actualEntryPrice: 150.0,
+      entrySource: 'yahoo',
+      expiryMinutes: 15,
+      plannedExitTimeUtc: new Date(nowMs - 20 * 60_000).toISOString(),
+      actualExitTimeUtc: new Date(nowMs - 20 * 60_000).toISOString(),
+      actualExitPrice: 150.15,
+      confidence: 0.80,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'CLOSED',
+      lifecycleHistory: [],
+      grossReturnPips: 15,
+      estimatedSpreadPips: 1.2,
+      netReturnPips: null,
+      payoutPct: 82,
+      netReturnUnits: null,
+      outcomeResult: 'WIN',
+      ruleFamily: 'order_flow_imbalance',
+      modelVersion: 'vTest',
+    });
+
+    const healer = new SelfHealingSupervisor();
+    const report = healer.runDiagnosticAndRepair(nowMs);
+    if (report.status !== 'REPAIRED' || report.totalRepairsExecuted < 2) {
+      throw new Error(`Expected self-healer to repair zombie & missing settlement units, got ${JSON.stringify(report)}`);
+    }
+
+    const fixedZombie = db.getSignals(true).find((s) => s.id === 'sig_selfheal_zombie_1');
+    const fixedSettled = db.getSignals(true).find((s) => s.id === 'sig_selfheal_settlement_1');
+    if (!fixedZombie || fixedZombie.lifecycleState !== 'EXPIRED' || fixedZombie.outcomeResult !== 'CANCELLED') {
+      throw new Error(`Zombie waiting signal was not expired/cancelled: ${JSON.stringify(fixedZombie)}`);
+    }
+    if (!fixedSettled || fixedSettled.netReturnUnits !== 0.82) {
+      throw new Error(`Missing settlement netReturnUnits was not auto-recomputed (expected 0.82): ${JSON.stringify(fixedSettled)}`);
+    }
+  });
+
   // Purge test signals so they never appear on the user's trading terminal
   db.purgeTestSignals();
 

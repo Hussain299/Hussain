@@ -107,6 +107,7 @@ export class AutonomousScheduler {
   private static readonly SYMBOL_FETCH_TIMEOUT_MS = 9_500;
   private isRunningCycle = false;
   private currentCycleStartedAtMs = 0;
+  private expectedAdvanceTargetMs = 0;
   // Preserve exact/cron scan requests when a slower sensing cycle currently owns the scheduler.
   private pendingSignalScan = false;
   private autopilotTimer: NodeJS.Timeout | null = null;
@@ -278,6 +279,7 @@ export class AutonomousScheduler {
       target3mMs += FIVE_MIN_MS;
     }
     const delayMs = Math.max(250, target3mMs - now);
+    this.expectedAdvanceTargetMs = target3mMs;
 
     this.advanceTimer = setTimeout(() => {
       if (this.isRunning()) {
@@ -288,6 +290,18 @@ export class AutonomousScheduler {
         this.scheduleNext3MinuteAdvancePulse();
       }
     }, delayMs);
+  }
+
+  public ensureAdvanceTimerArmed(nowMs: number = Date.now()): boolean {
+    if (!this.isRunning()) return false;
+    const drifted =
+      !this.advanceTimer ||
+      (this.expectedAdvanceTargetMs > 0 && nowMs > this.expectedAdvanceTargetMs + 60_000);
+    if (drifted) {
+      this.scheduleNext3MinuteAdvancePulse();
+      return true;
+    }
+    return false;
   }
 
   public start() {

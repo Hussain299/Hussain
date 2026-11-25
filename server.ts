@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import { apiRouter } from './src/server/api.js';
 import { autonomousScheduler } from './src/server/scheduler.js';
 import { db } from './src/server/db.js';
+import { selfHealingSupervisor } from './src/server/selfHealingSupervisor.js';
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -140,12 +141,13 @@ async function startServer() {
     // Defer background scheduler startup slightly so initial cold-start page loads get instant priority
     setTimeout(() => {
       autonomousScheduler.start();
+      selfHealingSupervisor.runDiagnosticAndRepair();
     }, 3000);
 
-    // Lightweight in-process scheduler & stalled-cycle watchdog
+    // Continuous autonomous self-healing & scheduler watchdog (every 60s)
     setInterval(() => {
       try {
-        autonomousScheduler.recoverIfStalled();
+        selfHealingSupervisor.runDiagnosticAndRepair();
         if (!autonomousScheduler.isRunning()) {
           console.warn('[Watchdog] autonomousScheduler was idle! Auto-restarting background coordinator...');
           autonomousScheduler.start();

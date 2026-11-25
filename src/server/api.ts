@@ -30,6 +30,7 @@ import {
   computePortfolioStatistics,
   evaluatePromotionReadiness,
 } from './portfolioRiskEngine.js';
+import { selfHealingSupervisor } from './selfHealingSupervisor.js';
 
 interface StrategySearchJob {
   jobId: string;
@@ -629,7 +630,19 @@ apiRouter.get('/system/health', (_req: Request, res: Response) => {
     providers: db.getFeedHealthList(),
     sessions: dataFeedEngine.getMarketSessions(),
     uptimeTelemetry: autonomousScheduler.getUptimeTelemetry(),
+    selfHealing: selfHealingSupervisor.getReport(),
   });
+});
+
+// GET /api/system/self-heal — Autonomous invariant checks & recent repair telemetry
+apiRouter.get('/system/self-heal', (_req: Request, res: Response) => {
+  res.json(selfHealingSupervisor.getReport());
+});
+
+// POST /api/system/self-heal/run — Trigger immediate invariant audit & automatic repair sweep
+apiRouter.post('/system/self-heal/run', (_req: Request, res: Response) => {
+  const report = selfHealingSupervisor.runDiagnosticAndRepair();
+  res.json(report);
 });
 
 // GET /api/system/uptime-status — 24/5 runtime environment & external cron verification

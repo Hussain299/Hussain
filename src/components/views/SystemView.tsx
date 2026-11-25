@@ -38,6 +38,8 @@ export const SystemView: React.FC = () => {
   const [cronTestResult, setCronTestResult] = useState<any>(null);
   const [copiedCronUrl, setCopiedCronUrl] = useState(false);
   const [copiedWorkerCode, setCopiedWorkerCode] = useState(false);
+  const [selfHealReport, setSelfHealReport] = useState<any>(null);
+  const [isRunningSelfHeal, setIsRunningSelfHeal] = useState(false);
 
   const fetchHealth = async () => {
     setIsLoadingHealth(true);
@@ -49,6 +51,7 @@ export const SystemView: React.FC = () => {
       if (healthRes.ok) {
         const data = await healthRes.json();
         setHealth(data);
+        if (data.selfHealing) setSelfHealReport(data.selfHealing);
       }
       if (uptimeRes.ok) {
         const uData = await uptimeRes.json();
@@ -58,6 +61,20 @@ export const SystemView: React.FC = () => {
       console.error(e);
     } finally {
       setIsLoadingHealth(false);
+    }
+  };
+
+  const handleRunSelfHeal = async () => {
+    setIsRunningSelfHeal(true);
+    try {
+      const res = await fetch('/api/system/self-heal/run', { method: 'POST' });
+      if (res.ok) {
+        setSelfHealReport(await res.json());
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsRunningSelfHeal(false);
     }
   };
 
@@ -208,6 +225,85 @@ export const SystemView: React.FC = () => {
               {telegramStatus?.subscribersCount ?? 0} subscribers
             </span>
           </div>
+        </div>
+
+        {/* ------------------------------------------------------------- */}
+        {/* SECTION 1.25: AUTONOMOUS SELF-HEALING SUPERVISOR              */}
+        {/* ------------------------------------------------------------- */}
+        <div className="sf-panel rounded-xl p-5 space-y-4 font-mono text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[#243040]">
+            <div className="flex items-center gap-2.5">
+              <Cpu className="w-4 h-4 text-[#72A98B]" />
+              <div>
+                <h3 className="text-sm font-black text-[#E8E5DE] uppercase">
+                  Autonomous Self-Healing Runtime Supervisor
+                </h3>
+                <p className="text-[11px] text-[#AAB4BF] font-sans">
+                  Audits scheduler deadlocks, 3M timer drift, zombie signals, missed settlements, corrupt candles, &amp; temp files every 60s.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span
+                className={`px-2.5 py-1 rounded-full text-[10px] font-bold border ${
+                  selfHealReport?.status === 'REPAIRED'
+                    ? 'bg-[#C4A574]/20 text-[#C4A574] border-[#C4A574]/40'
+                    : 'bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/35'
+                }`}
+              >
+                {selfHealReport?.status || 'HEALTHY'} · {selfHealReport?.totalRepairsExecuted ?? 0} REPAIRS
+              </span>
+              <button
+                onClick={handleRunSelfHeal}
+                disabled={isRunningSelfHeal}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#72A98B] hover:bg-[#72A98B]/90 text-[#121820] font-black transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <RotateCw className={`w-3.5 h-3.5 ${isRunningSelfHeal ? 'animate-spin' : ''}`} />
+                <span>{isRunningSelfHeal ? 'Auditing...' : 'Run Self-Heal Audit'}</span>
+              </button>
+            </div>
+          </div>
+
+          {selfHealReport?.invariants && selfHealReport.invariants.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              {selfHealReport.invariants.map((inv: any) => (
+                <div key={inv.name} className="p-3 rounded-lg bg-[#121820] border border-[#243040] space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-[#E8E5DE] truncate">{inv.name}</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0 ${
+                        inv.status === 'HEALTHY'
+                          ? 'bg-[#72A98B]/15 text-[#72A98B]'
+                          : inv.status === 'REPAIRED'
+                            ? 'bg-[#C4A574]/20 text-[#C4A574]'
+                            : 'bg-[#B7797D]/15 text-[#B7797D]'
+                      }`}
+                    >
+                      {inv.status}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-[#AAB4BF] leading-relaxed">{inv.detail}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {selfHealReport?.recentRepairs && selfHealReport.recentRepairs.length > 0 && (
+            <div className="space-y-1.5 pt-1">
+              <div className="text-[10px] text-[#AAB4BF] uppercase font-bold">Recent Auto-Repairs Executed</div>
+              {selfHealReport.recentRepairs.slice(0, 5).map((r: any) => (
+                <div key={r.id} className="p-2.5 rounded-lg bg-[#121820] border border-[#243040] text-[11px] flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <strong className="text-[#C4A574]">[{r.subsystem}]</strong>{' '}
+                    <span className="text-[#E8E5DE]">{r.issueDetected}</span>{' '}
+                    <span className="text-[#72A98B]">→ {r.actionTaken}</span>
+                  </div>
+                  <span className="text-[10px] text-[#AAB4BF]">fixed={r.itemsFixed}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* ------------------------------------------------------------- */}

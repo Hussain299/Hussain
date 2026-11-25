@@ -750,6 +750,44 @@ class DatabaseService {
     return list.slice(-limit);
   }
 
+  /**
+   * Prunes any corrupt, non-finite, inverted OHLC, or synthetic rows if ever present in persisted storage.
+   */
+  public sanitizePersistedCandles(): number {
+    let removed = 0;
+    for (const key of Object.keys(this.state.candles)) {
+      const list = this.state.candles[key];
+      if (!Array.isArray(list)) {
+        this.state.candles[key] = [];
+        removed += 1;
+        continue;
+      }
+      const clean = list.filter((c) => {
+        const ok =
+          Boolean(c) &&
+          c.source !== 'synthetic' &&
+          Number.isFinite(c.timestampMs) &&
+          Number.isFinite(c.open) &&
+          Number.isFinite(c.high) &&
+          Number.isFinite(c.low) &&
+          Number.isFinite(c.close) &&
+          c.high >= c.low &&
+          c.high >= c.open &&
+          c.high >= c.close &&
+          c.low <= c.open &&
+          c.low <= c.close &&
+          c.close > 0;
+        if (!ok) removed += 1;
+        return ok;
+      });
+      if (clean.length !== list.length) {
+        this.state.candles[key] = clean.sort((a, b) => a.timestampMs - b.timestampMs);
+      }
+    }
+    if (removed > 0) this.scheduleSave('high');
+    return removed;
+  }
+
   public getTotalCandlesCount(): number {
     let count = 0;
     for (const key of Object.keys(this.state.candles)) {
