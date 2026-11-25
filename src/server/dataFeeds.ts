@@ -114,6 +114,14 @@ export function getFreshRealCandleWindow(
   return Array.from(byTimestamp.values()).sort((a, b) => a.timestampMs - b.timestampMs).slice(-limit);
 }
 
+export function hasFreshRealProviderCandles(
+  candles: readonly Candle[],
+  symbol: ForexSymbol,
+  nowMs: number = Date.now()
+): boolean {
+  return getFreshRealCandleWindow(candles, symbol, nowMs, LIVE_CANDLE_MAX_AGE_MS, 100).length > 0;
+}
+
 export class DataFeedEngine {
   private basePrices: Record<ForexSymbol, number> = {
     'EUR/USD': 1.0854,
@@ -172,17 +180,33 @@ export class DataFeedEngine {
         const data = await res.json() as any;
         const result = data?.chart?.result?.[0];
         if (result && result.timestamp && result.indicators?.quote?.[0]) {
-          candles = this.normalizeYahoo(symbol, result);
-          activeSource = 'yahoo';
-          db.updateFeedHealth({
-            provider: 'yahoo',
-            symbol,
-            status: 'ONLINE',
-            latencyMs: Date.now() - start,
-            lastSuccess: new Date().toISOString(),
-            consecutiveFailures: 0,
-            attribution: 'Yahoo Finance public chart API',
-          });
+          const normalized = this.normalizeYahoo(symbol, result);
+          if (hasFreshRealProviderCandles(normalized, symbol)) {
+            candles = normalized;
+            activeSource = 'yahoo';
+            db.updateFeedHealth({
+              provider: 'yahoo',
+              symbol,
+              status: 'ONLINE',
+              latencyMs: Date.now() - start,
+              lastSuccess: new Date().toISOString(),
+              consecutiveFailures: 0,
+              attribution: 'Yahoo Finance public chart API',
+            });
+          } else {
+            // A non-empty historical response is not a successful live quote.
+            // Reject it so the Biquote/Dukascopy fallbacks can still be tried.
+            db.updateFeedHealth({
+              provider: 'yahoo',
+              symbol,
+              status: 'DEGRADED',
+              latencyMs: Date.now() - start,
+              lastSuccess: 'Pending',
+              consecutiveFailures: 1,
+              attribution: 'Yahoo Finance public chart API (stale response rejected)',
+              errorMessage: 'Newest external M1 candle is outside the 90-second live freshness window',
+            });
+          }
         }
       }
     } catch (err: any) {
@@ -212,17 +236,31 @@ export class DataFeedEngine {
           const data = await res.json() as any;
           const rawList = Array.isArray(data) ? data : data?.data || data?.candles;
           if (Array.isArray(rawList) && rawList.length > 0) {
-            candles = this.normalizeBiquote(symbol, rawList);
-            activeSource = 'biquote';
-            db.updateFeedHealth({
-              provider: 'biquote',
-              symbol,
-              status: 'ONLINE',
-              latencyMs: Date.now() - start,
-              lastSuccess: new Date().toISOString(),
-              consecutiveFailures: 0,
-              attribution: 'Biquote.io public M1 endpoint',
-            });
+            const normalized = this.normalizeBiquote(symbol, rawList);
+            if (hasFreshRealProviderCandles(normalized, symbol)) {
+              candles = normalized;
+              activeSource = 'biquote';
+              db.updateFeedHealth({
+                provider: 'biquote',
+                symbol,
+                status: 'ONLINE',
+                latencyMs: Date.now() - start,
+                lastSuccess: new Date().toISOString(),
+                consecutiveFailures: 0,
+                attribution: 'Biquote.io public M1 endpoint',
+              });
+            } else {
+              db.updateFeedHealth({
+                provider: 'biquote',
+                symbol,
+                status: 'DEGRADED',
+                latencyMs: Date.now() - start,
+                lastSuccess: 'Pending',
+                consecutiveFailures: 1,
+                attribution: 'Biquote.io public M1 endpoint (stale response rejected)',
+                errorMessage: 'Newest external M1 candle is outside the 90-second live freshness window',
+              });
+            }
           }
         }
       } catch (err: any) {
@@ -252,17 +290,31 @@ export class DataFeedEngine {
           const data = await res.json() as any;
           const rawList = data?.candles || data;
           if (Array.isArray(rawList) && rawList.length > 0) {
-            candles = this.normalizeDukascopy(symbol, rawList);
-            activeSource = 'dukascopy';
-            db.updateFeedHealth({
-              provider: 'dukascopy',
-              symbol,
-              status: 'ONLINE',
-              latencyMs: Date.now() - start,
-              lastSuccess: new Date().toISOString(),
-              consecutiveFailures: 0,
-              attribution: 'Dukascopy data via zapi.ink proxy (M1)',
-            });
+            const normalized = this.normalizeDukascopy(symbol, rawList);
+            if (hasFreshRealProviderCandles(normalized, symbol)) {
+              candles = normalized;
+              activeSource = 'dukascopy';
+              db.updateFeedHealth({
+                provider: 'dukascopy',
+                symbol,
+                status: 'ONLINE',
+                latencyMs: Date.now() - start,
+                lastSuccess: new Date().toISOString(),
+                consecutiveFailures: 0,
+                attribution: 'Dukascopy data via zapi.ink proxy (M1)',
+              });
+            } else {
+              db.updateFeedHealth({
+                provider: 'dukascopy',
+                symbol,
+                status: 'DEGRADED',
+                latencyMs: Date.now() - start,
+                lastSuccess: 'Pending',
+                consecutiveFailures: 1,
+                attribution: 'Dukascopy data via zapi.ink proxy (stale response rejected)',
+                errorMessage: 'Newest external M1 candle is outside the 90-second live freshness window',
+              });
+            }
           }
         }
       } catch (err: any) {
