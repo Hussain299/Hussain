@@ -235,14 +235,11 @@
     observer.disconnect();
   }
 
-  function publishSnapshot(force = false) {
+  function publishSnapshot() {
     if (!chrome.runtime?.id) {
       stopObserver();
       return;
     }
-    // Avoid overwriting a freshly observed dropdown list when tab blurs/hides;
-    // service-worker MAX_AGE_MS (30s) still transitions stale tabs to STALE.
-    if (!force && document.hidden) return;
     const instruments = readInstruments();
     let sessionState;
 
@@ -290,9 +287,9 @@
   }
 
   chrome.runtime.onMessage.addListener(message => {
-    if (message && message.type === 'OLYMP_SCAN_NOW') publishSnapshot(true);
+    if (message && message.type === 'OLYMP_SCAN_NOW') publishSnapshot();
   });
 
-  publishSnapshot(true);
-  intervalId = window.setInterval(() => publishSnapshot(false), 5000);
+  publishSnapshot();
+  intervalId = window.setInterval(publishSnapshot, 5000);
 })();

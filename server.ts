@@ -51,7 +51,15 @@ async function startServer() {
   const useProdStatic = process.env.NODE_ENV === 'production' && fs.existsSync(distIndex);
 
   if (useProdStatic) {
-    app.use(express.static(distPath, { maxAge: '1h' }));
+    app.use(express.static(distPath, {
+      maxAge: '1h',
+      index: false,
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.html')) {
+          res.setHeader('Cache-Control', 'no-store');
+        }
+      },
+    }));
     app.get('*', (req, res, next) => {
       if (req.originalUrl.startsWith('/api')) {
         return next();

@@ -77,7 +77,6 @@ export default function App() {
   // Forward sanitized read-only Olymp Trade companion snapshots to the scheduler while app is open
   useEffect(() => {
     const syncBridgeToServer = async () => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       try {
         const status = await requestOlympTradeBridgeStatus('GET_STATUS');
         if (!status.extensionInstalled) return;
@@ -91,7 +90,7 @@ export default function App() {
       }
     };
     void syncBridgeToServer();
-    const timer = window.setInterval(() => void syncBridgeToServer(), 10_000);
+    const timer = window.setInterval(() => void syncBridgeToServer(), 15_000);
     return () => window.clearInterval(timer);
   }, []);
 
