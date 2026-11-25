@@ -26,6 +26,7 @@ export type ViewTab =
   | 'terminal'
   | 'history'
   | 'analytics'
+  | 'accuracy'
   | 'brain'
   | 'behaviour'
   | 'system'
@@ -96,6 +97,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
           label: 'Analytics & PnL',
           desc: 'Equity trajectory, win rate & asset matrix',
           icon: BarChart3,
+        },
+        {
+          id: 'accuracy',
+          label: 'Session & Pair Accuracy',
+          desc: 'Verified win rate by market session and currency pair',
+          icon: Target,
         },
         {
           id: 'brain',
