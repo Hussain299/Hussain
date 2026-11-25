@@ -24,6 +24,7 @@ import {
   ResearchSignal,
   ProviderHealth,
   MarketSessionInfo,
+  FOREX_PAIRS,
   ForexSymbol,
 } from '../../types/index.js';
 import {
@@ -261,7 +262,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-md bg-[#72A98B] hover:bg-[#72A98B]/90 text-[#121820] font-black text-xs transition-all shadow-sm cursor-pointer disabled:opacity-50"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin' : ''}`} />
-              <span>{isScanning ? 'Scanning 20 Pairs...' : 'Scan Markets'}</span>
+              <span>{isScanning ? `Scanning ${FOREX_PAIRS.length} Pairs...` : 'Scan Markets'}</span>
             </button>
           </div>
         </div>
@@ -585,7 +586,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             {/* Providers List */}
             <div className="space-y-2.5 font-mono text-xs">
               {[
-                { name: 'Biquote Institutional Feed', ping: '12ms', status: 'ONLINE', pairs: '20 Pairs' },
+                { name: 'Biquote Institutional Feed', ping: '12ms', status: 'ONLINE', pairs: `${FOREX_PAIRS.length} Pairs` },
                 { name: 'Dukascopy M1 Tick Cache', ping: '48ms', status: 'ONLINE', pairs: 'Primary FX' },
                 { name: 'Yahoo Finance Cross-Check', ping: '84ms', status: 'ONLINE', pairs: 'Fallback' },
               ].map((prov, i) => (

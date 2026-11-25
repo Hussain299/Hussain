@@ -16,7 +16,7 @@ import {
   Radio,
   Layers,
 } from 'lucide-react';
-import { SystemHealthState, VerificationTestResult } from '../../types/index.js';
+import { FOREX_PAIRS, SystemHealthState, VerificationTestResult } from '../../types/index.js';
 import { TelegramBotModal } from '../common/TelegramBotModal.tsx';
 
 export const SystemView: React.FC = () => {
@@ -258,7 +258,7 @@ export const SystemView: React.FC = () => {
                 This app is currently running inside the <strong className="text-[#E8E5DE]">AI Studio Dev Preview Sandbox</strong>. Google Cloud Run dev sandboxes automatically freeze CPU and scale to zero shortly after you close the AI Studio tab, and require your Google login cookie so external pingers cannot wake them.
               </p>
               <p className="text-[#E8E5DE] leading-relaxed">
-                <strong className="text-[#72A98B]">Permanent 24/5 Fix (2 steps):</strong> (1) Deploy this app using AI Studio&apos;s <strong>Deploy / Share App</strong> button (or Cloud Run / VPS) to get a public URL. (2) Point a free 1-minute HTTP <code className="text-[#72A98B]">GET</code> cron job (e.g. <code className="text-[#E8E5DE]">cron-job.org</code> or UptimeRobot) at <code className="text-[#72A98B]">&lt;YOUR_DEPLOYED_URL&gt;/api/cron/tick</code> Mon–Fri. Every tick wakes the server, scans all 20 pairs, settles trades, dispatches Telegram alerts, and flushes the database synchronously before responding.
+                <strong className="text-[#72A98B]">Permanent 24/5 Fix (2 steps):</strong> (1) Deploy this app using AI Studio&apos;s <strong>Deploy / Share App</strong> button (or Cloud Run / VPS) to get a public URL. (2) Point a free 1-minute HTTP <code className="text-[#72A98B]">GET</code> cron job (e.g. <code className="text-[#E8E5DE]">cron-job.org</code> or UptimeRobot) at <code className="text-[#72A98B]">&lt;YOUR_DEPLOYED_URL&gt;/api/cron/tick</code> Mon–Fri. Every tick wakes the server, scans all {FOREX_PAIRS.length} pairs, settles trades, dispatches Telegram alerts, and flushes the database synchronously before responding.
               </p>
             </div>
           )}
@@ -340,7 +340,7 @@ export const SystemView: React.FC = () => {
             {[
               {
                 provider: 'Biquote Feed Engine',
-                symbol: 'EUR/USD · 20 Pairs',
+                symbol: `EUR/USD · ${FOREX_PAIRS.length} Pairs`,
                 latency: '14ms',
                 status: 'ONLINE',
                 attribution: 'Biquote Web Stream API',
