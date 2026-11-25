@@ -704,7 +704,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-[#6C9D91] hover:bg-[#72A98B] text-[#17212D] font-bold text-xs transition-all shadow-sm cursor-pointer disabled:opacity-50"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isScanningNow ? 'animate-spin' : ''}`} />
-                <span>{isScanningNow ? 'Scanning 20 Pairs...' : 'Scan Markets Now'}</span>
+                <span>{isScanningNow ? 'Scanning ${FOREX_PAIRS.length} Pairs...' : 'Scan Markets Now'}</span>
               </button>
             </div>
           </div>
@@ -1436,7 +1436,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                   <p>
                     {todaySignals.length > 0
                       ? `${todaySignals.length} signal(s) active/queued in market today. Completed binary contract outcomes will appear once 5M expiries settle.`
-                      : 'Today\'s 5M autonomous scanner is actively monitoring 20 Forex pairs.'}
+                      : `Today's 5M autonomous scanner is actively monitoring ${FOREX_PAIRS.length} Forex pairs.`}
                   </p>
                 </div>
                 {latestCompletedSession && (
