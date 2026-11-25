@@ -13,7 +13,7 @@ import {
   ResearchExperiment,
   RuleFamily,
 } from '../types/index.js';
-import { dataFeedEngine, filterFreshRealCandles, getSessionFromTimestamp, isForexMarketOpen } from './dataFeeds.js';
+import { dataFeedEngine, getFreshRealCandleWindow, getSessionFromTimestamp, isForexMarketOpen } from './dataFeeds.js';
 import { db } from './db.js';
 import { entryExitEngine } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
@@ -371,15 +371,16 @@ export class AutonomousScheduler {
           batch.map(async (symbol) => {
             try {
               const res = await dataFeedEngine.fetchCandles(symbol, 100);
-              // Only recent, timestamp-consistent external feed candles may reach live discovery
-              // or entry/exit evaluation. Old persisted candles must not become a fallback signal source.
+              // Require a fresh newest real candle, but retain the preceding real M1
+              // history for EMA/RSI/ATR/regime features. Applying a 90s age filter to
+              // every candle leaves fewer than 35 rows and silently disables discovery.
               const nowMs = Date.now();
-              const freshStored = filterFreshRealCandles(db.getCandles(symbol, 100), symbol, nowMs);
-              const freshFetched = filterFreshRealCandles(res.candles, symbol, nowMs);
+              const freshStoredWindow = getFreshRealCandleWindow(db.getCandles(symbol, 100), symbol, nowMs, undefined, 100);
+              const freshFetchedWindow = getFreshRealCandleWindow(res.candles, symbol, nowMs, undefined, 100);
               const byTimestamp = new Map<number, Candle>();
-              for (const candle of freshStored) byTimestamp.set(candle.timestampMs, candle);
+              for (const candle of freshStoredWindow) byTimestamp.set(candle.timestampMs, candle);
               // Prefer this cycle's provider candle if it shares a timestamp with persisted data.
-              for (const candle of freshFetched) byTimestamp.set(candle.timestampMs, candle);
+              for (const candle of freshFetchedWindow) byTimestamp.set(candle.timestampMs, candle);
               candlesMap[symbol] = Array.from(byTimestamp.values())
                 .sort((a, b) => a.timestampMs - b.timestampMs)
                 .slice(-100);
