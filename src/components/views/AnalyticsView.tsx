@@ -478,7 +478,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                 Currency Pair Asset Performance Matrix
               </h2>
               <p className="text-xs text-[#AAB4BF] mt-0.5">
-                Observed trade accuracy and net return distribution across all 20 monitored pairs.
+                Observed trade accuracy and net return distribution across all {FOREX_PAIRS.length} configured pairs.
               </p>
             </div>
 

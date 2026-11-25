@@ -11,6 +11,7 @@ import { db } from './db.js';
 import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
+import { buildAccuracyReport } from '../utils/accuracyAnalytics.js';
 import { telegramService } from './telegramService.js';
 import { isWithinStrictSignalDiscoveryWindow } from './scheduler.js';
 import {
@@ -94,6 +95,107 @@ export async function runAllVerificationTests(): Promise<{
       isWithinStrictSignalDiscoveryWindow(fiveMinuteBoundary + 155_001)
     ) {
       throw new Error('The strict 3-minute signal discovery window boundaries are incorrect.');
+    }
+  });
+
+  await runTest('DATA', 'Session and pair accuracy uses only verified filled settlements', () => {
+    const nowMs = Date.UTC(2026, 10, 25, 12, 0, 0);
+    const makeSettlement = (
+      id: string,
+      outcome: 'WIN' | 'LOSS' | 'SCRATCH',
+      session?: 'ASIA' | 'LONDON' | 'OVERLAP' | 'NEW_YORK',
+      overrides: Partial<ResearchSignal> = {}
+    ): ResearchSignal => ({
+      id,
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      predictionTimeUtc: new Date(nowMs - 60 * 60_000).toISOString(),
+      predictionTimeIst: '05:30 PM IST',
+      signalCandleTime: new Date(nowMs - 60 * 60_000).toISOString(),
+      entryCondition: 'Verified test fixture',
+      entryWindowStartUtc: new Date(nowMs - 60 * 60_000).toISOString(),
+      entryWindowEndUtc: new Date(nowMs - 55 * 60_000).toISOString(),
+      triggerPrice: 1.1,
+      invalidationPrice: 1.09,
+      actualEntryTimeUtc: new Date(nowMs - 55 * 60_000).toISOString(),
+      actualEntryPrice: 1.1,
+      entrySource: 'yahoo',
+      expiryMinutes: 5,
+      plannedExitTimeUtc: new Date(nowMs - 50 * 60_000).toISOString(),
+      actualExitTimeUtc: new Date(nowMs - 50 * 60_000).toISOString(),
+      actualExitPrice: 1.101,
+      confidence: 0.8,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'CLOSED',
+      lifecycleHistory: [],
+      grossReturnPips: 10,
+      estimatedSpreadPips: 1,
+      netReturnPips: 9,
+      payoutPct: 80,
+      netReturnUnits: outcome === 'WIN' ? 0.8 : outcome === 'LOSS' ? -1 : 0,
+      outcomeResult: outcome,
+      ruleFamily: 'momentum_5',
+      modelVersion: 'test',
+      marketSession: session,
+      ...overrides,
+    } as ResearchSignal);
+
+    const asiaWin = makeSettlement('accuracy_asia_win', 'WIN', 'ASIA');
+    const asiaLoss = makeSettlement('accuracy_asia_loss', 'LOSS', 'ASIA');
+    const londonScratch = makeSettlement('accuracy_london_scratch', 'SCRATCH', 'LONDON');
+    const noSession = makeSettlement('accuracy_no_session', 'WIN', undefined, {
+      predictionTimeUtc: '2026-11-25T13:00:00.000Z',
+    });
+    const expiredUnfilled = makeSettlement('accuracy_expired', 'LOSS', 'ASIA', {
+      lifecycleState: 'EXPIRED',
+      actualEntryTimeUtc: null,
+      actualEntryPrice: null,
+      actualExitTimeUtc: null,
+      actualExitPrice: null,
+    });
+    const missingPayout = makeSettlement('accuracy_missing_payout', 'WIN', 'ASIA', {
+      payoutPct: undefined,
+    });
+    const testFixture = makeSettlement('accuracy_test_rule', 'WIN', 'ASIA', {
+      ruleFamily: 'test_fixture',
+    });
+
+    const report = buildAccuracyReport(
+      [asiaWin, asiaLoss, londonScratch, noSession, expiredUnfilled, missingPayout, testFixture, asiaWin],
+      { period: 'ALL', nowMs }
+    );
+
+    if (
+      report.summary.settlements !== 4 ||
+      report.summary.scoredTrades !== 3 ||
+      report.summary.wins !== 2 ||
+      report.summary.losses !== 1 ||
+      report.summary.scratches !== 1 ||
+      report.summary.winRatePct !== 66.7
+    ) {
+      throw new Error(`Unexpected verified accuracy summary: ${JSON.stringify(report.summary)}`);
+    }
+
+    const asia = report.sessions.find(row => row.key === 'ASIA');
+    const london = report.sessions.find(row => row.key === 'LONDON');
+    const overlap = report.sessions.find(row => row.key === 'OVERLAP');
+    if (asia?.scoredTrades !== 2 || asia.winRatePct !== 50 ||
+        london?.scratches !== 1 || london.winRatePct !== null ||
+        overlap?.wins !== 1) {
+      throw new Error('Session-wise aggregation or legacy session inference is incorrect.');
+    }
+
+    const londonPairs = buildAccuracyReport(
+      [asiaWin, asiaLoss, londonScratch, noSession],
+      { period: 'ALL', pairSession: 'LONDON', nowMs }
+    );
+    const eurUsdLondon = londonPairs.pairs.find(row => row.key === 'EUR/USD');
+    if (eurUsdLondon?.settlements !== 1 || eurUsdLondon.scoredTrades !== 0 ||
+        eurUsdLondon.winRatePct !== null) {
+      throw new Error('Pair-wise session filtering must keep scratch rows separate from scored win rate.');
+    }
+    if (report.pairs.length !== FOREX_PAIRS.length) {
+      throw new Error('Pair accuracy must render every configured currency pair, including pairs with no data.');
     }
   });
 
