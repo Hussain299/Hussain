@@ -15,15 +15,34 @@ import {
 import { AgiSelfLearningState } from '../types/index.ts';
 
 interface ModelTelemetry {
+  modelVersion?: string;
   stepCount: number;
+  adamStepCount?: number;
+  optimizerRestorationStatus?: string;
   lastLoss: number;
   averageLoss20: number;
+  validationLossOos?: number | null;
+  oosDirectionalAccuracy?: number | null;
+  oosEvaluatedCount?: number;
   gradientNorm: number;
   learningRate: number;
   activeWeightsNorm: number;
   linUcbConfidenceRadius: number;
   storedMemoryEpisodes: number;
-  lastUpdated: string;
+  trainedSignalCount?: number;
+  skippedMissingFeaturesCount?: number;
+  duplicateAttemptsBlocked?: number;
+  lastTrainedAt?: string | null;
+  lastUpdated: string | null;
+  linUcbV2?: {
+    version: string;
+    mode: string;
+    observationsBuy: number;
+    observationsSell: number;
+    totalObservations: number;
+    meanReward: number | null;
+    lastTrainedAt: string | null;
+  };
 }
 
 interface ModelWeightsSnapshot {
@@ -152,7 +171,7 @@ export const AgiSelfLearningModal: React.FC<AgiSelfLearningModalProps> = ({
             <div>
               <div className="text-[10px] text-neutral-400 uppercase font-mono">Gradient L2 Norm</div>
               <div className="text-sm font-bold text-emerald-400 font-mono">
-                ‖∇L‖ = {telemetry?.gradientNorm || '0.0000'}
+                ‖∇L‖ = {telemetry?.gradientNorm ?? '0.0000'} · {telemetry?.optimizerRestorationStatus || 'INIT'}
               </div>
             </div>
           </div>
@@ -490,8 +509,15 @@ export const AgiSelfLearningModal: React.FC<AgiSelfLearningModalProps> = ({
 
         {/* Footer */}
         <div className="p-3 px-4 bg-neutral-950 border-t border-neutral-800 flex items-center justify-between text-xs font-mono text-neutral-500 shrink-0">
-          <span>Real Online Policy Model · No Mock Artifacts</span>
-          <span>Last Parameter Update: {telemetry?.lastUpdated ? new Date(telemetry.lastUpdated).toLocaleTimeString() : 'Active'}</span>
+          <span>
+            Online Policy {telemetry?.modelVersion || ''} · Skipped: {telemetry?.skippedMissingFeaturesCount ?? 0} · Dups Blocked: {telemetry?.duplicateAttemptsBlocked ?? 0}
+          </span>
+          <span>
+            Last Training Update:{' '}
+            {telemetry?.lastTrainedAt
+              ? new Date(telemetry.lastTrainedAt).toLocaleString()
+              : 'Never trained yet'}
+          </span>
         </div>
       </div>
     </div>

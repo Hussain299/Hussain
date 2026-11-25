@@ -29,7 +29,13 @@ export class AgiSelfLearningEngine {
   private adaptiveThresholdDelta: number = 0; // PID dynamic sensitivity adjustment
   private trailingErrors: number[] = [];
   private recordedSignalIds: Set<string> = new Set();
-  private lastReinforcementTime: string = new Date().toISOString();
+  private banditLastProbeAt: Record<string, number> = {};
+  private lastReinforcementTime: string = '';
+  private episodicRetrievalsTotal: number = 0;
+  private episodicSufficientCount: number = 0;
+  private episodicSkippedInsufficientHistoryCount: number = 0;
+  private episodicVetoCount: number = 0;
+  private lastVetoReason: string | null = null;
 
   constructor() {
     this.hydrateFromPersistentLedger();
@@ -104,7 +110,7 @@ export class AgiSelfLearningEngine {
 
     // 1. Hydrate all strategy bandit arms from persisted StrategyPerformanceRecord ledger
     const perfRecords = db.getStrategyPerformance();
-    const gamma = 0.96;
+    const gamma = 0.985; // ~67-trade recency horizon prevents profitable 56-59% arms from locking on brief pullbacks
     for (const record of perfRecords) {
       if (!record.strategyId || record.strategyId.includes('test_')) continue;
 
@@ -135,7 +141,9 @@ export class AgiSelfLearningEngine {
       const scored = wins + losses;
       const expectedWinRate = alpha / Math.max(0.001, alpha + beta);
       const empiricalWinRate = scored > 0 ? wins / scored : 0.5;
-      const shouldThrottle = scored >= 8 && (expectedWinRate < 0.556 || empiricalWinRate < 0.556);
+      const shouldThrottle =
+        scored >= 8 &&
+        ((expectedWinRate < 0.556 && empiricalWinRate < 0.556) || expectedWinRate < 0.52);
 
       this.banditArms[record.strategyId] = {
         strategyId: record.strategyId,
@@ -203,14 +211,41 @@ export class AgiSelfLearningEngine {
    * Checks whether a strategy arm is empirically underperforming the 80%-payout binary break-even floor (55.6%)
    * and should be throttled from emitting live signals.
    */
-  public isStrategyThrottled(strategyId: string): {
+  public isStrategyThrottled(
+    strategyId: string,
+    nowMs: number = Date.now()
+  ): {
     throttled: boolean;
     reason?: string;
     winRate?: number;
     sampleSize?: number;
+    recoveryProbe?: boolean;
   } {
+    const RECOVERY_PROBE_INTERVAL_MS = 60 * 60 * 1000; // Allow 1 bounded recovery probe per 60 minutes if idle
+    const checkRecoveryProbe = (lastUpdatedIso?: string): boolean => {
+      const updatedMs = lastUpdatedIso ? Date.parse(lastUpdatedIso) : NaN;
+      const lastProbeMs = this.banditLastProbeAt[strategyId] || 0;
+      if (
+        Number.isFinite(updatedMs) &&
+        nowMs - updatedMs >= RECOVERY_PROBE_INTERVAL_MS &&
+        nowMs - lastProbeMs >= RECOVERY_PROBE_INTERVAL_MS
+      ) {
+        this.banditLastProbeAt[strategyId] = nowMs;
+        return true;
+      }
+      return false;
+    };
+
     const arm = this.banditArms[strategyId];
     if (arm && arm.status === 'THROTTLED') {
+      if (checkRecoveryProbe(arm.lastUpdated)) {
+        return {
+          throttled: false,
+          recoveryProbe: true,
+          winRate: arm.currentWinRate,
+          sampleSize: arm.wins + arm.losses,
+        };
+      }
       return {
         throttled: true,
         winRate: arm.currentWinRate,
@@ -227,6 +262,14 @@ export class AgiSelfLearningEngine {
       const scored = wins + losses;
       const wr = scored > 0 ? wins / scored : 0.5;
       if (scored >= 8 && wr < 0.556) {
+        if (checkRecoveryProbe(perf.updatedAt)) {
+          return {
+            throttled: false,
+            recoveryProbe: true,
+            winRate: Number((wr * 100).toFixed(1)),
+            sampleSize: scored,
+          };
+        }
         return {
           throttled: true,
           winRate: Number((wr * 100).toFixed(1)),
@@ -352,9 +395,9 @@ export class AgiSelfLearningEngine {
     exitPrice: number,
     outcome: 'WIN' | 'LOSS' | 'SCRATCH' | 'CANCELLED',
     netUnits: number
-  ) {
+  ): boolean {
     if (signal.id && this.recordedSignalIds.has(signal.id)) {
-      return; // Never double-count the same settled signal
+      return false; // Never double-count the same settled signal
     }
     if (signal.id) {
       this.recordedSignalIds.add(signal.id);
@@ -387,6 +430,7 @@ export class AgiSelfLearningEngine {
     this.updatePidController(outcome);
 
     this.lastReinforcementTime = new Date().toISOString();
+    return true;
   }
 
   /**
@@ -405,11 +449,13 @@ export class AgiSelfLearningEngine {
     neighborsFound: number;
   } {
     // Look at past memories for this currency pair or correlated assets
+    this.episodicRetrievalsTotal += 1;
     const candidateMemories = this.episodicMemories.filter(
       m => m.symbol === symbol && m.direction === direction && ['WIN', 'LOSS'].includes(m.outcome)
     );
 
     if (candidateMemories.length < 5) {
+      this.episodicSkippedInsufficientHistoryCount += 1;
       return {
         shouldVeto: false,
         reason: 'Insufficient episodic history for neighborhood veto.',
@@ -417,6 +463,8 @@ export class AgiSelfLearningEngine {
         neighborsFound: candidateMemories.length,
       };
     }
+
+    this.episodicSufficientCount += 1;
 
     // Compute Euclidean distance in 19D feature space
     const scored = candidateMemories.map(m => {
@@ -439,6 +487,8 @@ export class AgiSelfLearningEngine {
     // INHIBITORY VETO RULE: If >= 60% of nearest structural market episodes lost, VETO!
     if (total >= 5 && lossRate >= 0.60) {
       const reason = `[EPISODIC MEMORY VETO]: ${Math.round(lossRate * 100)}% of top-${total} nearest historical setups resulted in LOSS on ${symbol} ${direction}. Sub-microstructure pattern flagged as high-fragility trap.`;
+      this.episodicVetoCount += 1;
+      this.lastVetoReason = reason;
       this.recentVetoes.unshift({
         timestamp: new Date().toISOString(),
         symbol,
@@ -477,7 +527,7 @@ export class AgiSelfLearningEngine {
     this.initializeBanditArms();
     const arm = this.ensureBanditArm(strategyId, strategyName);
 
-    const gamma = 0.96; // Exponential recency discount (~25 trade memory horizon)
+    const gamma = 0.985; // ~67-trade recency horizon matches hydrateFromPersistentLedger
     arm.totalTrades += 1;
 
     if (outcome === 'WIN') {
@@ -496,10 +546,13 @@ export class AgiSelfLearningEngine {
     // Draw Thompson sample from Beta(alpha, beta)
     arm.thompsonSampleScore = Number(this.sampleBeta(arm.alpha, arm.beta).toFixed(3));
 
-    // Throttle underperforming arms below binary options break-even floor (55.6% @ 80% payout)
+    // Throttle underperforming arms below binary break-even floor (avoid false locks on >55.6% arms on tiny dips)
     const expectedWinRate = arm.alpha / (arm.alpha + arm.beta);
     const empiricalWinRate = arm.wins / scored;
-    if (scored >= 8 && (expectedWinRate < 0.556 || empiricalWinRate < 0.556)) {
+    if (
+      scored >= 8 &&
+      ((expectedWinRate < 0.556 && empiricalWinRate < 0.556) || expectedWinRate < 0.52)
+    ) {
       arm.status = 'THROTTLED';
     } else {
       arm.status = 'ACTIVE_ARM';
@@ -547,7 +600,11 @@ export class AgiSelfLearningEngine {
    * H < 0.45: Anti-persistent / Mean-reverting (Wick-rejection fades favoured)
    * 0.45 <= H <= 0.55: Random walk / High-entropy noise (Stand down or demand high conviction)
    */
-  public classifyMarketRegime(symbol: ForexSymbol, candles: Candle[]): MarketRegimeState {
+  public classifyMarketRegime(
+    symbol: ForexSymbol,
+    candles: Candle[],
+    updateCache: boolean = true
+  ): MarketRegimeState {
     if (!candles || candles.length < 40) {
       return {
         symbol,
@@ -642,7 +699,9 @@ export class AgiSelfLearningEngine {
       calculatedAt: new Date().toISOString(),
     };
 
-    this.regimeCache[symbol] = state;
+    if (updateCache) {
+      this.regimeCache[symbol] = state;
+    }
     return state;
   }
 
@@ -733,6 +792,13 @@ export class AgiSelfLearningEngine {
       adaptiveThresholdDelta: this.adaptiveThresholdDelta,
       activeImmuneAntidotesCount: autopsies.length,
       lastReinforcementAt: this.lastReinforcementTime,
+      episodicStats: {
+        retrievalsTotal: this.episodicRetrievalsTotal,
+        sufficientHistoryCount: this.episodicSufficientCount,
+        skippedInsufficientHistoryCount: this.episodicSkippedInsufficientHistoryCount,
+        vetoCount: this.episodicVetoCount,
+        lastVetoReason: this.lastVetoReason,
+      },
     };
   }
 

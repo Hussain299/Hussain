@@ -29,28 +29,13 @@ import {
 } from './types/index.ts';
 import { useFirebase } from './contexts/FirebaseContext.tsx';
 import { requestOlympTradeBridgeStatus } from './services/olympTradeBridge.ts';
-
-function isSettledImmutable(sig?: ResearchSignal | null): boolean {
-  return Boolean(
-    sig &&
-      sig.lifecycleState === 'CLOSED' &&
-      ['WIN', 'LOSS', 'SCRATCH'].includes(sig.outcomeResult)
-  );
-}
-
-function sortSignalsDeterministically(list: ResearchSignal[]): ResearchSignal[] {
-  return [...list].sort((a, b) => {
-    const ta = a.predictionTimeUtc ? Date.parse(a.predictionTimeUtc) : 0;
-    const tb = b.predictionTimeUtc ? Date.parse(b.predictionTimeUtc) : 0;
-    if (tb !== ta) return tb - ta;
-    return String(b.id).localeCompare(String(a.id));
-  });
-}
+import { mergeServerAndCloudSignals, sortSignalsDeterministically } from './utils/signalMerge.ts';
 
 export default function App() {
   const { user, cloudSignals, cloudLedgerReady, syncSignalsToFirestore } = useFirebase();
   const [activeTab, setActiveTab] = useState<ViewTab>('overview');
   const [serverSignals, setServerSignals] = useState<ResearchSignal[]>([]);
+  const [serverLoadedOnce, setServerLoadedOnce] = useState(false);
   const [latestPrices, setLatestPrices] = useState<Record<string, number>>({});
   const [marketSessions, setMarketSessions] = useState<MarketSessionInfo[]>([]);
   const [experiments, setExperiments] = useState<ResearchExperiment[]>([]);
@@ -94,33 +79,17 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
-  // Merge live server signals with persistent Firestore cloud ledger (immutable settled outcomes win on conflict)
-  const signals = React.useMemo(() => {
-    const merged = new Map<string, ResearchSignal>();
-    if (user && cloudLedgerReady) {
-      for (const cs of cloudSignals) {
-        if (cs?.id) merged.set(cs.id, cs);
-      }
-    }
-    for (const ss of serverSignals) {
-      if (!ss?.id) continue;
-      const existing = merged.get(ss.id);
-      if (existing && isSettledImmutable(existing)) {
-        // Keep immutable settled cloud outcome; enrich with live lifecycleHistory if available
-        merged.set(ss.id, {
-          ...existing,
-          lifecycleHistory:
-            ss.lifecycleHistory && ss.lifecycleHistory.length > 0
-              ? ss.lifecycleHistory
-              : existing.lifecycleHistory,
-          lossAutopsy: ss.lossAutopsy || existing.lossAutopsy,
-        });
-      } else {
-        merged.set(ss.id, ss);
-      }
-    }
-    return sortSignalsDeterministically(Array.from(merged.values()));
-  }, [serverSignals, cloudSignals, user, cloudLedgerReady]);
+  // Merge live server signals with persistent Firestore cloud ledger (drops orphaned non-settled zombie docs)
+  const signals = React.useMemo(
+    () =>
+      mergeServerAndCloudSignals(
+        serverSignals,
+        cloudSignals,
+        Boolean(user && cloudLedgerReady),
+        serverLoadedOnce
+      ),
+    [serverSignals, cloudSignals, user, cloudLedgerReady, serverLoadedOnce]
+  );
 
   // Continuously persist newly arrived or settled server signals into Firestore when signed in
   useEffect(() => {
@@ -181,6 +150,7 @@ export default function App() {
       }
 
       if (sigRes && Array.isArray(sigRes.signals)) {
+        setServerLoadedOnce(true);
         const uniqueSignalsMap = new Map<string, ResearchSignal>();
         for (const sig of sigRes.signals) {
           if (sig && sig.id && !uniqueSignalsMap.has(sig.id)) {

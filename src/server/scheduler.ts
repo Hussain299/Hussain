@@ -121,12 +121,12 @@ export class AutonomousScheduler {
         (candle, history) => agiSelfLearningEngine.extractFeatureVector(candle, history)
       );
 
-      if (res.trainedCount > 0) {
+      if (res.trainedCount > 0 || res.skippedMissingFeatures > 0) {
         // Re-hydrate AGI episodic memories after onlinePolicyNetwork persisted newly trained vectors
         agiSelfLearningEngine.hydrateFromPersistentLedger();
         this.logMind(
           'MIND',
-          `Online Policy Network caught up on ${res.trainedCount} settled trades (causal entry vectors). Total Adam steps: ${res.stepCount}.`
+          `Online Policy Network caught up on ${res.trainedCount} settled trades using frozen prediction vectors (${res.skippedMissingFeatures} skipped: missing frozen features). Total steps: ${res.stepCount}.`
         );
       }
       this.hasBootstrappedOnlineModel = true;

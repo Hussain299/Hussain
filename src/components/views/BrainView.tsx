@@ -34,6 +34,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
   const [telemetry, setTelemetry] = useState<any>(null);
   const [weights, setWeights] = useState<any>(null);
   const [agiState, setAgiState] = useState<any>(null);
+  const [diagnostics, setDiagnostics] = useState<any>(null);
   const [autopsies, setAutopsies] = useState<LossAutopsy[]>([]);
   const [reviews, setReviews] = useState<AgentReview[]>([]);
   const [strategies, setStrategies] = useState<SynthesizedStrategyGene[]>([]);
@@ -42,10 +43,11 @@ export const BrainView: React.FC<BrainViewProps> = () => {
   const fetchBrainData = async () => {
     setIsLoading(true);
     try {
-      const [telRes, wtRes, agiRes, autRes, revRes, stratRes] = await Promise.all([
+      const [telRes, wtRes, agiRes, diagRes, autRes, revRes, stratRes] = await Promise.all([
         fetch('/api/online-model/telemetry').then(r => r.json()).catch(() => ({ telemetry: null })),
         fetch('/api/online-model/weights').then(r => r.json()).catch(() => ({ weights: null })),
         fetch('/api/agi/state').then(r => r.json()).catch(() => ({ agi: null })),
+        fetch('/api/evolution/diagnostics').then(r => r.json()).catch(() => null),
         fetch('/api/research/autopsies').then(r => r.json()).catch(() => ({ autopsies: [] })),
         fetch('/api/research/agents').then(r => r.json()).catch(() => ({ reviews: [] })),
         fetch('/api/strategies/synthesized').then(r => r.json()).catch(() => ({ strategies: [] })),
@@ -54,6 +56,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
       if (telRes?.telemetry) setTelemetry(telRes.telemetry);
       if (wtRes?.weights) setWeights(wtRes.weights);
       if (agiRes?.agi) setAgiState(agiRes.agi);
+      if (diagRes) setDiagnostics(diagRes);
       if (autRes?.autopsies) setAutopsies(autRes.autopsies);
       if (revRes?.reviews) setReviews(revRes.reviews);
       if (stratRes?.strategies) setStrategies(stratRes.strategies);
@@ -140,42 +143,90 @@ export const BrainView: React.FC<BrainViewProps> = () => {
                   </p>
                 </div>
                 <span className="px-2.5 py-1 rounded bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/30 font-bold">
-                  ACTIVE GRADIENT UPDATER
+                  {telemetry?.lastTrainedAt ? `TRAINED: ${new Date(telemetry.lastTrainedAt).toLocaleString()}` : 'AWAITING SETTLED OUTCOMES'}
                 </span>
               </div>
 
               {/* Top 4 Metrics */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Training Steps</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Adam Training Steps</span>
                   <div className="text-2xl font-black text-[#E8E5DE] mt-1 tabular-nums">
                     {telemetry?.stepCount ?? 0}
                   </div>
-                  <span className="text-[10px] text-[#72A98B] block mt-1">Online Adam Passes</span>
+                  <span className="text-[10px] text-[#72A98B] block mt-1">
+                    {telemetry?.optimizerRestorationStatus || 'FRESH_INIT'} · Skipped: {telemetry?.skippedMissingFeaturesCount ?? 0}
+                  </span>
                 </div>
 
                 <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Online BCE Loss (20)</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">OOS BCE / Dir Acc</span>
                   <div className="text-2xl font-black text-[#C4A574] mt-1 tabular-nums">
-                    {telemetry?.averageLoss20 !== undefined ? telemetry.averageLoss20 : '—'}
+                    {telemetry?.validationLossOos !== null && telemetry?.validationLossOos !== undefined
+                      ? telemetry.validationLossOos
+                      : telemetry?.averageLoss20 ?? '—'}
                   </div>
-                  <span className="text-[10px] text-[#AAB4BF] block mt-1">Strict Calibration</span>
+                  <span className="text-[10px] text-[#AAB4BF] block mt-1">
+                    OOS Dir: {telemetry?.oosDirectionalAccuracy !== null && telemetry?.oosDirectionalAccuracy !== undefined ? `${telemetry.oosDirectionalAccuracy}%` : '—'} (n={telemetry?.oosEvaluatedCount ?? 0})
+                  </span>
                 </div>
 
                 <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">LinUCB Exploration α</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">LinUCB V2 (Shadow)</span>
                   <div className="text-2xl font-black text-[#6C9D91] mt-1 tabular-nums">
-                    {telemetry?.linUcbAlpha ?? '0.25'}
+                    {telemetry?.linUcbV2?.totalObservations ?? 0} obs
                   </div>
-                  <span className="text-[10px] text-[#AAB4BF] block mt-1">Multi-Armed Bandit</span>
+                  <span className="text-[10px] text-[#AAB4BF] block mt-1">
+                    BUY {telemetry?.linUcbV2?.observationsBuy ?? 0} · SELL {telemetry?.linUcbV2?.observationsSell ?? 0} · Mean {telemetry?.linUcbV2?.meanReward ?? '—'}
+                  </span>
                 </div>
 
                 <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5">
-                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Weight Regularization</span>
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">FTRL 56D Brier Skill</span>
                   <div className="text-2xl font-black text-[#E8E5DE] mt-1 tabular-nums">
-                    L2 (1e-4)
+                    {diagnostics?.learning?.onlineLearner?.brierSkillVsPrevalence ?? '—'}
                   </div>
-                  <span className="text-[10px] text-[#AAB4BF] block mt-1">Clipped Gradients</span>
+                  <span className="text-[10px] text-[#AAB4BF] block mt-1">
+                    Prevalence Base: {diagnostics?.learning?.onlineLearner?.prevalenceBrierBaseline ?? '—'} (n={diagnostics?.learning?.onlineLearner?.sampleCount ?? 0})
+                  </span>
+                </div>
+              </div>
+
+              {/* Provenance + Episodic + Coverage Telemetry */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-1">
+                <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5 space-y-1">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Signal Provenance Split</span>
+                  <div className="text-[#E8E5DE]">
+                    Legacy: <strong>{diagnostics?.provenanceBreakdown?.legacy?.wins ?? 0}W-{diagnostics?.provenanceBreakdown?.legacy?.losses ?? 0}L</strong> ({diagnostics?.provenanceBreakdown?.legacy?.winRatePct ?? '—'}%)
+                  </div>
+                  <div className="text-[#72A98B]">
+                    Olymp Verified: <strong>{diagnostics?.provenanceBreakdown?.olympVerified?.wins ?? 0}W-{diagnostics?.provenanceBreakdown?.olympVerified?.losses ?? 0}L</strong> ({diagnostics?.provenanceBreakdown?.olympVerified?.winRatePct ?? '—'}%)
+                  </div>
+                  <div className="text-[#C4A574]">
+                    Shadow Accepted: <strong>{diagnostics?.provenanceBreakdown?.shadowAccepted?.wins ?? 0}W-{diagnostics?.provenanceBreakdown?.shadowAccepted?.losses ?? 0}L</strong> · Abstained: {diagnostics?.provenanceBreakdown?.shadowAbstained?.totalClosed ?? 0}
+                  </div>
+                </div>
+
+                <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5 space-y-1">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Training Coverage &amp; Episodic k-NN</span>
+                  <div className="text-[#E8E5DE]">
+                    MLP Trained: <strong>{telemetry?.trainedSignalCount ?? 0}</strong> · Dups Blocked: {telemetry?.duplicateAttemptsBlocked ?? 0}
+                  </div>
+                  <div className="text-[#AAB4BF]">
+                    Episodic Retrievals: {agiState?.episodicStats?.retrievalsTotal ?? 0} · Skipped (&lt;5): {agiState?.episodicStats?.skippedInsufficientHistoryCount ?? 0} · Vetoes: {agiState?.episodicStats?.vetoCount ?? 0}
+                  </div>
+                </div>
+
+                <div className="bg-[#121820] border border-[#243040] rounded-lg p-3.5 space-y-1">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block font-semibold">Top FTRL Feature Weights</span>
+                  <div className="text-[11px] text-[#AAB4BF] space-y-0.5 max-h-20 overflow-y-auto">
+                    {(diagnostics?.learning?.onlineLearner?.topFeatures || []).slice(0, 4).map((f: any) => (
+                      <div key={f.feature} className="flex justify-between">
+                        <span className="truncate max-w-[160px]">{f.feature}</span>
+                        <span className={f.weight >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}>{f.weight >= 0 ? '+' : ''}{f.weight}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
 

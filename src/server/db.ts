@@ -30,6 +30,7 @@ import {
 import { getSessionFromTimestamp } from './dataFeeds.js';
 import {
   createInitialOnlineLearnerState,
+  getOnlineLearnerFeatureImportance,
   getOnlineLearnerSummary,
   learnOnlineOutcome,
   normalizeOnlineLearnerState,
@@ -75,16 +76,47 @@ interface DatabaseSchema {
     history: Array<{ runAt: string; durationMs: number; status: string; summary: string }>;
   };
   onlineModel?: {
+    modelVersion?: string;
     w1: number[][];
     b1: number[];
     w2: number[];
     b2: number;
+    mW1?: number[][];
+    vW1?: number[][];
+    mb1?: number[];
+    vb1?: number[];
+    mW2?: number[];
+    vW2?: number[];
+    mb2?: number;
+    vb2?: number;
     stepCount: number;
+    adamStepCount?: number;
+    lastGradNorm?: number;
     trailingLosses: number[];
+    oosLosses?: number[];
+    oosDirectionCorrect?: number;
+    oosDirectionTotal?: number;
     linUcbA: number[][];
     linUcbB: number[];
     trainedSignalIds?: string[];
+    skippedTrainingRecords?: Array<{ signalId: string; reason: string; at: string }>;
+    duplicateBlocks?: number;
+    lastTrainedAt?: string | null;
     lastUpdated: string;
+    linUcbV2?: {
+      version: string;
+      aBuy: number[][];
+      bBuy: number[];
+      aSell: number[][];
+      bSell: number[];
+      observationsBuy: number;
+      observationsSell: number;
+      totalReward: number;
+      explorationTotal: number;
+      exploitationTotal: number;
+      trainedSignalIds: string[];
+      lastTrainedAt: string | null;
+    };
   };
   episodicMemories?: Array<{
     signalId?: string;
@@ -96,8 +128,11 @@ interface DatabaseSchema {
   }>;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'signalforge.db.json');
+const DEFAULT_DB_FILE = path.join(path.resolve(process.cwd(), 'data'), 'signalforge.db.json');
+const DB_FILE = process.env.SIGNALFORGE_DB_PATH
+  ? path.resolve(process.env.SIGNALFORGE_DB_PATH)
+  : DEFAULT_DB_FILE;
+const DATA_DIR = path.dirname(DB_FILE);
 
 const RETRYABLE_RENAME_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 const SYNC_RENAME_RETRIES = 3;
@@ -140,6 +175,8 @@ class DatabaseService {
   private saveTimeout: NodeJS.Timeout | null = null;
   private isWriting = false;
   private writeQueued = false;
+  private inFlightWrite: Promise<void> | null = null;
+  private isShuttingDown = false;
   private pendingPriority: 'none' | 'low' | 'high' = 'none';
   private lastWriteAtMs = 0;
   private static readonly LOW_PRIORITY_FLUSH_INTERVAL_MS = 60_000;
@@ -149,6 +186,10 @@ class DatabaseService {
   constructor() {
     this.ensureDataDir();
     this.state = this.loadState();
+  }
+
+  public getDbPath(): string {
+    return DB_FILE;
   }
 
   private ensureDataDir() {
@@ -594,40 +635,60 @@ class DatabaseService {
     }
   }
 
+  public async shutdownAsync(): Promise<void> {
+    this.isShuttingDown = true;
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+      this.saveTimeout = null;
+    }
+    this.pendingPriority = 'none';
+    if (this.inFlightWrite) {
+      await this.inFlightWrite;
+    }
+    this.saveStateSync();
+  }
+
   public async flushAsync(): Promise<void> {
+    if (this.isShuttingDown) return;
     if (this.saveTimeout) {
       clearTimeout(this.saveTimeout);
       this.saveTimeout = null;
     }
     if (this.isWriting) {
       this.writeQueued = true;
-      return;
+      return this.inFlightWrite ?? undefined;
     }
     this.isWriting = true;
     this.pendingPriority = 'none';
-    let tempFile = '';
-    try {
-      this.ensureDataDir();
-      const payload = JSON.stringify(this.buildPersistedState());
-      tempFile = `${DB_FILE}.${process.pid}.tmp`;
-      await fs.promises.writeFile(tempFile, payload, 'utf-8');
-      await renameAsyncWithRetry(tempFile, DB_FILE);
-      this.lastWriteAtMs = Date.now();
-    } catch (err: any) {
-      if (tempFile) {
-        try { await fs.promises.rm(tempFile, { force: true }); } catch { /* preserve the last valid DB snapshot */ }
+    const run = async () => {
+      let tempFile = '';
+      try {
+        this.ensureDataDir();
+        const payload = JSON.stringify(this.buildPersistedState());
+        tempFile = `${DB_FILE}.${process.pid}.tmp`;
+        await fs.promises.writeFile(tempFile, payload, 'utf-8');
+        await renameAsyncWithRetry(tempFile, DB_FILE);
+        this.lastWriteAtMs = Date.now();
+      } catch (err: any) {
+        if (tempFile) {
+          try { await fs.promises.rm(tempFile, { force: true }); } catch { /* preserve the last valid DB snapshot */ }
+        }
+        console.error('[DB] Async state save failed:', err?.message || err);
+      } finally {
+        this.isWriting = false;
+        this.inFlightWrite = null;
+        if (this.writeQueued && !this.isShuttingDown) {
+          this.writeQueued = false;
+          void this.flushAsync();
+        }
       }
-      console.error('[DB] Async state save failed:', err?.message || err);
-    } finally {
-      this.isWriting = false;
-      if (this.writeQueued) {
-        this.writeQueued = false;
-        void this.flushAsync();
-      }
-    }
+    };
+    this.inFlightWrite = run();
+    return this.inFlightWrite;
   }
 
   public scheduleSave(priority: 'low' | 'high' = 'low') {
+    if (this.isShuttingDown) return;
     if (priority === 'high') {
       this.pendingPriority = 'high';
       if (this.saveTimeout) {
@@ -731,12 +792,15 @@ class DatabaseService {
 
   private mergeImmutableSettledSignal(existing: ResearchSignal, incoming: ResearchSignal): ResearchSignal {
     // Once a signal is CLOSED with WIN/LOSS/SCRATCH, all settlement fields are permanently locked.
-    // Only allow attaching forensic lossAutopsy and telegramAuditSentAt metadata if not yet recorded.
+    // Only allow attaching forensic lossAutopsy, telegramAuditSentAt, and trainingAudit metadata.
     if (this.isSettledSignal(existing)) {
       return {
         ...existing,
         lossAutopsy: existing.lossAutopsy || incoming.lossAutopsy,
         telegramAuditSentAt: existing.telegramAuditSentAt || incoming.telegramAuditSentAt,
+        trainingAudit: incoming.trainingAudit
+          ? { ...(existing.trainingAudit || {}), ...incoming.trainingAudit }
+          : existing.trainingAudit,
       };
     }
     return incoming;
@@ -813,9 +877,11 @@ class DatabaseService {
       const existing = this.state.signals[idx];
       const merged = this.mergeImmutableSettledSignal(existing, signal);
       this.state.signals[idx] = merged;
-      // The CLOSED signal is the source of truth for every derived learner.
-      // Persist it synchronously before any model or strategy-ledger updates occur.
-      if (this.isSettledSignal(merged) && !this.isSettledSignal(existing)) {
+      const auditChanged =
+        Boolean(signal.trainingAudit) &&
+        JSON.stringify(existing.trainingAudit) !== JSON.stringify(merged.trainingAudit);
+      // The CLOSED signal (and any updated trainingAudit) must persist synchronously.
+      if ((this.isSettledSignal(merged) && !this.isSettledSignal(existing)) || auditChanged) {
         this.saveStateSync();
       } else {
         this.scheduleSave('high');
@@ -1329,30 +1395,63 @@ class DatabaseService {
 
     // Train the separate FTRL model only from the frozen prediction and a verified
     // filled WIN/LOSS. SCRATCH is tracked in strategy metrics but is not a class label.
-    if ((signal.outcomeResult === 'WIN' || signal.outcomeResult === 'LOSS') &&
-        !this.state.onlineLearnerProcessedSignalIds.includes(signal.id) &&
-        signal.onlineLearnerVersion === ONLINE_LEARNER_VERSION &&
-        Number.isFinite(signal.onlineLearnerPrediction) &&
-        signal.onlineLearnerPrediction! >= 0 && signal.onlineLearnerPrediction! <= 1 &&
-        Array.isArray(signal.marketFeatureVector) &&
-        signal.marketFeatureVector.length === 19 &&
-        signal.marketFeatureVector.every(Number.isFinite)) {
-      const context: OnlineLearningContext = {
-        symbol: signal.symbol,
-        direction: signal.direction,
-        ruleFamily: signal.ruleFamily,
-        marketFeatureVector: signal.marketFeatureVector,
-      };
-      const observedAt = signal.actualExitTimeUtc || signal.plannedExitTimeUtc || '';
-      if (Number.isFinite(Date.parse(observedAt))) {
-        this.state.onlineLearner = learnOnlineOutcome(
-          this.state.onlineLearner,
-          context,
-          signal.outcomeResult,
-          signal.onlineLearnerPrediction!,
-          observedAt,
-        );
-        this.state.onlineLearnerProcessedSignalIds.push(signal.id);
+    if (signal.outcomeResult === 'WIN' || signal.outcomeResult === 'LOSS') {
+      let ftrlSkipReason: string | undefined;
+      if (this.state.onlineLearnerProcessedSignalIds.includes(signal.id)) {
+        ftrlSkipReason = 'ALREADY_TRAINED';
+      } else if (
+        !Array.isArray(signal.marketFeatureVector) ||
+        signal.marketFeatureVector.length !== 19 ||
+        !signal.marketFeatureVector.every(Number.isFinite)
+      ) {
+        ftrlSkipReason = 'MISSING_FROZEN_PREDICTION_FEATURES';
+      } else if (signal.onlineLearnerVersion !== ONLINE_LEARNER_VERSION) {
+        ftrlSkipReason = 'VERSION_MISMATCH';
+      } else if (!Number.isFinite(signal.onlineLearnerPrediction) || signal.onlineLearnerPrediction! < 0 || signal.onlineLearnerPrediction! > 1) {
+        ftrlSkipReason = 'MISSING_FROZEN_PREDICTION_SCORE';
+      } else {
+        const observedAt = signal.actualExitTimeUtc || signal.plannedExitTimeUtc || '';
+        if (!Number.isFinite(Date.parse(observedAt))) {
+          ftrlSkipReason = 'INVALID_OBSERVED_AT';
+        } else {
+          const context: OnlineLearningContext = {
+            symbol: signal.symbol,
+            direction: signal.direction,
+            ruleFamily: signal.ruleFamily,
+            marketFeatureVector: signal.marketFeatureVector,
+          };
+          this.state.onlineLearner = learnOnlineOutcome(
+            this.state.onlineLearner,
+            context,
+            signal.outcomeResult,
+            signal.onlineLearnerPrediction!,
+            observedAt,
+          );
+          this.state.onlineLearnerProcessedSignalIds.push(signal.id);
+          signal.trainingAudit = {
+            ...(signal.trainingAudit || {
+              mlpTrained: false,
+              linUcbV2Trained: false,
+              ftrlTrained: false,
+              episodicRecorded: false,
+            }),
+            ftrlTrained: true,
+          };
+          this.updateSignal(signal);
+        }
+      }
+      if (ftrlSkipReason && ftrlSkipReason !== 'ALREADY_TRAINED') {
+        signal.trainingAudit = {
+          ...(signal.trainingAudit || {
+            mlpTrained: false,
+            linUcbV2Trained: false,
+            ftrlTrained: false,
+            episodicRecorded: false,
+          }),
+          ftrlTrained: false,
+          ftrlSkippedReason: ftrlSkipReason,
+        };
+        this.updateSignal(signal);
       }
     }
 
@@ -1529,6 +1628,34 @@ class DatabaseService {
     const forwardMissingUnits = forwardRows.filter(row =>
       typeof row.observedNetReturnUnits !== 'number' || !Number.isFinite(row.observedNetReturnUnits)
     ).length;
+    const summarizeSet = (subset: ResearchSignal[]) => {
+      const wl = subset.filter(s => s.outcomeResult === 'WIN' || s.outcomeResult === 'LOSS');
+      const wins = wl.filter(s => s.outcomeResult === 'WIN').length;
+      const losses = wl.length - wins;
+      const net = subset.reduce(
+        (acc, s) =>
+          acc + (typeof s.netReturnUnits === 'number' && Number.isFinite(s.netReturnUnits) ? s.netReturnUnits : 0),
+        0
+      );
+      return {
+        totalClosed: subset.length,
+        winLossCount: wl.length,
+        wins,
+        losses,
+        winRatePct: wl.length > 0 ? Number(((wins / wl.length) * 100).toFixed(2)) : null,
+        netReturnUnits: Number(net.toFixed(2)),
+      };
+    };
+
+    const olympClosed = closed.filter(s => s.payoutSource === 'BROKER_OBSERVED');
+    const legacyClosed = closed.filter(s => s.payoutSource !== 'BROKER_OBSERVED');
+    const shadowClosed = closed.filter(s => Boolean(s.shadowCandidate));
+    const shadowAccepted = shadowClosed.filter(s => s.shadowCandidate && !s.shadowCandidate.shouldAbstain);
+    const shadowAbstained = shadowClosed.filter(s => s.shadowCandidate?.shouldAbstain);
+
+    const skippedRecords = this.state.onlineModel?.skippedTrainingRecords || [];
+    const skippedReasons = countBy(skippedRecords.map(r => r.reason));
+
     return {
       generatedAt: new Date().toISOString(),
       ledger: {
@@ -1552,6 +1679,12 @@ class DatabaseService {
         closedSettled: closed.length,
         recoverableClosedFilled: recoverable.length,
       },
+      provenanceBreakdown: {
+        legacy: summarizeSet(legacyClosed),
+        olympVerified: summarizeSet(olympClosed),
+        shadowAccepted: summarizeSet(shadowAccepted),
+        shadowAbstained: summarizeSet(shadowAbstained),
+      },
       learning: {
         processedOutcomeIds: outcomeIds.size,
         forwardObservationIds: forwardIds.size,
@@ -1561,6 +1694,37 @@ class DatabaseService {
         onlineLearner: {
           ...getOnlineLearnerSummary(this.state.onlineLearner),
           processedSignalCount: this.state.onlineLearnerProcessedSignalIds.length,
+          topFeatures: getOnlineLearnerFeatureImportance(this.state.onlineLearner, 12),
+        },
+        onlinePolicyPersistence: {
+          modelVersion: this.state.onlineModel?.modelVersion || 'legacy-unversioned',
+          stepCount: this.state.onlineModel?.stepCount || 0,
+          adamStepCount: this.state.onlineModel?.adamStepCount ?? null,
+          trainedSignalsCount: (this.state.onlineModel?.trainedSignalIds || []).length,
+          skippedCount: skippedRecords.length,
+          skippedReasons,
+          duplicateBlocks: this.state.onlineModel?.duplicateBlocks || 0,
+          lastGradNorm: this.state.onlineModel?.lastGradNorm ?? null,
+          lastTrainedAt: this.state.onlineModel?.lastTrainedAt ?? null,
+          linUcbV2: this.state.onlineModel?.linUcbV2
+            ? {
+                version: this.state.onlineModel.linUcbV2.version,
+                observationsBuy: this.state.onlineModel.linUcbV2.observationsBuy,
+                observationsSell: this.state.onlineModel.linUcbV2.observationsSell,
+                lastTrainedAt: this.state.onlineModel.linUcbV2.lastTrainedAt,
+                trainedSignalsCount: this.state.onlineModel.linUcbV2.trainedSignalIds?.length || 0,
+              }
+            : null,
+        },
+        signalAuditCoverage: {
+          mlpTrainedSignals: closed.filter(s => s.trainingAudit?.mlpTrained).length,
+          mlpSkippedSignals: closed.filter(s => Boolean(s.trainingAudit?.mlpSkippedReason)).length,
+          ftrlTrainedSignals: closed.filter(s => s.trainingAudit?.ftrlTrained).length,
+          ftrlSkippedSignals: closed.filter(s => Boolean(s.trainingAudit?.ftrlSkippedReason)).length,
+          episodicTrainedSignals: closed.filter(s => s.trainingAudit?.episodicRecorded).length,
+          withFrozenFeatures: closed.filter(
+            s => Array.isArray(s.marketFeatureVector) && s.marketFeatureVector.length === 19
+          ).length,
         },
       },
     };

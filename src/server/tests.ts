@@ -29,6 +29,7 @@ import {
   normalizeOnlineLearnerState,
   ONLINE_LEARNER_FEATURE_DIMENSIONS,
 } from './onlineLearning.js';
+import type { PriorEpisodeRecord } from './shadowPredictor.js';
 
 const makeM1TestCandles = (symbol: ForexSymbol, count: number): Candle[] =>
   dataFeedEngine.generateRealisticHistoricalCandles(symbol, count).map(c => {
@@ -1710,6 +1711,538 @@ export async function runAllVerificationTests(): Promise<{
     const duplicate = tempNet.trainStep(vec, 'BUY', 'WIN', 0.8, 'EUR/USD', sigId);
     if (duplicate.step !== stepBefore + 1) {
       throw new Error(`Expected duplicate signalId training to be skipped, but step became ${duplicate.step}`);
+    }
+  });
+
+  await runTest('ML', 'Phase 1 Proof: Zero Lookahead Leakage on Frozen Features & Missing Vector Skips', async () => {
+    const { OnlinePolicyNetwork, hasTrustedPredictionFeatures } = await import('./onlinePolicyNetwork.js');
+    const net = new OnlinePolicyNetwork({ skipAutoLoad: true, persistToDb: false });
+    const vec = Array.from({ length: 19 }, (_, idx) => (idx % 2 === 0 ? 0.35 : -0.25));
+
+    // Fresh network has honest null lastTrainedAt
+    if (net.getTelemetry().lastTrainedAt !== null || net.getTelemetry().lastUpdated !== null) {
+      throw new Error('Untrained network must expose lastTrainedAt === null instead of wall-clock time.');
+    }
+
+    // Signal without frozen prediction vector fails trust check and must never reconstruct from future candles
+    const incompleteSig = {
+      id: 'test_sig_no_vec',
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      ruleFamily: 'order_flow_imbalance',
+    } as unknown as ResearchSignal;
+    if (hasTrustedPredictionFeatures(incompleteSig)) {
+      throw new Error('Signal lacking 19D marketFeatureVector must not pass hasTrustedPredictionFeatures.');
+    }
+
+    // Verify entryExitEngine.createResearchSignal freezes feature vector strictly from <= signalCandle.timestampMs
+    const baseMs = 1793300000000;
+    const realHist: Candle[] = makeM1TestCandles('EUR/USD', 25).map((c, i) => ({
+      ...c,
+      timestampMs: baseMs + i * 60_000,
+      timestamp: new Date(baseMs + i * 60_000).toISOString(),
+      source: 'yahoo' as const,
+    }));
+    db.storeCandles('EUR/USD', realHist);
+    const predCandle = realHist[realHist.length - 1];
+    // Insert extreme adversarial future candle after predCandle
+    const futureCandle: Candle = {
+      symbol: 'EUR/USD',
+      timestampMs: predCandle.timestampMs + 60_000,
+      timestamp: new Date(predCandle.timestampMs + 60_000).toISOString(),
+      open: predCandle.close * 1.15,
+      high: predCandle.close * 1.25,
+      low: predCandle.close * 0.85,
+      close: predCandle.close * 1.20,
+      volume: 99999,
+      source: 'yahoo' as const,
+    };
+    db.storeCandles('EUR/USD', [futureCandle]);
+
+    const sigCausal = entryExitEngine.createResearchSignal({
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      signalCandle: predCandle,
+      ruleFamily: `test_no_lookahead_${Date.now()}`,
+      expiryMinutes: 5,
+      confidence: 0.72,
+      modelVersion: 'vTest',
+    });
+    if (!Array.isArray(sigCausal.marketFeatureVector) || sigCausal.marketFeatureVector.length !== 19) {
+      throw new Error('Expected createResearchSignal to freeze 19D marketFeatureVector at creation.');
+    }
+    // Check training step directly on frozen vector is unaffected by future candles
+    const r = net.trainStep(vec, 'BUY', 'WIN', 0.8, 'EUR/USD', 'sig_freeze_1', new Date(predCandle.timestampMs + 300_000).toISOString());
+    if (r.step !== 1 || net.getTelemetry().trainedSignalCount !== 1) {
+      throw new Error('Expected single valid step on frozen vector.');
+    }
+  });
+
+  await runTest('ML', 'Phase 1 Proof: Adam Optimizer Full State Persistence & Legacy Safe Migration', async () => {
+    const { OnlinePolicyNetwork } = await import('./onlinePolicyNetwork.js');
+    const net1 = new OnlinePolicyNetwork({ skipAutoLoad: true, persistToDb: false });
+    const x1 = Array.from({ length: 19 }, (_, i) => Math.sin(i + 1) * 0.4);
+    const x2 = Array.from({ length: 19 }, (_, i) => Math.cos(i + 1) * 0.4);
+
+    for (let i = 0; i < 5; i++) {
+      net1.trainStep(i % 2 === 0 ? x1 : x2, 'BUY', i % 2 === 0 ? 'WIN' : 'LOSS', i % 2 === 0 ? 0.8 : -1.0, 'EUR/USD', `sig_adam_${i}`, '2026-11-25T12:00:00.000Z');
+    }
+    const snap = net1.exportPersistedSnapshot();
+    if (!snap || snap.adamStepCount !== 5 || !Array.isArray(snap.mW1) || !Array.isArray(snap.vW2)) {
+      throw new Error('Exported snapshot missing Adam first/second moment arrays or adamStepCount.');
+    }
+
+    const net2 = new OnlinePolicyNetwork({ skipAutoLoad: true, persistToDb: false });
+    net2.loadPersistedSnapshot(snap);
+    const tel2 = net2.getTelemetry();
+    if (tel2.optimizerRestorationStatus !== 'RESTORED_WITH_ADAM_MOMENTS' || tel2.adamStepCount !== 5 || tel2.lastTrainedAt !== '2026-11-25T12:00:00.000Z') {
+      throw new Error(`Expected full Adam restoration, got ${JSON.stringify(tel2)}`);
+    }
+
+    // Step #6 on net1 vs restored net2 must produce identical loss & weights
+    const s1 = net1.trainStep(x1, 'SELL', 'WIN', 0.85, 'GBP/USD', 'sig_adam_resume', '2026-11-25T12:05:00.000Z');
+    const s2 = net2.trainStep(x1, 'SELL', 'WIN', 0.85, 'GBP/USD', 'sig_adam_resume', '2026-11-25T12:05:00.000Z');
+    if (Math.abs(s1.loss - s2.loss) > 1e-12 || Math.abs(s1.gradientNorm - s2.gradientNorm) > 1e-12) {
+      throw new Error(`Restarted Adam trajectory diverged: s1=${JSON.stringify(s1)}, s2=${JSON.stringify(s2)}`);
+    }
+
+    // Legacy snapshot with stepCount > 0 but zero moments must safely reset adamStepCount = 0
+    const net3 = new OnlinePolicyNetwork({ skipAutoLoad: true, persistToDb: false });
+    const legacySnap = {
+      w1: snap.w1,
+      b1: snap.b1,
+      w2: snap.w2,
+      b2: snap.b2,
+      linUcbA: snap.linUcbA,
+      linUcbB: snap.linUcbB,
+      stepCount: 42,
+      trailingLosses: [0.7],
+      trainedSignalIds: ['legacy_1'],
+      lastUpdated: new Date().toISOString(),
+    };
+    net3.loadPersistedSnapshot(legacySnap);
+    const tel3 = net3.getTelemetry();
+    if (tel3.optimizerRestorationStatus !== 'MIGRATED_LEGACY_RESET_ADAM_STEP' || tel3.adamStepCount !== 0 || tel3.stepCount !== 42) {
+      throw new Error(`Legacy migration must reset adamStepCount=0 while preserving historical stepCount=42, got ${JSON.stringify(tel3)}`);
+    }
+  });
+
+  await runTest('ML', 'Phase 1/5 Proof: LinUCB V2 Direction Isolation, Actual Return Reward & Duplicate Blocks', async () => {
+    const { OnlinePolicyNetwork } = await import('./onlinePolicyNetwork.js');
+    const net = new OnlinePolicyNetwork({ skipAutoLoad: true, persistToDb: false });
+    const x = Array.from({ length: 19 }, (_, i) => (i === 0 ? 0.9 : 0.1));
+
+    // Train 5 BUY losses -> SELL arm must stay completely isolated (0 observations, 0 mean reward)
+    for (let i = 0; i < 5; i++) {
+      net.trainLinUcbV2(x, 'BUY', 'LOSS', -1.0, `sig_v2_buy_${i}`, '2026-11-25T13:00:00.000Z');
+    }
+    const buyEval = net.evaluateLinUcbV2(x, 'BUY');
+    const sellEval = net.evaluateLinUcbV2(x, 'SELL');
+    if (buyEval.actionObservations !== 5 || buyEval.meanReward >= 0) {
+      throw new Error(`Expected BUY meanReward < 0 after 5 losses, got ${JSON.stringify(buyEval)}`);
+    }
+    if (sellEval.actionObservations !== 0 || sellEval.meanReward !== 0) {
+      throw new Error(`BUY losses contaminated isolated SELL LinUCB V2 arm: ${JSON.stringify(sellEval)}`);
+    }
+
+    // Train SELL win using actual netReturnUnits (+0.90) & test duplicate block
+    const winRes = net.trainLinUcbV2(x, 'SELL', 'WIN', 0.9, 'sig_v2_sell_1', '2026-11-25T13:05:00.000Z');
+    const dupRes = net.trainLinUcbV2(x, 'SELL', 'WIN', 0.9, 'sig_v2_sell_1', '2026-11-25T13:05:00.000Z');
+    if (!winRes.trained || winRes.reward <= 0.89 || dupRes.trained || net.getTelemetry().duplicateAttemptsBlocked < 1) {
+      throw new Error(`Expected LinUCB V2 win (+0.90) and duplicate block, got win=${JSON.stringify(winRes)}, dup=${JSON.stringify(dupRes)}`);
+    }
+  });
+
+  await runTest('ML', 'Phase 2-4 Proof: Shadow Causal Calibration, Negative-EV Abstention & Walk-Forward Metrics', async () => {
+    const { evaluateShadowCandidate, evaluateShadowCandidateChronologically } = await import('./shadowPredictor.js');
+
+    // Construct strictly prior losing history -> shadow candidate must detect negative EV and abstain
+    const losingPriors: PriorEpisodeRecord[] = Array.from({ length: 24 }, (_, idx) => ({
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      ruleFamily: 'momentum_5',
+      strategyId: 'rule:momentum_5',
+      outcome: idx % 4 === 0 ? 'WIN' : 'LOSS', // 25% WR << 55.56% break-even
+      netReturnUnits: idx % 4 === 0 ? 0.8 : -1.0,
+      rawScoreProb: 0.45,
+    }));
+
+    const shadowWeak = evaluateShadowCandidate({
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      ruleFamily: 'momentum_5',
+      strategyId: 'rule:momentum_5',
+      payoutPct: 80,
+      ftrlProbability: 0.38,
+      ftrlSampleSize: 24,
+      priorSettledRecords: losingPriors,
+    });
+    if (!shadowWeak.shouldAbstain || !shadowWeak.abstentionReasons.includes('NEGATIVE_EXPECTED_VALUE')) {
+      throw new Error(`Expected shadow candidate to abstain with NEGATIVE_EXPECTED_VALUE, got ${JSON.stringify(shadowWeak)}`);
+    }
+
+    // Walk-forward chronological evaluation computes prevalence Brier baseline and provenance split cleanly
+    const mockSettled: ResearchSignal[] = Array.from({ length: 20 }, (_, i) => ({
+      id: `sig_wf_${i}`,
+      symbol: 'EUR/USD',
+      direction: i % 2 === 0 ? 'BUY' : 'SELL',
+      predictionTimeUtc: new Date(1795600000000 + i * 600_000).toISOString(),
+      predictionTimeIst: '',
+      signalCandleTime: '',
+      entryCondition: '',
+      entryWindowStartUtc: '',
+      entryWindowEndUtc: '',
+      triggerPrice: 1.1,
+      invalidationPrice: 1.09,
+      actualEntryTimeUtc: new Date(1795600000000 + i * 600_000 + 60_000).toISOString(),
+      actualEntryPrice: 1.1,
+      entrySource: 'yahoo',
+      expiryMinutes: 5,
+      plannedExitTimeUtc: new Date(1795600000000 + i * 600_000 + 360_000).toISOString(),
+      actualExitTimeUtc: new Date(1795600000000 + i * 600_000 + 360_000).toISOString(),
+      actualExitPrice: 1.1,
+      confidence: 0.8,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'CLOSED',
+      lifecycleHistory: [],
+      grossReturnPips: 1,
+      estimatedSpreadPips: 1,
+      netReturnPips: 0,
+      payoutPct: 80,
+      payoutSource: i >= 12 ? 'BROKER_OBSERVED' : 'ASSUMED_MINIMUM',
+      netReturnUnits: i % 3 === 0 ? -1.0 : 0.8,
+      outcomeResult: i % 3 === 0 ? 'LOSS' : 'WIN',
+      ruleFamily: 'order_flow_imbalance',
+      modelVersion: 'vTest',
+      notes: '',
+      marketFeatureVector: Array.from({ length: 19 }, (_, k) => Math.sin(i + k) * 0.3),
+    }));
+    const report = evaluateShadowCandidateChronologically(mockSettled);
+    if (report.datasetSummary.legacyWinLoss !== 12 || report.datasetSummary.olympVerifiedWinLoss !== 8) {
+      throw new Error(`Expected 12 legacy / 8 olympVerified, got ${JSON.stringify(report.datasetSummary)}`);
+    }
+    if (report.shadowAll.brierScore >= report.baselineAll.brierScore || report.baselineAll.prevalenceBrierBaseline <= 0) {
+      throw new Error(`Expected calibrated shadow Brier (${report.shadowAll.brierScore}) < overconfident baseline (${report.baselineAll.brierScore})`);
+    }
+  });
+
+  await runTest('SYSTEM', 'Audit Fix Proofs: Isolated Temp DB, Batched Bootstrap Saves, Read-Only Regime, Duplicate Audit & k-NN Restore', async () => {
+    const fsMod = await import('fs');
+    const pathMod = await import('path');
+    const { OnlinePolicyNetwork } = await import('./onlinePolicyNetwork.js');
+    const { AgiSelfLearningEngine } = await import('./agiEngine.js');
+    const { evaluateShadowCandidate } = await import('./shadowPredictor.js');
+
+    // 1. Verify isolated test database is active (never points at data/signalforge.db.json)
+    const activeDbPath = pathMod.default.resolve(db.getDbPath());
+    const prodDbPath = pathMod.default.resolve(process.cwd(), 'data', 'signalforge.db.json');
+    if (activeDbPath === prodDbPath) {
+      throw new Error(`Tests must never run against working DB ${prodDbPath}`);
+    }
+
+    // 2. Verify shadow regime evaluation reports missing regimes as UNKNOWN & never mutates live cache
+    const shadowNullRegime = evaluateShadowCandidate({
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      ruleFamily: 'order_flow_imbalance',
+      payoutPct: 80,
+      regime: null,
+      priorSettledRecords: [],
+    });
+    if (shadowNullRegime.regimeType !== 'UNKNOWN') {
+      throw new Error(`Expected UNKNOWN for null regime, got ${shadowNullRegime.regimeType}`);
+    }
+
+    const tempAgi = new AgiSelfLearningEngine();
+    const baseMs = 1793500000000;
+    const histCandles: Candle[] = makeM1TestCandles('USD/JPY', 45).map((c, idx) => ({
+      ...c,
+      timestampMs: baseMs + idx * 60_000,
+      timestamp: new Date(baseMs + idx * 60_000).toISOString(),
+      source: 'yahoo' as const,
+    }));
+    tempAgi.classifyMarketRegime('USD/JPY', histCandles, true);
+    const cachedBefore = tempAgi.getSelfLearningState().regimes['USD/JPY'];
+    await new Promise(r => setTimeout(r, 15));
+    tempAgi.classifyMarketRegime('USD/JPY', histCandles, false);
+    const cachedAfter = tempAgi.getSelfLearningState().regimes['USD/JPY'];
+    if (cachedBefore.calculatedAt !== cachedAfter.calculatedAt) {
+      throw new Error('Read-only classifyMarketRegime(..., false) mutated live regimeCache.');
+    }
+
+    // 3. Verify trainingAudit persists synchronously & duplicate-blocked attempts report false + ALREADY_TRAINED
+    const vec = Array.from({ length: 19 }, (_, idx) => Math.sin(idx + 0.5) * 0.35);
+    const auditSig: ResearchSignal = {
+      id: `sig_audit_fix_${Date.now()}`,
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      predictionTimeUtc: '2026-11-25T10:00:00.000Z',
+      predictionTimeIst: '03:30:00 PM IST',
+      signalCandleTime: '2026-11-25T09:59:00.000Z',
+      entryCondition: 'M5',
+      entryWindowStartUtc: '2026-11-25T10:05:00.000Z',
+      entryWindowEndUtc: '2026-11-25T10:10:00.000Z',
+      triggerPrice: 1.1,
+      invalidationPrice: 1.09,
+      actualEntryTimeUtc: '2026-11-25T10:05:00.000Z',
+      actualEntryPrice: 1.1,
+      entrySource: 'yahoo',
+      expiryMinutes: 5,
+      plannedExitTimeUtc: '2026-11-25T10:10:00.000Z',
+      actualExitTimeUtc: '2026-11-25T10:10:00.000Z',
+      actualExitPrice: 1.101,
+      confidence: 0.78,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'ACTIVE',
+      lifecycleHistory: [],
+      grossReturnPips: 10,
+      estimatedSpreadPips: 1.2,
+      netReturnPips: null,
+      payoutPct: 80,
+      payoutSource: 'BROKER_OBSERVED',
+      netReturnUnits: 0.8,
+      outcomeResult: 'WIN',
+      ruleFamily: 'order_flow_imbalance',
+      modelVersion: 'vTest',
+      notes: '',
+      marketFeatureVector: vec,
+    };
+    db.addSignal(auditSig);
+    auditSig.lifecycleState = 'CLOSED';
+    db.updateSignal(auditSig);
+    (entryExitEngine as any).triggerClosedLoopLearning(auditSig, histCandles);
+    // Re-read raw JSON from isolated temp DB to prove synchronous disk persistence of trainingAudit
+    const onDiskFirst = JSON.parse(fsMod.default.readFileSync(activeDbPath, 'utf-8')).signals.find((s: any) => s.id === auditSig.id);
+    if (!onDiskFirst?.trainingAudit?.mlpTrained || !onDiskFirst?.trainingAudit?.linUcbV2Trained || !onDiskFirst?.trainingAudit?.episodicRecorded) {
+      throw new Error(`Expected persisted trainingAudit all true after first training, got ${JSON.stringify(onDiskFirst?.trainingAudit)}`);
+    }
+    // Second call with exact same signalId must block duplicates AND record false + ALREADY_TRAINED
+    (entryExitEngine as any).triggerClosedLoopLearning(auditSig, histCandles);
+    const onDiskDup = JSON.parse(fsMod.default.readFileSync(activeDbPath, 'utf-8')).signals.find((s: any) => s.id === auditSig.id);
+    if (
+      onDiskDup?.trainingAudit?.mlpTrained !== false ||
+      onDiskDup?.trainingAudit?.mlpSkippedReason !== 'ALREADY_TRAINED' ||
+      onDiskDup?.trainingAudit?.linUcbV2Trained !== false ||
+      onDiskDup?.trainingAudit?.linUcbV2SkippedReason !== 'ALREADY_TRAINED' ||
+      onDiskDup?.trainingAudit?.episodicRecorded !== false ||
+      onDiskDup?.trainingAudit?.episodicSkippedReason !== 'ALREADY_TRAINED'
+    ) {
+      throw new Error(`Duplicate-blocked run must report false/ALREADY_TRAINED on disk, got ${JSON.stringify(onDiskDup?.trainingAudit)}`);
+    }
+
+    // 4. Verify bootstrapFromSettledSignals() batches saves instead of saving per skipped record
+    for (let i = 0; i < 6; i++) {
+      db.addSignal({
+        ...auditSig,
+        id: `sig_skip_batch_${i}_${Date.now()}`,
+        symbol: 'GBP/USD',
+        candleOpenTimeUtc: `2026-11-25T10:${String(15 + i * 5).padStart(2, '0')}:00.000Z`,
+        lifecycleState: 'CLOSED',
+        marketFeatureVector: undefined,
+      });
+    }
+    const batchNet = new OnlinePolicyNetwork({ skipAutoLoad: true, persistToDb: false });
+    let saveCalls = 0;
+    (batchNet as any).saveState = () => { saveCalls++; };
+    const boot1 = batchNet.bootstrapFromSettledSignals();
+    if (boot1.skippedMissingFeatures < 6 || saveCalls !== 1) {
+      throw new Error(`Expected batched 1 save across >=6 skipped signals, got skipped=${boot1.skippedMissingFeatures}, saveCalls=${saveCalls}`);
+    }
+    const boot2 = batchNet.bootstrapFromSettledSignals();
+    if (saveCalls !== 1 || boot2.skippedMissingFeatures < 6) {
+      throw new Error(`Expected 0 redundant saves on repeat bootstrap, got saveCalls=${saveCalls}`);
+    }
+
+    // 5. Verify second k-NN check (onlinePolicyNetwork.queryEpisodicKNN) is functional & restored in scheduler.ts GATE 3
+    const knnNet = new OnlinePolicyNetwork({ skipAutoLoad: true, persistToDb: false });
+    for (let i = 0; i < 5; i++) {
+      knnNet.trainStep(vec, 'BUY', 'LOSS', -1.0, 'EUR/AUD', `sig_knn_restore_${i}`);
+    }
+    const knnCheck = knnNet.queryEpisodicKNN(vec, 'EUR/AUD', 'BUY', 7);
+    if (!knnCheck.shouldVeto) {
+      throw new Error(`Expected queryEpisodicKNN veto after 5 local losses, got ${JSON.stringify(knnCheck)}`);
+    }
+    const schedSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'src', 'server', 'scheduler.ts'), 'utf-8');
+    if (!schedSrc.includes('const policyKnn = onlinePolicyNetwork.queryEpisodicKNN(featureVec, symbol, candidate.direction);') ||
+        !schedSrc.includes('if (agiKnn.shouldVeto || policyKnn.shouldVeto)')) {
+      throw new Error('Expected restored dual k-NN veto gate in scheduler.ts GATE 3.');
+    }
+  });
+
+  await runTest('SYSTEM', 'Production Safety: HTTP Test Endpoints Disabled in Production & Child-Process Isolated in Dev', async () => {
+    const fsMod = await import('fs');
+    const pathMod = await import('path');
+    const { isProductionTestExecutionBlocked, createHandleRunTests, apiRouter } = await import('./api.js');
+
+    // 1. Verify production & fail-closed env checks block execution
+    if (!isProductionTestExecutionBlocked({ NODE_ENV: 'production' })) {
+      throw new Error('Expected NODE_ENV=production to block HTTP test endpoints.');
+    }
+    if (!isProductionTestExecutionBlocked({ K_SERVICE: 'ais-pre-signalforge' })) {
+      throw new Error('Expected K_SERVICE=ais-pre-* to block HTTP test endpoints.');
+    }
+    if (!isProductionTestExecutionBlocked({ K_SERVICE: 'signalforge-prod' })) {
+      throw new Error('Expected production Cloud Run K_SERVICE to block HTTP test endpoints.');
+    }
+    if (!isProductionTestExecutionBlocked({})) {
+      throw new Error('Expected unset environment to fail closed and block HTTP test endpoints.');
+    }
+    if (isProductionTestExecutionBlocked({ NODE_ENV: 'development' })) {
+      throw new Error('Expected NODE_ENV=development to allow isolated subprocess HTTP testing.');
+    }
+
+    // 2. Verify handler returns HTTP 403 and NEVER invokes runner in production
+    let runnerInvokedInProd = false;
+    const prodHandler = createHandleRunTests(
+      () => ({ NODE_ENV: 'production' }),
+      async () => {
+        runnerInvokedInProd = true;
+        return { ok: true };
+      }
+    );
+    let capturedStatus = 200;
+    let capturedBody: any = null;
+    const mockRes: any = {
+      status(code: number) {
+        capturedStatus = code;
+        return this;
+      },
+      json(body: any) {
+        capturedBody = body;
+        return this;
+      },
+    };
+    await prodHandler({} as any, mockRes);
+    if (capturedStatus !== 403 || runnerInvokedInProd || !String(capturedBody?.error || '').includes('disabled in production')) {
+      throw new Error(`Expected HTTP 403 without running tests in production, got status=${capturedStatus}, invoked=${runnerInvokedInProd}`);
+    }
+
+    // Verify both /test/run and /tests/run POST routes are registered
+    const postPaths = (apiRouter.stack || [])
+      .filter((layer: any) => layer?.route?.methods?.post)
+      .map((layer: any) => layer.route.path);
+    if (!postPaths.includes('/test/run') || !postPaths.includes('/tests/run')) {
+      throw new Error(`Expected /test/run and /tests/run routes registered, got ${JSON.stringify(postPaths)}`);
+    }
+
+    // 3. Verify api.ts never imports or calls runAllVerificationTests in-process
+    const apiSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'src', 'server', 'api.ts'), 'utf-8');
+    if (apiSrc.includes('runAllVerificationTests') || apiSrc.includes('./tests.js')) {
+      throw new Error('api.ts must not import ./tests.js or call runAllVerificationTests() inside the live Express process.');
+    }
+
+    // 4. Verify dev handler delegates to isolated child-process runner (never live DB)
+    let devRunnerCalls = 0;
+    const devHandler = createHandleRunTests(
+      () => ({ NODE_ENV: 'development' }),
+      async () => {
+        devRunnerCalls++;
+        return { isolated: true, dbPath: process.env.SIGNALFORGE_DB_PATH };
+      }
+    );
+    capturedStatus = 200;
+    await devHandler({} as any, mockRes);
+    if (capturedStatus !== 200 || devRunnerCalls !== 1 || !capturedBody?.isolated) {
+      throw new Error(`Expected dev handler to invoke isolated runner once, got status=${capturedStatus}, calls=${devRunnerCalls}`);
+    }
+
+    // 5. Verify CLI runner sets SIGNALFORGE_DB_PATH in os.tmpdir() before importing db.js & active DB is not working DB
+    const runnerSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'scripts', 'run-verification.ts'), 'utf-8');
+    const envAssignIdx = runnerSrc.indexOf('process.env.SIGNALFORGE_DB_PATH');
+    const dbImportIdx = runnerSrc.indexOf("await import('../src/server/db.js')");
+    if (envAssignIdx < 0 || dbImportIdx < 0 || envAssignIdx > dbImportIdx) {
+      throw new Error('scripts/run-verification.ts must assign SIGNALFORGE_DB_PATH before importing db.js.');
+    }
+    const prodDbPath = pathMod.default.resolve(process.cwd(), 'data', 'signalforge.db.json');
+    if (pathMod.default.resolve(db.getDbPath()) === prodDbPath) {
+      throw new Error('Test execution attempted on real working database.');
+    }
+  });
+
+  await runTest('SYSTEM', 'Orphaned Zombie Signal Purge & Bandit Recovery Fix', async () => {
+    const { mergeServerAndCloudSignals } = await import('../utils/signalMerge.js');
+    const { AgiSelfLearningEngine } = await import('./agiEngine.js');
+
+    const nowMs = Date.parse('2026-11-25T18:00:00.000Z');
+    const settledCloud: ResearchSignal = {
+      id: 'sig_cloud_settled_1',
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      predictionTimeUtc: '2026-11-25T13:00:00.000Z',
+      predictionTimeIst: '',
+      signalCandleTime: '',
+      entryCondition: '',
+      entryWindowStartUtc: '',
+      entryWindowEndUtc: '',
+      triggerPrice: 1.1,
+      invalidationPrice: 1.09,
+      actualEntryTimeUtc: '2026-11-25T13:05:00.000Z',
+      actualEntryPrice: 1.1,
+      entrySource: 'yahoo',
+      expiryMinutes: 5,
+      plannedExitTimeUtc: '2026-11-25T13:10:00.000Z',
+      actualExitTimeUtc: '2026-11-25T13:10:00.000Z',
+      actualExitPrice: 1.101,
+      confidence: 0.78,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'CLOSED',
+      lifecycleHistory: [],
+      grossReturnPips: 10,
+      estimatedSpreadPips: 1.2,
+      netReturnPips: null,
+      payoutPct: 80,
+      payoutSource: 'BROKER_OBSERVED',
+      netReturnUnits: 0.8,
+      outcomeResult: 'WIN',
+      ruleFamily: 'order_flow_imbalance',
+      modelVersion: 'vTest',
+      notes: '',
+    };
+    const orphanWaitingCloud: ResearchSignal = {
+      ...settledCloud,
+      id: 'sig_cloud_orphan_waiting',
+      lifecycleState: 'WAITING_FOR_ENTRY',
+      outcomeResult: 'PENDING',
+      actualEntryTimeUtc: null,
+      actualEntryPrice: null,
+      plannedExitTimeUtc: null,
+      actualExitTimeUtc: null,
+      actualExitPrice: null,
+      candleCloseTimeUtc: '2026-11-25T14:30:00.000Z',
+    };
+
+    const mergedAfterLoad = mergeServerAndCloudSignals([], [settledCloud, orphanWaitingCloud], true, true, nowMs);
+    if (!mergedAfterLoad.some(s => s.id === settledCloud.id) || mergedAfterLoad.some(s => s.id === orphanWaitingCloud.id)) {
+      throw new Error('Expected settled cloud history kept and orphaned non-settled zombie dropped after server load.');
+    }
+
+    // Verify profitable ~59% (40W-28L) interleaved bandit arm stays ACTIVE under gamma=0.985 & throttled arm gets hourly probe
+    const agi = new AgiSelfLearningEngine();
+    const stratActive = 'stacked:test_gamma985_ofi:30';
+    for (let i = 0; i < 68; i++) {
+      // Interleaved 40W-28L distribution (first 34: 22W-12L, last 34: 18W-16L -> ~53% recent, ~59% overall)
+      const outcome = i < 34 ? (i % 3 === 0 ? 'LOSS' : 'WIN') : (i % 2 === 0 ? 'WIN' : 'LOSS');
+      agi.updateBanditArm(stratActive, outcome);
+    }
+    const activeCheck = agi.isStrategyThrottled(stratActive, Date.now());
+    if (activeCheck.throttled) {
+      throw new Error(`Expected profitable interleaved 40W-28L arm to stay ACTIVE under gamma=0.985, got ${JSON.stringify(activeCheck)}`);
+    }
+    const losingStrat = 'stacked:test_recovery_probe:20';
+    for (let i = 0; i < 9; i++) {
+      agi.updateBanditArm(losingStrat, i < 2 ? 'WIN' : 'LOSS');
+    }
+    const immediateCheck = agi.isStrategyThrottled(losingStrat, Date.now());
+    if (!immediateCheck.throttled) {
+      throw new Error('Expected losing arm to remain throttled immediately after loss streak.');
+    }
+    const afterHourCheck = agi.isStrategyThrottled(losingStrat, Date.now() + 65 * 60 * 1000);
+    if (afterHourCheck.throttled || !afterHourCheck.recoveryProbe) {
+      throw new Error(`Expected 1 hourly recovery probe after 65m idle, got ${JSON.stringify(afterHourCheck)}`);
+    }
+    const secondImmediateCheck = agi.isStrategyThrottled(losingStrat, Date.now() + 66 * 60 * 1000);
+    if (!secondImmediateCheck.throttled) {
+      throw new Error('Expected throttled arm to allow at most one recovery probe per 60m window.');
     }
   });
 

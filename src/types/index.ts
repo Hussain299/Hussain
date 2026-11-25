@@ -161,6 +161,36 @@ export interface BrokerEligibilitySnapshot {
   verifiedAtUtc: string;
 }
 
+export interface ShadowCandidateEvaluation {
+  modelVersion: string;
+  rawProbability: number;
+  calibratedProbability: number;
+  lowerConfidenceBound: number;
+  breakEvenProbability: number;
+  payoutPctUsed: number;
+  expectedValueUnits?: number;
+  shouldAbstain: boolean;
+  abstentionReasons: string[];
+  linUcbV2Score: number;
+  ftrlProbability: number;
+  mlpDirectionalProbability: number;
+  regimeType: 'TRENDING' | 'MEAN_REVERTING' | 'RANDOM_WALK_CHOP' | 'UNKNOWN';
+  modelDisagreement: number;
+  calibrationSampleSize: number;
+}
+
+export interface SignalTrainingAudit {
+  mlpTrained: boolean;
+  mlpSkippedReason?: string;
+  linUcbV2Trained: boolean;
+  linUcbV2SkippedReason?: string;
+  ftrlTrained: boolean;
+  ftrlSkippedReason?: string;
+  episodicRecorded: boolean;
+  episodicSkippedReason?: string;
+  trainedAtUtc?: string;
+}
+
 export interface ResearchSignal {
   id: string;
   symbol: ForexSymbol;
@@ -241,6 +271,12 @@ export interface ResearchSignal {
   telegramAuditSentAt?: string;
   /** Auditable Olymp Trade eligibility snapshot verified at signal creation time (absent on legacy pre-filter signals). */
   brokerEligibility?: BrokerEligibilitySnapshot;
+  /** Market regime observed strictly at prediction time. */
+  predictionMarketRegime?: 'TRENDING' | 'MEAN_REVERTING' | 'RANDOM_WALK_CHOP' | 'UNKNOWN';
+  /** Frozen shadow candidate evaluation at signal creation (never alters live selection until promoted). */
+  shadowCandidate?: ShadowCandidateEvaluation;
+  /** Durable per-component training & skip audit for this settled signal. */
+  trainingAudit?: SignalTrainingAudit;
 }
 
 export interface LossAutopsy {
@@ -589,6 +625,13 @@ export interface AgiSelfLearningState {
   adaptiveThresholdDelta: number;
   activeImmuneAntidotesCount: number;
   lastReinforcementAt: string;
+  episodicStats?: {
+    retrievalsTotal: number;
+    sufficientHistoryCount: number;
+    skippedInsufficientHistoryCount: number;
+    vetoCount: number;
+    lastVetoReason?: string | null;
+  };
 }
 
 // -------------------------------------------------------------

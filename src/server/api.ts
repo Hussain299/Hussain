@@ -5,6 +5,10 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { execFile } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { FOREX_PAIRS, ForexSymbol, RuleFamily } from '../types/index.js';
 import { dataFeedEngine } from './dataFeeds.js';
 import { db } from './db.js';
@@ -12,13 +16,13 @@ import { summarizeSignalAccounting } from '../utils/tradeAccounting.js';
 import { entryExitEngine } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
 import { autonomousScheduler } from './scheduler.js';
-import { runAllVerificationTests } from './tests.js';
 import { historicalDataStore } from './historicalData.js';
 import { agiSelfLearningEngine } from './agiEngine.js';
 import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
 import { behaviouralEngine } from './behaviouralEngine.js';
 import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
+import { evaluateShadowCandidateChronologically } from './shadowPredictor.js';
 
 interface StrategySearchJob {
   jobId: string;
@@ -544,7 +548,16 @@ apiRouter.get('/evolution/state', (_req: Request, res: Response) => {
 
 // Detailed entry and learning audit. This endpoint is read-only.
 apiRouter.get('/evolution/diagnostics', (_req: Request, res: Response) => {
-  res.json(db.getEvolutionDiagnostics());
+  res.json({
+    ...db.getEvolutionDiagnostics(),
+    onlinePolicyNetwork: onlinePolicyNetwork.getTelemetry(),
+    agi: agiSelfLearningEngine.getSelfLearningState(),
+  });
+});
+
+// Chronological walk-forward baseline vs shadow candidate evaluation (read-only).
+apiRouter.get('/evolution/shadow-benchmark', (_req: Request, res: Response) => {
+  res.json(evaluateShadowCandidateChronologically(db.getSignals(false)));
 });
 
 // Rebuild and reconcile learning state safely. Both operations are idempotent.
@@ -765,15 +778,82 @@ apiRouter.get('/system/export-d1', (_req: Request, res: Response) => {
   });
 });
 
-// POST /api/test/run and /api/tests/run — Run automated verification test suite
-const handleRunTests = async (_req: Request, res: Response) => {
+/**
+ * Fail-closed guard: HTTP test execution is strictly disabled in production or unspecified environments.
+ * Development HTTP invocations (when explicitly enabled) execute only in a separate isolated child process.
+ */
+export function isProductionTestExecutionBlocked(env: NodeJS.ProcessEnv = process.env): boolean {
+  const nodeEnv = String(env.NODE_ENV || '').trim().toLowerCase();
+  const kService = String(env.K_SERVICE || '').trim();
+  if (nodeEnv === 'production') return true;
+  if (kService.startsWith('ais-pre-')) return true;
+  if (kService && !kService.startsWith('ais-dev-')) return true;
+  return nodeEnv !== 'development' && nodeEnv !== 'test' && !kService.startsWith('ais-dev-');
+}
+
+export async function runIsolatedVerificationSubprocess(
+  timeoutMs: number = 60_000
+): Promise<any> {
+  const tsxCli = path.resolve(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  const scriptPath = path.resolve(process.cwd(), 'scripts', 'run-verification.ts');
+  const jsonTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'signalforge-http-verify-'));
+  const jsonOutPath = path.join(jsonTempDir, 'report.json');
+
   try {
-    const report = await runAllVerificationTests();
-    res.json(report);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    await new Promise<void>((resolve, reject) => {
+      execFile(
+        process.execPath,
+        [tsxCli, scriptPath, '--json'],
+        {
+          cwd: process.cwd(),
+          timeout: timeoutMs,
+          env: {
+            ...process.env,
+            SIGNALFORGE_VERIFY_JSON_OUT: jsonOutPath,
+          },
+        },
+        (error, _stdout, stderr) => {
+          if (error && !fs.existsSync(jsonOutPath)) {
+            reject(new Error(stderr || error.message));
+            return;
+          }
+          resolve();
+        }
+      );
+    });
+
+    const raw = fs.readFileSync(jsonOutPath, 'utf-8');
+    return JSON.parse(raw);
+  } finally {
+    try {
+      fs.rmSync(jsonTempDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup
+    }
   }
-};
+}
+
+export function createHandleRunTests(
+  envProvider: () => NodeJS.ProcessEnv = () => process.env,
+  runner: () => Promise<any> = runIsolatedVerificationSubprocess
+) {
+  return async (_req: Request, res: Response) => {
+    if (isProductionTestExecutionBlocked(envProvider())) {
+      return res.status(403).json({
+        error: 'HTTP test execution endpoints are disabled in production. Use CLI: npm run test:verify.',
+      });
+    }
+    try {
+      const report = await runner();
+      return res.json(report);
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || String(err) });
+    }
+  };
+}
+
+// POST /api/test/run and /api/tests/run — Disabled in production; dev runs in an isolated child process
+const handleRunTests = createHandleRunTests();
 apiRouter.post('/test/run', handleRunTests);
 apiRouter.post('/tests/run', handleRunTests);
 

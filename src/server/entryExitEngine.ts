@@ -19,8 +19,9 @@ import { db } from './db.js';
 import { calculateBinarySettlement, DEFAULT_BINARY_PAYOUT_PERCENT } from './binarySettlement.js';
 import { getSessionFromTimestamp } from './dataFeeds.js';
 import { agiSelfLearningEngine } from './agiEngine.js';
-import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
+import { hasTrustedPredictionFeatures, onlinePolicyNetwork } from './onlinePolicyNetwork.js';
 import { isValidBrokerEligibilitySnapshot } from '../services/olympTradeBridge.js';
+import { evaluateShadowCandidate, PriorEpisodeRecord } from './shadowPredictor.js';
 
 /** Maximum delay to wait for a provider to deliver the exact 5-minute entry bar. */
 export const LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS = 5 * 60_000;
@@ -340,6 +341,60 @@ export class EntryExitEngine {
           signal.onlineLearnerPrediction = prediction.probability;
           signal.onlineLearnerSampleSize = prediction.sampleSize;
           signal.onlineLearnerVersion = prediction.version;
+
+          // Read-only regime classification for shadow telemetry (must NOT mutate live regimeCache)
+          const regime = agiSelfLearningEngine.classifyMarketRegime(params.symbol, predictionHistory, false);
+          signal.predictionMarketRegime = regime.regimeType;
+
+          // Compute strictly causal shadow calibrated evaluation (NEVER modifies live signal confidence/execution)
+          const nowMs = Date.parse(nowUtc);
+          const priorSettledRecords: PriorEpisodeRecord[] = db
+            .getSignals(false)
+            .filter(s => {
+              if (s.lifecycleState !== 'CLOSED') return false;
+              if (s.outcomeResult !== 'WIN' && s.outcomeResult !== 'LOSS') return false;
+              if (s.ruleFamily?.startsWith('test_')) return false;
+              const settledAtMs = Date.parse(s.actualExitTimeUtc || s.plannedExitTimeUtc || s.predictionTimeUtc);
+              return Number.isFinite(settledAtMs) && settledAtMs <= nowMs;
+            })
+            .map(s => ({
+              symbol: s.symbol,
+              direction: s.direction,
+              ruleFamily: s.ruleFamily,
+              strategyId: s.strategyId,
+              outcome: s.outcomeResult as 'WIN' | 'LOSS',
+              netReturnUnits:
+                typeof s.netReturnUnits === 'number' && Number.isFinite(s.netReturnUnits)
+                  ? s.netReturnUnits
+                  : s.outcomeResult === 'WIN'
+                    ? (s.payoutPct || 80) / 100
+                    : -1,
+              regimeType: s.predictionMarketRegime,
+              marketFeatureVector: s.marketFeatureVector,
+              rawScoreProb: s.shadowCandidate?.rawProbability,
+            }));
+
+          const mlpFwd = onlinePolicyNetwork.forward(marketFeatureVector);
+          const mlpTel = onlinePolicyNetwork.getTelemetry();
+          const v2Eval = onlinePolicyNetwork.evaluateLinUcbV2(marketFeatureVector, params.direction);
+
+          signal.shadowCandidate = evaluateShadowCandidate({
+            symbol: params.symbol,
+            direction: params.direction,
+            ruleFamily: params.ruleFamily,
+            strategyId: signal.strategyId,
+            payoutPct: signal.payoutPct,
+            marketFeatureVector,
+            ftrlProbability: prediction.probability,
+            ftrlSampleSize: prediction.sampleSize,
+            mlpUpProbability: mlpFwd.probabilityUp,
+            mlpStepCount: mlpTel.stepCount,
+            mlpOosBce: mlpTel.validationLossOos,
+            linUcbV2Score: v2Eval.ucbScore,
+            linUcbV2Obs: v2Eval.actionObservations,
+            regime,
+            priorSettledRecords,
+          });
         }
       }
     }
@@ -884,39 +939,23 @@ export class EntryExitEngine {
 
   /**
    * Unified closed-loop reinforcement learning trigger called by EVERY settlement branch.
-   * Extracts strictly causal entry-time 19D features (never exit-time lookahead features),
-   * skips test fixtures and synthetic candles, updates AGI Bandit + PID + Episodic Memory,
-   * and executes analytical MLP backpropagation + LinUCB covariance update.
+   * ZERO LOOKAHEAD: Uses ONLY the immutable prediction-time `signal.marketFeatureVector`
+   * captured when the signal was originally emitted. Never reconstructs features from
+   * post-entry candles (`entryTsMs + 60_000` bug removed).
    */
-  private triggerClosedLoopLearning(signal: ResearchSignal, candles: Candle[]) {
+  private triggerClosedLoopLearning(signal: ResearchSignal, _candles: Candle[]) {
     if (signal.ruleFamily?.startsWith('test_')) return;
     if (signal.outcomeResult !== 'WIN' && signal.outcomeResult !== 'LOSS') return;
 
     const outcome = signal.outcomeResult;
     const netUnits = signal.netReturnUnits ?? (outcome === 'WIN' ? 0.8 : -1.0);
     const exitPrice = signal.actualExitPrice ?? signal.actualEntryPrice ?? signal.triggerPrice;
-    const realCandles = (candles || [])
-      .filter(c => c && c.source !== 'synthetic')
-      .sort((a, b) => a.timestampMs - b.timestampMs);
+    const observedAt = signal.actualExitTimeUtc || signal.plannedExitTimeUtc || new Date().toISOString();
 
-    const entryTsMs = Date.parse(
-      signal.actualEntryTimeUtc || signal.candleOpenTimeUtc || signal.predictionTimeUtc
-    );
+    if (hasTrustedPredictionFeatures(signal)) {
+      const featureVec = signal.marketFeatureVector!;
 
-    const causalSlice = Number.isFinite(entryTsMs)
-      ? realCandles.filter(c => c.timestampMs <= entryTsMs + 60_000)
-      : realCandles;
-
-    const hasValidCausalEntryWindow =
-      causalSlice.length >= 20 &&
-      (!Number.isFinite(entryTsMs) ||
-        Math.abs(causalSlice[causalSlice.length - 1].timestampMs - entryTsMs) <= 20 * 60_000);
-
-    if (hasValidCausalEntryWindow) {
-      const entryCandle = causalSlice[causalSlice.length - 1];
-      const featureVec = agiSelfLearningEngine.extractFeatureVector(entryCandle, causalSlice);
-
-      agiSelfLearningEngine.recordTradeOutcomeEpisode(
+      const episodicRecorded = agiSelfLearningEngine.recordTradeOutcomeEpisode(
         signal,
         featureVec,
         exitPrice,
@@ -924,16 +963,56 @@ export class EntryExitEngine {
         netUnits
       );
 
-      onlinePolicyNetwork.trainStep(
+      const stepRes = onlinePolicyNetwork.trainStep(
         featureVec,
         signal.direction,
         outcome,
         netUnits,
         signal.symbol,
-        signal.id
+        signal.id,
+        observedAt
       );
+
+      const mlpTrained = !stepRes.duplicateBlocked && stepRes.step > 0;
+      const linUcbV2Trained = Boolean(stepRes.linUcbV2Trained) && !stepRes.linUcbV2DuplicateBlocked;
+
+      signal.trainingAudit = {
+        ...(signal.trainingAudit || { ftrlTrained: false }),
+        mlpTrained,
+        mlpSkippedReason: mlpTrained
+          ? undefined
+          : stepRes.duplicateBlocked
+            ? 'ALREADY_TRAINED'
+            : 'NOT_TRAINED',
+        linUcbV2Trained,
+        linUcbV2SkippedReason: linUcbV2Trained
+          ? undefined
+          : stepRes.linUcbV2DuplicateBlocked
+            ? 'ALREADY_TRAINED'
+            : 'NOT_TRAINED',
+        episodicRecorded,
+        episodicSkippedReason: episodicRecorded ? undefined : 'ALREADY_TRAINED',
+        trainedAtUtc:
+          mlpTrained || linUcbV2Trained || episodicRecorded
+            ? observedAt
+            : signal.trainingAudit?.trainedAtUtc,
+      };
+      db.updateSignal(signal);
     } else {
-      // Even if older entry candles rotated out of memory, still update Thompson Sampling bandit arm
+      // No frozen prediction-time features: classify transparently as skipped without fabricating future features.
+      onlinePolicyNetwork.recordSkippedTraining(signal.id, 'MISSING_FROZEN_PREDICTION_FEATURES');
+      signal.trainingAudit = {
+        ...(signal.trainingAudit || { ftrlTrained: false }),
+        mlpTrained: false,
+        mlpSkippedReason: 'MISSING_FROZEN_PREDICTION_FEATURES',
+        linUcbV2Trained: false,
+        linUcbV2SkippedReason: 'MISSING_FROZEN_PREDICTION_FEATURES',
+        episodicRecorded: false,
+        episodicSkippedReason: 'MISSING_FROZEN_PREDICTION_FEATURES',
+      };
+      db.updateSignal(signal);
+
+      // Strategy Bandit updates strictly on strategyId + outcome (zero candle leakage)
       const strategyId = signal.strategyId || signal.synthesizedGeneId || `rule:${signal.ruleFamily}`;
       agiSelfLearningEngine.updateBanditArm(strategyId, outcome, signal.strategyName);
     }

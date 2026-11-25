@@ -303,6 +303,15 @@ export function getOnlineLearnerSummary(stateInput: OnlineLearnerState) {
   const sampleCount = state.sampleCount;
   const meanBrierScore = sampleCount ? state.brierSum / sampleCount : null;
   const meanLogLoss = sampleCount ? state.logLossSum / sampleCount : null;
+  const prevalenceWinRate = sampleCount ? state.wins / sampleCount : null;
+  const prevalenceBrierBaseline = prevalenceWinRate !== null
+    ? Number(Math.max(1e-6, prevalenceWinRate * (1 - prevalenceWinRate)).toFixed(5))
+    : null;
+  const pClamped = prevalenceWinRate !== null ? clamp(prevalenceWinRate, 1e-6, 1 - 1e-6) : null;
+  const prevalenceLogLossBaseline = pClamped !== null
+    ? Number((-(pClamped * Math.log(pClamped) + (1 - pClamped) * Math.log(1 - pClamped))).toFixed(5))
+    : null;
+
   return {
     version: ONLINE_LEARNER_VERSION,
     mode: 'SHADOW_ONLY' as const,
@@ -315,6 +324,13 @@ export function getOnlineLearnerSummary(stateInput: OnlineLearnerState) {
     meanLogLoss: meanLogLoss === null ? null : Number(meanLogLoss.toFixed(5)),
     brierSkillVs50Baseline: meanBrierScore === null ? null : Number((1 - meanBrierScore / 0.25).toFixed(5)),
     logLossSkillVs50Baseline: meanLogLoss === null ? null : Number((1 - meanLogLoss / Math.log(2)).toFixed(5)),
+    prevalenceWinRate: prevalenceWinRate === null ? null : Number(prevalenceWinRate.toFixed(4)),
+    prevalenceBrierBaseline,
+    brierSkillVsPrevalence:
+      meanBrierScore === null || prevalenceBrierBaseline === null
+        ? null
+        : Number((1 - meanBrierScore / prevalenceBrierBaseline).toFixed(5)),
+    prevalenceLogLossBaseline,
     brier50Baseline: 0.25,
     logLoss50Baseline: Number(Math.log(2).toFixed(5)),
     recentBrierWindow: state.recentBrierErrors.length,
@@ -323,6 +339,35 @@ export function getOnlineLearnerSummary(stateInput: OnlineLearnerState) {
     updatedAt: state.updatedAt,
     minimumReportingSample: ONLINE_LEARNER_MIN_REPORTING_SAMPLE,
   };
+}
+
+const MARKET_FEATURE_NAMES = [
+  'return_1', 'return_3', 'return_5', 'return_13',
+  'body_direction', 'body_ratio', 'wick_imbalance', 'close_location',
+  'range_expansion', 'ema_spread', 'ema_curvature', 'rsi_centered',
+  'rsi_momentum', 'range_position_13', 'range_position_34', 'volatility_ratio',
+  'directional_efficiency', 'return_autocorrelation', 'wick_pressure_change',
+];
+
+export function getOnlineLearnerFeatureImportance(stateInput: OnlineLearnerState, topN: number = 12) {
+  const state = normalizeOnlineLearnerState(stateInput);
+  const names: string[] = [
+    'intercept',
+    ...MARKET_FEATURE_NAMES,
+    ...SYMBOLS.map(s => `pair:${s}`),
+    'direction:BUY(+1)/SELL(-1)',
+    ...RULE_FAMILIES.map(f => `rule:${f}`),
+  ];
+  const entries = names.map((feature, idx) => ({
+    feature,
+    weight: Number(getWeight(state, idx).toFixed(5)),
+    absWeight: Number(Math.abs(getWeight(state, idx)).toFixed(5)),
+    gradNormAccum: Number(state.n[idx].toFixed(4)),
+  }));
+  return entries
+    .filter(e => e.feature !== 'intercept')
+    .sort((a, b) => b.absWeight - a.absWeight)
+    .slice(0, topN);
 }
 
 
