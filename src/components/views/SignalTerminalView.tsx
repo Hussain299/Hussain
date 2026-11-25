@@ -832,12 +832,23 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                           ))}
                         </div>
 
-                        <button
-                          onClick={() => setSelectedSignal(alert)}
-                          className="px-4 py-2 rounded-lg bg-[#222B36] hover:bg-[#354251] text-[#6C9D91] hover:text-[#E8E5DE] border border-[#354251] font-bold text-xs transition-colors cursor-pointer"
-                        >
-                          Inspect Setup &amp; Audit Trail →
-                        </button>
+                        <div className="flex items-center gap-2">
+                          {alert.brokerEligibility ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/30">
+                              OLYMP VERIFIED · {alert.brokerEligibility.payoutPct}%
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#C5A36A]/15 text-[#C5A36A] border border-[#C5A36A]/30">
+                              LEGACY PRE-FILTER
+                            </span>
+                          )}
+                          <button
+                            onClick={() => setSelectedSignal(alert)}
+                            className="px-4 py-2 rounded-lg bg-[#222B36] hover:bg-[#354251] text-[#6C9D91] hover:text-[#E8E5DE] border border-[#354251] font-bold text-xs transition-colors cursor-pointer"
+                          >
+                            Inspect Setup &amp; Audit Trail →
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -941,12 +952,23 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         <span className="text-[#AAB4BF] truncate max-w-[280px]">
                           Strategy: <strong className="text-[#E8E5DE]">{trade.strategyName || trade.ruleFamily}</strong>
                         </span>
-                        <button
-                          onClick={() => setSelectedSignal(trade)}
-                          className="text-xs text-[#6C9D91] hover:underline font-bold cursor-pointer"
-                        >
-                          Audit Signal Details →
-                        </button>
+                        <div className="flex items-center gap-2">
+                          {trade.brokerEligibility ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/30">
+                              OLYMP VERIFIED · {trade.brokerEligibility.payoutPct}%
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#C5A36A]/15 text-[#C5A36A] border border-[#C5A36A]/30">
+                              LEGACY PRE-FILTER
+                            </span>
+                          )}
+                          <button
+                            onClick={() => setSelectedSignal(trade)}
+                            className="text-xs text-[#6C9D91] hover:underline font-bold cursor-pointer"
+                          >
+                            Audit Signal Details →
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );

@@ -25,6 +25,7 @@ import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
 import {
   ActiveTradingUniverse,
+  authorizeSignalWithBrokerSnapshot,
   OlympTradeBridgeStatus,
   resolveActiveTradingPairs,
   sanitizeOlympTradeBridgeStatus,
@@ -54,19 +55,41 @@ export class AutonomousScheduler {
   private cycleCount = 0;
   private hasBootstrappedOnlineModel = false;
   private latestOlympTradeStatus: OlympTradeBridgeStatus | null = null;
+  private lastBlockedLogMs = 0;
 
   public updateOlympTradeSnapshot(rawStatus: unknown): ActiveTradingUniverse {
     const sanitized = sanitizeOlympTradeBridgeStatus(rawStatus);
-    if (sanitized.connected) {
-      this.latestOlympTradeStatus = sanitized;
-    } else if (sanitized.extensionInstalled && sanitized.sessionState !== 'READY') {
-      this.latestOlympTradeStatus = sanitized;
-    }
+    this.latestOlympTradeStatus = sanitized.extensionInstalled ? sanitized : null;
     return this.getActiveTradingUniverse();
+  }
+
+  public clearOlympTradeSnapshot(): void {
+    this.latestOlympTradeStatus = null;
   }
 
   public getActiveTradingUniverse(nowMs: number = Date.now()): ActiveTradingUniverse {
     return resolveActiveTradingPairs(this.latestOlympTradeStatus, nowMs);
+  }
+
+  /**
+   * Authoritative broker-gated signal creation entry point.
+   * Ensures every non-test signal creation checks the current Olymp Trade snapshot
+   * at the exact moment of creation and attaches an auditable eligibility record.
+   */
+  public createBrokerGatedSignal(
+    params: Parameters<typeof entryExitEngine.createResearchSignal>[0],
+    nowMs: number = Date.now()
+  ) {
+    const auth = authorizeSignalWithBrokerSnapshot(params.symbol, this.latestOlympTradeStatus, nowMs);
+    if (!auth.authorized) {
+      throw new Error(`BROKER_ELIGIBILITY_BLOCKED: ${auth.reason}`);
+    }
+    return entryExitEngine.createResearchSignal({
+      ...params,
+      payoutPct: auth.eligibility.payoutPct,
+      payoutSource: 'BROKER_OBSERVED',
+      brokerEligibility: auth.eligibility,
+    });
   }
 
   constructor() {
@@ -594,11 +617,15 @@ export class AutonomousScheduler {
 
       if (shouldScanForSignals && inFlightTrades.length < 6) {
         const universe = this.getActiveTradingUniverse();
-        if (universe.mode === 'OLYMP_NO_ELIGIBLE_PAIRS') {
-          this.logMind(
-            'AUDITOR',
-            '[OLYMP TRADE FILTER] Live companion is active, but 0 configured pairs currently meet >= 80% payout and availability. Skipping signal discovery.'
-          );
+        if (universe.mode !== 'OLYMP_ACTIVE' || universe.pairs.length === 0) {
+          const nowMs = Date.now();
+          if (nowMs - this.lastBlockedLogMs >= 60_000) {
+            this.lastBlockedLogMs = nowMs;
+            this.logMind(
+              'AUDITOR',
+              `[OLYMP TRADE FAIL-CLOSED · ${universe.mode}] ${universe.reason}`
+            );
+          }
         }
         for (const symbol of universe.pairs) {
           // Strict Pair Isolation: If this pair already has an active in-flight trade, NEVER create another!
@@ -734,6 +761,16 @@ export class AutonomousScheduler {
               }
             }
 
+            const authNow = authorizeSignalWithBrokerSnapshot(symbol, this.latestOlympTradeStatus, Date.now());
+            if (!authNow.authorized) {
+              this.logMind(
+                'AUDITOR',
+                `[OLYMP TRADE GATE REJECTED] Blocked ${symbol} novel signal at creation time: ${authNow.reason}`,
+                symbol
+              );
+              continue;
+            }
+
             const signal = entryExitEngine.createResearchSignal({
               symbol,
               direction: novelGeneCandidate.direction,
@@ -741,6 +778,9 @@ export class AutonomousScheduler {
               ruleFamily: 'volatility_squeeze',
               expiryMinutes: gene.optimalHorizonMinutes,
               confidence: finalConviction,
+              payoutPct: authNow.eligibility.payoutPct,
+              payoutSource: 'BROKER_OBSERVED',
+              brokerEligibility: authNow.eligibility,
               modelVersion: `OnlinePolicy-MLP19-16-1+LinUCB`,
               strategyName: gene.name,
               strategyId: gene.id,
@@ -1017,6 +1057,16 @@ export class AutonomousScheduler {
               continue;
             }
 
+            const authNow = authorizeSignalWithBrokerSnapshot(symbol, this.latestOlympTradeStatus, Date.now());
+            if (!authNow.authorized) {
+              this.logMind(
+                'AUDITOR',
+                `[OLYMP TRADE GATE REJECTED] Blocked ${symbol} stacked signal at creation time: ${authNow.reason}`,
+                symbol
+              );
+              continue;
+            }
+
             const signal = entryExitEngine.createResearchSignal({
               symbol,
               direction: candidate.direction,
@@ -1024,6 +1074,9 @@ export class AutonomousScheduler {
               ruleFamily,
               expiryMinutes: dynamicExpiry,
               confidence: adaptedConfidence,
+              payoutPct: authNow.eligibility.payoutPct,
+              payoutSource: 'BROKER_OBSERVED',
+              brokerEligibility: authNow.eligibility,
               modelVersion: `v3.0-adaptive-online-ml`,
               strategyName,
               strategyId,

@@ -5,7 +5,9 @@
  */
 
 import {
+  BrokerEligibilitySnapshot,
   Candle,
+  FOREX_PAIRS,
   ForexSymbol,
   MarketSessionId,
   ResearchSignal,
@@ -18,6 +20,7 @@ import { calculateBinarySettlement, DEFAULT_BINARY_PAYOUT_PERCENT } from './bina
 import { getSessionFromTimestamp } from './dataFeeds.js';
 import { agiSelfLearningEngine } from './agiEngine.js';
 import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
+import { isValidBrokerEligibilitySnapshot } from '../services/olympTradeBridge.js';
 
 /** Maximum delay to wait for a provider to deliver the exact 5-minute entry bar. */
 export const LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS = 5 * 60_000;
@@ -78,6 +81,7 @@ export interface SignalCreationParams {
   mathematicalFormula?: string;
   whyHumansMissThis?: string;
   paperOnly?: boolean;
+  brokerEligibility?: BrokerEligibilitySnapshot;
 }
 
 export class EntryExitEngine {
@@ -120,6 +124,17 @@ export class EntryExitEngine {
    * Every trade is synchronized to open strictly on the 5-minute candle opening.
    */
   public createResearchSignal(params: SignalCreationParams): ResearchSignal {
+    const isTest = params.ruleFamily.startsWith('test_');
+    if (!isTest) {
+      if (!FOREX_PAIRS.includes(params.symbol)) {
+        throw new Error(`BROKER_ELIGIBILITY_BLOCKED: ${params.symbol} is outside the configured 29-pair universe.`);
+      }
+      if (!isValidBrokerEligibilitySnapshot(params.brokerEligibility, params.symbol)) {
+        throw new Error(
+          `BROKER_ELIGIBILITY_BLOCKED: Cannot create live signal for ${params.symbol} without a fresh, verified Olymp Trade AVAILABLE >=80% HIGH-evidence snapshot.`
+        );
+      }
+    }
     const isJpy = params.symbol.includes('JPY');
     const pipUnit = isJpy ? 0.01 : 0.0001;
     const now = new Date();
@@ -149,7 +164,6 @@ export class EntryExitEngine {
     // Every trade opens exactly on the full 5-minute candle boundary (:00, :05, :10, :15, :20, :25, :30, :35, :40, :45, :50, :55)
     // Never random mid-candle entries like :32 or :37.
     const FIVE_MIN_MS = 5 * 60 * 1000;
-    const isTest = params.ruleFamily.startsWith('test_');
     const signalCandleMs = params.signalCandle.timestampMs || Date.now();
     const refMs = isTest ? signalCandleMs : Date.now();
     // Strict 3-Minute Advance Alignment:
@@ -288,6 +302,7 @@ export class EntryExitEngine {
       mathematicalFormula: params.mathematicalFormula,
       whyHumansMissThis: params.whyHumansMissThis,
       paperOnly: params.paperOnly ?? false,
+      brokerEligibility: params.brokerEligibility,
     };
 
     // Freeze the new shadow model's prediction at signal creation using only real

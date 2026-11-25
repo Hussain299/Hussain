@@ -214,7 +214,7 @@ export default function App() {
             notifiedIdsRef.current.add(sig.id);
             const sigTime = sig.predictionTimeUtc ? Date.parse(sig.predictionTimeUtc) : 0;
             const sigAgeMs = isNaN(sigTime) || sigTime === 0 ? Infinity : nowMs - sigTime;
-            if (sigAgeMs <= 180_000 && sig.lifecycleState === 'WAITING_FOR_ENTRY') {
+            if (sigAgeMs <= 180_000 && sig.lifecycleState === 'WAITING_FOR_ENTRY' && sig.brokerEligibility?.mode === 'OLYMP_ACTIVE') {
               setActiveNotification({
                 id: `notif_${sig.id}`,
                 signalId: sig.id,

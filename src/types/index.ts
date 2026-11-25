@@ -150,6 +150,17 @@ export interface SignalLifecycleEvent {
   price?: number;
 }
 
+export interface BrokerEligibilitySnapshot {
+  broker: 'OLYMP_TRADE';
+  mode: 'OLYMP_ACTIVE';
+  pair: ForexSymbol;
+  payoutPct: number;
+  availability: 'AVAILABLE';
+  evidence: 'HIGH';
+  snapshotCapturedAt: string;
+  verifiedAtUtc: string;
+}
+
 export interface ResearchSignal {
   id: string;
   symbol: ForexSymbol;
@@ -228,6 +239,8 @@ export interface ResearchSignal {
   lossAutopsy?: LossAutopsy;
   /** UTC ISO timestamp recording when the Telegram Win/Loss Audit Report was dispatched for this settled signal. */
   telegramAuditSentAt?: string;
+  /** Auditable Olymp Trade eligibility snapshot verified at signal creation time (absent on legacy pre-filter signals). */
+  brokerEligibility?: BrokerEligibilitySnapshot;
 }
 
 export interface LossAutopsy {

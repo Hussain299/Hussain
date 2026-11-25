@@ -1,15 +1,43 @@
-import { FOREX_PAIRS, ForexSymbol } from '../types/index.js';
+import { BrokerEligibilitySnapshot, FOREX_PAIRS, ForexSymbol } from '../types/index.js';
 
 export type OlympTradeSessionState = 'READY' | 'LOGIN_REQUIRED' | 'WAITING_FOR_MARKET_DATA' | 'NO_PLATFORM_TAB' | 'STALE' | 'UNKNOWN';
 export type OlympTradeAvailability = 'AVAILABLE' | 'UNAVAILABLE' | 'UNKNOWN';
 export type OlympTradeEvidence = 'HIGH' | 'MEDIUM' | 'NONE';
-export type OlympTradeUniverseMode = 'OLYMP_ACTIVE' | 'OLYMP_NO_ELIGIBLE_PAIRS' | 'FALLBACK_29';
+export type OlympTradeInstrumentSource = 'MARKET_LIST' | 'TAB' | 'UNKNOWN';
+export type OlympTradeUniverseMode =
+  | 'OLYMP_ACTIVE'
+  | 'OLYMP_NO_ELIGIBLE_PAIRS'
+  | 'OLYMP_WAITING_FOR_SNAPSHOT'
+  | 'OLYMP_STALE'
+  | 'OLYMP_LOGIN_REQUIRED';
+
+export interface OlympTradeDiagnosticCounts {
+  observed: number;
+  available: number;
+  unavailable: number;
+  unknownAvailability: number;
+  knownPayout: number;
+  payoutAtLeast80: number;
+  eligibleInUniverse: number;
+  outsideUniverse: number;
+}
+
+export interface EligiblePairDetail {
+  payoutPct: number;
+  availability: 'AVAILABLE';
+  evidence: 'HIGH';
+  sourceType: OlympTradeInstrumentSource;
+}
 
 export interface ActiveTradingUniverse {
   mode: OlympTradeUniverseMode;
   pairs: ForexSymbol[];
   liveCount: number;
   capturedAt: string | null;
+  ageMs: number | null;
+  reason: string;
+  counts: OlympTradeDiagnosticCounts;
+  eligibleDetails: Partial<Record<ForexSymbol, EligiblePairDetail>>;
 }
 
 export interface OlympTradeInstrument {
@@ -17,7 +45,9 @@ export interface OlympTradeInstrument {
   payoutPct: number | null;
   availability: OlympTradeAvailability;
   evidence: OlympTradeEvidence;
+  sourceType?: OlympTradeInstrumentSource;
 }
+
 export interface OlympTradeBridgeStatus {
   extensionInstalled: boolean;
   extensionVersion: string | null;
@@ -29,13 +59,35 @@ export interface OlympTradeBridgeStatus {
   instruments: OlympTradeInstrument[];
 }
 
+export const SNAPSHOT_FRESHNESS_MS = 45_000;
+export const MIN_ELIGIBLE_PAYOUT_PCT = 80;
+
 const CHANNEL = 'SIGNALFORGE_OLYMP_TRADE_BRIDGE';
-const STALE_THRESHOLD_MS = 45_000;
+const CONFIGURED_PAIR_SET = new Set<string>(FOREX_PAIRS);
 
 const EMPTY_STATUS: OlympTradeBridgeStatus = {
-  extensionInstalled: false, extensionVersion: null, platformTabOpen: false,
-  connected: false, sessionState: 'UNKNOWN', capturedAt: null, ageMs: null, instruments: [],
+  extensionInstalled: false,
+  extensionVersion: null,
+  platformTabOpen: false,
+  connected: false,
+  sessionState: 'UNKNOWN',
+  capturedAt: null,
+  ageMs: null,
+  instruments: [],
 };
+
+function emptyCounts(): OlympTradeDiagnosticCounts {
+  return {
+    observed: 0,
+    available: 0,
+    unavailable: 0,
+    unknownAvailability: 0,
+    knownPayout: 0,
+    payoutAtLeast80: 0,
+    eligibleInUniverse: 0,
+    outsideUniverse: 0,
+  };
+}
 
 export function normalizePair(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -48,20 +100,47 @@ export function normalizePair(value: unknown): string | null {
   return null;
 }
 
+function isInstrumentEligible(inst: OlympTradeInstrument): boolean {
+  return (
+    CONFIGURED_PAIR_SET.has(inst.pair) &&
+    inst.availability === 'AVAILABLE' &&
+    inst.payoutPct !== null &&
+    Number.isFinite(inst.payoutPct) &&
+    inst.payoutPct >= MIN_ELIGIBLE_PAYOUT_PCT &&
+    inst.payoutPct <= 100 &&
+    inst.evidence === 'HIGH'
+  );
+}
+
+function instrumentScore(inst: OlympTradeInstrument): number {
+  return (
+    (inst.availability === 'AVAILABLE' ? 200 : inst.availability === 'UNAVAILABLE' ? 50 : 0) +
+    (inst.evidence === 'HIGH' ? 100 : inst.evidence === 'MEDIUM' ? 30 : 0) +
+    (inst.payoutPct !== null ? 40 : 0) +
+    (inst.sourceType === 'MARKET_LIST' ? 10 : 0)
+  );
+}
+
 /** Accept only the fields needed by this read-only panel from the local extension. */
 export function sanitizeOlympTradeBridgeStatus(value: unknown): OlympTradeBridgeStatus {
   if (!value || typeof value !== 'object') return { ...EMPTY_STATUS };
   const raw = value as Record<string, unknown>;
-  const capturedAt = typeof raw.capturedAt === 'string' && Number.isFinite(Date.parse(raw.capturedAt))
-    ? new Date(raw.capturedAt).toISOString() : null;
-  const ageMs = typeof raw.ageMs === 'number' && Number.isFinite(raw.ageMs) && raw.ageMs >= 0
-    ? Math.min(raw.ageMs, 7 * 24 * 60 * 60 * 1000)
-    : capturedAt ? Math.max(0, Date.now() - Date.parse(capturedAt)) : null;
+  const capturedAt =
+    typeof raw.capturedAt === 'string' && Number.isFinite(Date.parse(raw.capturedAt))
+      ? new Date(raw.capturedAt).toISOString()
+      : null;
+  const ageMs =
+    typeof raw.ageMs === 'number' && Number.isFinite(raw.ageMs) && raw.ageMs >= 0
+      ? Math.min(raw.ageMs, 7 * 24 * 60 * 60 * 1000)
+      : capturedAt
+      ? Math.max(0, Date.now() - Date.parse(capturedAt))
+      : null;
   const allowedStates: OlympTradeSessionState[] = [
     'READY', 'LOGIN_REQUIRED', 'WAITING_FOR_MARKET_DATA', 'NO_PLATFORM_TAB', 'STALE', 'UNKNOWN',
   ];
   const sessionState = allowedStates.includes(raw.sessionState as OlympTradeSessionState)
-    ? raw.sessionState as OlympTradeSessionState : 'UNKNOWN';
+    ? (raw.sessionState as OlympTradeSessionState)
+    : 'UNKNOWN';
   const unique = new Map<string, OlympTradeInstrument>();
 
   if (Array.isArray(raw.instruments)) {
@@ -70,32 +149,53 @@ export function sanitizeOlympTradeBridgeStatus(value: unknown): OlympTradeBridge
       const instrument = item as Record<string, unknown>;
       const pair = normalizePair(instrument.pair);
       if (!pair) continue;
-      const payout = typeof instrument.payoutPct === 'number' &&
-        Number.isFinite(instrument.payoutPct) && instrument.payoutPct >= 50 && instrument.payoutPct <= 100
-        ? Math.round(instrument.payoutPct * 100) / 100 : null;
+      const payout =
+        typeof instrument.payoutPct === 'number' &&
+        Number.isFinite(instrument.payoutPct) &&
+        instrument.payoutPct >= 50 &&
+        instrument.payoutPct <= 100
+          ? Math.round(instrument.payoutPct * 100) / 100
+          : null;
       const availability: OlympTradeAvailability =
         instrument.availability === 'AVAILABLE' || instrument.availability === 'UNAVAILABLE'
-          ? instrument.availability : 'UNKNOWN';
+          ? instrument.availability
+          : 'UNKNOWN';
       const evidence: OlympTradeEvidence =
         instrument.evidence === 'HIGH' || instrument.evidence === 'MEDIUM'
-          ? instrument.evidence : 'NONE';
-      const next = { pair, payoutPct: payout, availability, evidence };
+          ? instrument.evidence
+          : 'NONE';
+      const sourceType: OlympTradeInstrumentSource =
+        instrument.sourceType === 'MARKET_LIST' || instrument.sourceType === 'TAB'
+          ? instrument.sourceType
+          : 'UNKNOWN';
+      const next: OlympTradeInstrument = { pair, payoutPct: payout, availability, evidence, sourceType };
       const previous = unique.get(pair);
-      if (!previous || (next.payoutPct !== null && previous.payoutPct === null) ||
-          (next.evidence === 'HIGH' && previous.evidence !== 'HIGH')) unique.set(pair, next);
+      if (!previous || instrumentScore(next) > instrumentScore(previous)) {
+        unique.set(pair, next);
+      }
     }
   }
 
   const extensionInstalled = raw.extensionInstalled === true;
   const platformTabOpen = raw.platformTabOpen === true;
-  const connected = extensionInstalled && platformTabOpen && raw.connected === true &&
-    sessionState === 'READY' && ageMs !== null && ageMs <= STALE_THRESHOLD_MS && unique.size > 0;
+  const connected =
+    extensionInstalled &&
+    platformTabOpen &&
+    raw.connected === true &&
+    sessionState === 'READY' &&
+    ageMs !== null &&
+    ageMs <= SNAPSHOT_FRESHNESS_MS &&
+    unique.size > 0;
 
   // Build result with ONLY the expected fields — no credential data forwarded
   return {
     extensionInstalled,
     extensionVersion: typeof raw.extensionVersion === 'string' ? raw.extensionVersion.slice(0, 32) : null,
-    platformTabOpen, connected, sessionState, capturedAt, ageMs,
+    platformTabOpen,
+    connected,
+    sessionState,
+    capturedAt,
+    ageMs,
     instruments: Array.from(unique.values()).sort((a, b) => a.pair.localeCompare(b.pair)),
   };
 }
@@ -118,8 +218,9 @@ export async function requestOlympTradeBridgeStatus(
     const onMessage = (event: MessageEvent) => {
       if (event.source !== window || event.origin !== window.location.origin) return;
       const data = event.data as Record<string, unknown> | null;
-      if (!data || data.channel !== CHANNEL || data.direction !== 'EXTENSION_RESPONSE' ||
-          data.requestId !== requestId) return;
+      if (!data || data.channel !== CHANNEL || data.direction !== 'EXTENSION_RESPONSE' || data.requestId !== requestId) {
+        return;
+      }
       finish(sanitizeOlympTradeBridgeStatus(data.payload));
     };
     timeoutId = window.setTimeout(() => finish({ ...EMPTY_STATUS }), 1800);
@@ -128,40 +229,141 @@ export async function requestOlympTradeBridgeStatus(
   });
 }
 
-const SERVER_SNAPSHOT_MAX_AGE_MS = 90_000;
-const MIN_ELIGIBLE_PAYOUT_PCT = 80;
+export function computeDiagnosticCounts(instruments: readonly OlympTradeInstrument[]): OlympTradeDiagnosticCounts {
+  const counts = emptyCounts();
+  for (const inst of instruments) {
+    counts.observed++;
+    if (inst.availability === 'AVAILABLE') counts.available++;
+    else if (inst.availability === 'UNAVAILABLE') counts.unavailable++;
+    else counts.unknownAvailability++;
+
+    if (inst.payoutPct !== null && Number.isFinite(inst.payoutPct)) {
+      counts.knownPayout++;
+      if (inst.payoutPct >= MIN_ELIGIBLE_PAYOUT_PCT) counts.payoutAtLeast80++;
+    }
+
+    if (!CONFIGURED_PAIR_SET.has(inst.pair)) {
+      counts.outsideUniverse++;
+    } else if (isInstrumentEligible(inst)) {
+      counts.eligibleInUniverse++;
+    }
+  }
+  return counts;
+}
 
 /**
- * Resolve which configured pairs are eligible for signal discovery based on the
- * latest sanitized Olymp Trade companion snapshot. Falls back to the 29-pair
- * universe only when the companion is offline/stale/not ready.
+ * Authoritative FAIL-CLOSED resolver for actionable Olymp Trade signal generation.
+ * Never falls back to the 29-pair research universe when the broker snapshot is
+ * missing, disconnected, login-required, stale (>45s), or lacks verified >=80% pairs.
  */
 export function resolveActiveTradingPairs(
   status: OlympTradeBridgeStatus | null | undefined,
   nowMs: number = Date.now()
 ): ActiveTradingUniverse {
-  if (!status || !status.connected || status.sessionState !== 'READY' || !status.capturedAt) {
-    return { mode: 'FALLBACK_29', pairs: [...FOREX_PAIRS], liveCount: 0, capturedAt: null };
+  if (!status || !status.extensionInstalled || !status.platformTabOpen) {
+    return {
+      mode: 'OLYMP_WAITING_FOR_SNAPSHOT',
+      pairs: [],
+      liveCount: 0,
+      capturedAt: null,
+      ageMs: null,
+      reason: 'Waiting for authenticated Olymp Trade browser companion snapshot. Signal generation paused.',
+      counts: emptyCounts(),
+      eligibleDetails: {},
+    };
   }
+
+  const rawCounts = computeDiagnosticCounts(status.instruments);
+
+  if (status.sessionState === 'LOGIN_REQUIRED') {
+    return {
+      mode: 'OLYMP_LOGIN_REQUIRED',
+      pairs: [],
+      liveCount: 0,
+      capturedAt: status.capturedAt,
+      ageMs: status.ageMs,
+      reason: 'Olymp Trade requires login. Signal generation paused until authenticated.',
+      counts: { ...rawCounts, eligibleInUniverse: 0 },
+      eligibleDetails: {},
+    };
+  }
+
+  if (status.sessionState === 'STALE') {
+    return {
+      mode: 'OLYMP_STALE',
+      pairs: [],
+      liveCount: 0,
+      capturedAt: status.capturedAt,
+      ageMs: status.ageMs,
+      reason: 'Olymp Trade browser snapshot is stale. Signal generation paused.',
+      counts: { ...rawCounts, eligibleInUniverse: 0 },
+      eligibleDetails: {},
+    };
+  }
+
+  if (status.sessionState !== 'READY' || !status.connected || !status.capturedAt) {
+    return {
+      mode: 'OLYMP_WAITING_FOR_SNAPSHOT',
+      pairs: [],
+      liveCount: 0,
+      capturedAt: status.capturedAt,
+      ageMs: status.ageMs,
+      reason: 'Olymp Trade market snapshot not ready or disconnected. Signal generation paused.',
+      counts: { ...rawCounts, eligibleInUniverse: 0 },
+      eligibleDetails: {},
+    };
+  }
+
   const capturedMs = Date.parse(status.capturedAt);
-  if (!Number.isFinite(capturedMs) || Math.max(0, nowMs - capturedMs) > SERVER_SNAPSHOT_MAX_AGE_MS) {
-    return { mode: 'FALLBACK_29', pairs: [...FOREX_PAIRS], liveCount: 0, capturedAt: status.capturedAt };
+  const computedAgeMs = Number.isFinite(capturedMs) ? Math.max(0, nowMs - capturedMs) : Infinity;
+  const effectiveAgeMs = status.ageMs !== null ? Math.max(computedAgeMs, status.ageMs) : computedAgeMs;
+
+  if (!Number.isFinite(capturedMs) || effectiveAgeMs > SNAPSHOT_FRESHNESS_MS) {
+    return {
+      mode: 'OLYMP_STALE',
+      pairs: [],
+      liveCount: 0,
+      capturedAt: status.capturedAt,
+      ageMs: Number.isFinite(effectiveAgeMs) ? effectiveAgeMs : null,
+      reason: 'Olymp Trade snapshot exceeded 45s freshness limit. Signal generation paused.',
+      counts: { ...rawCounts, eligibleInUniverse: 0 },
+      eligibleDetails: {},
+    };
   }
 
-  const eligibleSet = new Set<string>();
+  const byPair = new Map<string, OlympTradeInstrument>();
   for (const inst of status.instruments) {
-    if (inst.availability === 'UNAVAILABLE') continue;
-    if (inst.payoutPct === null || inst.payoutPct < MIN_ELIGIBLE_PAYOUT_PCT) continue;
-    eligibleSet.add(inst.pair);
+    const prev = byPair.get(inst.pair);
+    if (!prev || instrumentScore(inst) > instrumentScore(prev)) {
+      byPair.set(inst.pair, inst);
+    }
   }
 
-  const pairs = FOREX_PAIRS.filter(pair => eligibleSet.has(pair));
+  const eligibleDetails: Partial<Record<ForexSymbol, EligiblePairDetail>> = {};
+  const pairs: ForexSymbol[] = [];
+  for (const pair of FOREX_PAIRS) {
+    const inst = byPair.get(pair);
+    if (inst && isInstrumentEligible(inst)) {
+      pairs.push(pair);
+      eligibleDetails[pair] = {
+        payoutPct: inst.payoutPct!,
+        availability: 'AVAILABLE',
+        evidence: 'HIGH',
+        sourceType: inst.sourceType || 'UNKNOWN',
+      };
+    }
+  }
+
   if (pairs.length === 0) {
     return {
       mode: 'OLYMP_NO_ELIGIBLE_PAIRS',
       pairs: [],
       liveCount: 0,
       capturedAt: status.capturedAt,
+      ageMs: effectiveAgeMs,
+      reason: 'No configured 29-pair instrument is explicitly AVAILABLE with >=80% HIGH-confidence payout on Olymp Trade.',
+      counts: { ...rawCounts, eligibleInUniverse: 0 },
+      eligibleDetails: {},
     };
   }
 
@@ -170,5 +372,67 @@ export function resolveActiveTradingPairs(
     pairs,
     liveCount: pairs.length,
     capturedAt: status.capturedAt,
+    ageMs: effectiveAgeMs,
+    reason: `Olymp Trade eligibility gate active across ${pairs.length} verified pair(s) paying >=80%.`,
+    counts: { ...rawCounts, eligibleInUniverse: pairs.length },
+    eligibleDetails,
   };
+}
+
+export function authorizeSignalWithBrokerSnapshot(
+  symbol: ForexSymbol,
+  status: OlympTradeBridgeStatus | null | undefined,
+  nowMs: number = Date.now()
+):
+  | { authorized: true; eligibility: BrokerEligibilitySnapshot; universe: ActiveTradingUniverse }
+  | { authorized: false; reason: string; universe: ActiveTradingUniverse } {
+  const universe = resolveActiveTradingPairs(status, nowMs);
+  if (universe.mode !== 'OLYMP_ACTIVE') {
+    return { authorized: false, reason: universe.reason, universe };
+  }
+  const detail = universe.eligibleDetails[symbol];
+  if (!detail || !universe.pairs.includes(symbol) || !universe.capturedAt) {
+    return {
+      authorized: false,
+      reason: `${symbol} is not in the currently eligible Olymp Trade active-pair universe.`,
+      universe,
+    };
+  }
+  return {
+    authorized: true,
+    universe,
+    eligibility: {
+      broker: 'OLYMP_TRADE',
+      mode: 'OLYMP_ACTIVE',
+      pair: symbol,
+      payoutPct: detail.payoutPct,
+      availability: 'AVAILABLE',
+      evidence: 'HIGH',
+      snapshotCapturedAt: universe.capturedAt,
+      verifiedAtUtc: new Date(nowMs).toISOString(),
+    },
+  };
+}
+
+export function isValidBrokerEligibilitySnapshot(
+  eligibility: BrokerEligibilitySnapshot | null | undefined,
+  expectedSymbol: ForexSymbol,
+  nowMs: number = Date.now()
+): boolean {
+  if (!eligibility || typeof eligibility !== 'object') return false;
+  if (eligibility.broker !== 'OLYMP_TRADE' || eligibility.mode !== 'OLYMP_ACTIVE') return false;
+  if (eligibility.pair !== expectedSymbol || !CONFIGURED_PAIR_SET.has(expectedSymbol)) return false;
+  if (eligibility.availability !== 'AVAILABLE' || eligibility.evidence !== 'HIGH') return false;
+  if (
+    typeof eligibility.payoutPct !== 'number' ||
+    !Number.isFinite(eligibility.payoutPct) ||
+    eligibility.payoutPct < MIN_ELIGIBLE_PAYOUT_PCT ||
+    eligibility.payoutPct > 100
+  ) {
+    return false;
+  }
+  const capturedMs = Date.parse(eligibility.snapshotCapturedAt);
+  if (!Number.isFinite(capturedMs)) return false;
+  const ageMs = nowMs - capturedMs;
+  return ageMs >= -5_000 && ageMs <= SNAPSHOT_FRESHNESS_MS;
 }

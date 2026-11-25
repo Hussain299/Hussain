@@ -5,8 +5,8 @@
   /* ───────── currency whitelist ───────── */
   const CURRENCIES = new Set([
     'USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'MXN', 'NOK', 'SEK', 'SGD',
-    'ZAR', 'TRY', 'PLN', 'HKD', 'CNY', 'INR', 'BRL', 'CZK', 'HUF', 'DKK', 'ILS', 'AED',
-    'SAR', 'THB', 'IDR', 'MYR', 'PHP', 'KRW',
+    'ZAR', 'TRY', 'PLN', 'HKD', 'CNY', 'CNH', 'INR', 'BRL', 'CZK', 'HUF', 'DKK', 'ILS',
+    'AED', 'SAR', 'THB', 'IDR', 'MYR', 'PHP', 'KRW',
   ]);
 
   /* ───────── regex patterns ───────── */
@@ -14,6 +14,18 @@
   const PAIR_NO_SLASH_REGEX = /\b([A-Z]{3})([A-Z]{3})\b/g;
   const PAYOUT_LABEL_REGEX = /(?:payout|profit|return|income|yield)[^0-9]{0,32}(\d{2,3}(?:\.\d{1,2})?)\s*%/i;
   const PERCENT_REGEX = /(?:^|[\s+•|·(])([5-9]\d(?:\.\d{1,2})?|100(?:\.0{1,2})?)\s*%/g;
+  const MARKET_CONTAINER_SELECTOR = [
+    '[role="dialog"]', '[role="listbox"]', '[role="menu"]', '[role="grid"]',
+    '[data-test*="asset" i]', '[data-testid*="asset" i]',
+    '[data-test*="market" i]', '[data-testid*="market" i]',
+    '[class*="asset" i]', '[class*="market" i]', '[class*="modal" i]',
+    '[class*="drawer" i]', '[class*="dropdown" i]', '[class*="popover" i]',
+    '[class*="selector" i]', '[class*="volume" i]',
+  ].join(',');
+  const INTERACTIVE_SELECTOR = 'button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"],[tabindex],li,tr';
+
+  const VIRTUAL_CACHE_TTL_MS = 25_000;
+  const virtualMarketListCache = new Map();
 
   /* ───────── visibility check ───────── */
   function isVisible(element) {
@@ -22,6 +34,7 @@
     if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) {
       return false;
     }
+    if (style.display === 'contents') return true;
     const rect = element.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   }
@@ -37,7 +50,7 @@
       element.getAttribute('data-symbol') || '',
       element.getAttribute('data-test') || '',
       element.getAttribute('alt') || '',
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 320);
+    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 400);
   }
 
   /* ───────── extract normalised currency pairs from text ───────── */
@@ -62,30 +75,43 @@
     return Array.from(pairs);
   }
 
-  /* ───────── find payout associated with a specific pair ───────── */
+  /* ───────── find payout associated strictly with a single pair row ───────── */
   function findPayout(text, pair) {
+    // 1. Explicit payout label is authoritative
     const labeled = text.match(PAYOUT_LABEL_REGEX);
     if (labeled) {
       const value = Number(labeled[1]);
       if (value >= 50 && value <= 100) return { payoutPct: value, evidence: 'HIGH' };
     }
 
+    // Ensure the row text contains only this pair so neighbouring pairs never bleed over
+    const allPairsInText = findPairs(text);
+    if (allPairsInText.length !== 1 || allPairsInText[0] !== pair) {
+      return { payoutPct: null, evidence: 'NONE' };
+    }
+
+    // Collect all plausible 50-100% values in this single-pair row
+    const percentages = Array.from(text.matchAll(PERCENT_REGEX))
+      .map(match => Number(match[1]))
+      .filter(value => Number.isFinite(value) && value >= 50 && value <= 100);
+
+    // Multiple distinct 50-100% numbers in the same row without an explicit label are ambiguous
+    if (percentages.length > 1) {
+      return { payoutPct: null, evidence: 'NONE' };
+    }
+
     const pairIndex = text.toUpperCase().indexOf(pair);
     if (pairIndex >= 0) {
-      const afterPair = text.slice(pairIndex + pair.length, pairIndex + pair.length + 48);
-      const adjacent = afterPair.match(/^[^0-9]{0,24}(\d{2,3}(?:\.\d{1,2})?)\s*%/);
+      const afterPair = text.slice(pairIndex + pair.length, pairIndex + pair.length + 56);
+      const adjacent = afterPair.match(/^[^0-9]{0,28}(\d{2,3}(?:\.\d{1,2})?)\s*%/);
       if (adjacent) {
         const value = Number(adjacent[1]);
         if (value >= 50 && value <= 100) return { payoutPct: value, evidence: 'HIGH' };
       }
     }
 
-    const allPairsInText = findPairs(text);
-    if (allPairsInText.length === 1 && allPairsInText[0] === pair) {
-      const percentages = Array.from(text.matchAll(PERCENT_REGEX))
-        .map(match => Number(match[1]))
-        .filter(value => value >= 50 && value <= 100);
-      if (percentages.length === 1) return { payoutPct: percentages[0], evidence: 'MEDIUM' };
+    if (percentages.length === 1) {
+      return { payoutPct: percentages[0], evidence: 'MEDIUM' };
     }
 
     return { payoutPct: null, evidence: 'NONE' };
@@ -95,19 +121,108 @@
   function findRowContainer(startElement, pair) {
     let best = startElement;
     let current = startElement.parentElement;
-    for (let depth = 0; depth < 6 && current && current !== document.body; depth++) {
-      const rect = current.getBoundingClientRect();
-      if (rect.height > 180 || rect.width > 1400) break;
+    for (let depth = 0; depth < 7 && current && current !== document.body; depth++) {
+      const style = window.getComputedStyle(current);
+      if (style.display !== 'contents') {
+        const rect = current.getBoundingClientRect();
+        if (rect.height > 180 || rect.width > 1400) break;
+      }
       const text = readText(current);
-      if (!text || text.length > 260) break;
+      if (!text || text.length > 360) break;
       const pairs = findPairs(text);
       if (pairs.length !== 1 || pairs[0] !== pair) break;
       best = current;
-      // If this container already has a percentage, we found the instrument row/card
-      if (/%/.test(text)) break;
+      // Continue climbing one more level if an immediate parent is the interactive button/row wrapper
+      if (/%/.test(text) && current.matches(INTERACTIVE_SELECTOR)) break;
       current = current.parentElement;
     }
     return best;
+  }
+
+  function hasInteractiveCue(rowEl, leaf) {
+    // Check elements from leaf up through rowEl and single-pair ancestors
+    let cur = leaf;
+    for (let i = 0; i < 8 && cur && cur !== document.body; i++) {
+      if (cur instanceof HTMLElement) {
+        if (cur.matches(INTERACTIVE_SELECTOR)) return true;
+        const style = window.getComputedStyle(cur);
+        if (style.cursor === 'pointer') return true;
+      }
+      if (cur === rowEl) break;
+      cur = cur.parentElement;
+    }
+
+    cur = rowEl;
+    for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
+      if (cur instanceof HTMLElement) {
+        if (cur.matches(INTERACTIVE_SELECTOR)) return true;
+        if (window.getComputedStyle(cur).cursor === 'pointer') return true;
+      }
+      cur = cur.parentElement;
+    }
+
+    const childInteractive = rowEl.querySelector('button,a,[role="button"],[role="option"],[role="tab"],[tabindex]');
+    if (childInteractive && isVisible(childInteractive)) return true;
+    const descendants = rowEl.querySelectorAll('*');
+    for (let i = 0; i < descendants.length && i < 25; i++) {
+      if (descendants[i] instanceof HTMLElement && window.getComputedStyle(descendants[i]).cursor === 'pointer') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function hasDisabledCue(rowEl, text) {
+    let cur = rowEl;
+    for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
+      if (cur instanceof HTMLElement) {
+        if (
+          cur.hasAttribute('disabled') ||
+          cur.getAttribute('aria-disabled') === 'true' ||
+          cur.getAttribute('data-disabled') === 'true' ||
+          cur.getAttribute('data-locked') === 'true'
+        ) {
+          return true;
+        }
+        const cls = typeof cur.className === 'string' ? cur.className : '';
+        if (/\b(disabled|unavailable|closed|suspended|locked|inactive)\b/i.test(cls)) return true;
+        const opacity = Number(window.getComputedStyle(cur).opacity || 1);
+        if (Number.isFinite(opacity) && opacity < 0.6) return true;
+      }
+      cur = cur.parentElement;
+    }
+    return /\b(disabled|unavailable|closed|suspended|locked|inactive|not\s+available)\b/i.test(text);
+  }
+
+  function classifySourceType(rowEl) {
+    if (rowEl.closest('[role="tablist"],[role="tab"]')) return 'TAB';
+    const rect = rowEl.getBoundingClientRect();
+    if (rect.top >= 0 && rect.top < 110 && rect.height > 0 && rect.height <= 76 && !rowEl.closest('[role="dialog"],[role="listbox"],[role="menu"]')) {
+      return 'TAB';
+    }
+    if (rowEl.closest(MARKET_CONTAINER_SELECTOR)) return 'MARKET_LIST';
+    let cur = rowEl.parentElement;
+    for (let i = 0; i < 6 && cur && cur !== document.body; i++) {
+      const style = window.getComputedStyle(cur);
+      if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && cur.scrollHeight > cur.clientHeight + 20) {
+        return 'MARKET_LIST';
+      }
+      cur = cur.parentElement;
+    }
+    return 'UNKNOWN';
+  }
+
+  function hasOpenMarketListContainer() {
+    const candidates = document.querySelectorAll('[role="dialog"],[role="listbox"],[role="menu"],[class*="asset" i],[class*="market" i],[class*="modal" i],[class*="drawer" i],[class*="dropdown" i],[class*="popover" i]');
+    for (let i = 0; i < candidates.length && i < 120; i++) {
+      const el = candidates[i];
+      if (!isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.height >= 160 && rect.width >= 200 && findPairs(readText(el)).length >= 2) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /* ───────── scan visible instruments via TreeWalker + attribute fallback ───────── */
@@ -115,12 +230,11 @@
     const found = new Map();
     const candidateLeaves = new Set();
 
-    // 1. Walk visible text nodes containing currency-like letters (including split <span>EUR</span><span>/USD</span>)
     if (document.body) {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
       let visited = 0;
-      while ((node = walker.nextNode()) && visited < 30000) {
+      while ((node = walker.nextNode()) && visited < 40000) {
         visited++;
         const raw = node.nodeValue ? node.nodeValue.trim() : '';
         if (!raw || raw.length < 3 || raw.length > 80) continue;
@@ -138,9 +252,8 @@
       }
     }
 
-    // 2. Also check elements with aria-label / data-asset / data-symbol / title
     const attrNodes = document.querySelectorAll('[aria-label],[data-asset],[data-symbol],[title]');
-    for (let i = 0; i < attrNodes.length && i < 1500; i++) {
+    for (let i = 0; i < attrNodes.length && i < 2000; i++) {
       const el = attrNodes[i];
       if (isVisible(el)) candidateLeaves.add(el);
     }
@@ -154,44 +267,53 @@
       if (!isVisible(rowEl)) continue;
 
       const text = readText(rowEl);
-      if (!text || text.length > 260) continue;
+      if (!text || text.length > 360) continue;
+      // Never conflate OTC instruments with live FX currency pairs
+      if (/\bOTC\b/i.test(text)) continue;
 
-      const classText = typeof rowEl.className === 'string' ? rowEl.className : '';
-      const isDisabled = rowEl.hasAttribute('disabled') ||
-        rowEl.getAttribute('aria-disabled') === 'true' ||
-        /\b(disabled|unavailable|closed|suspended|locked)\b/i.test(classText) ||
-        /\b(disabled|unavailable|closed|suspended|locked)\b/i.test(text);
-      const hasPointer = el => {
-        let cur = el;
-        for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
-          if (window.getComputedStyle(cur).cursor === 'pointer') return true;
-          cur = cur.parentElement;
-        }
-        return false;
-      };
-      const isInteractive = rowEl.matches('button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"],li,tr') ||
-        Boolean(rowEl.closest('button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"]')) ||
-        Boolean(rowEl.querySelector('button,[role="button"]')) ||
-        hasPointer(rowEl);
+      const isDisabled = hasDisabledCue(rowEl, text);
+      const isInteractive = hasInteractiveCue(rowEl, leaf);
       const availability = isDisabled ? 'UNAVAILABLE' : isInteractive ? 'AVAILABLE' : 'UNKNOWN';
-
+      const sourceType = classifySourceType(rowEl);
       const payout = findPayout(text, pair);
+
       const next = {
         pair,
         payoutPct: payout.payoutPct,
         availability,
         evidence: payout.evidence,
+        sourceType,
         textLength: text.length,
       };
 
       const previous = found.get(pair);
       const score = row =>
+        (row.sourceType === 'MARKET_LIST' ? 40 : row.sourceType === 'TAB' ? 10 : 0) +
         (row.payoutPct !== null ? 100 : 0) +
         (row.evidence === 'HIGH' ? 20 : row.evidence === 'MEDIUM' ? 10 : 0) +
         (row.availability === 'AVAILABLE' ? 5 : 0) -
         row.textLength / 1000;
 
       if (!previous || score(next) > score(previous)) found.set(pair, next);
+    }
+
+    const nowMs = Date.now();
+    const marketOpen = hasOpenMarketListContainer();
+    if (!marketOpen) {
+      virtualMarketListCache.clear();
+    } else {
+      for (const [pair, row] of found.entries()) {
+        if (row.sourceType === 'MARKET_LIST') {
+          virtualMarketListCache.set(pair, { row, seenAt: nowMs });
+        }
+      }
+      for (const [pair, entry] of virtualMarketListCache.entries()) {
+        if (nowMs - entry.seenAt > VIRTUAL_CACHE_TTL_MS) {
+          virtualMarketListCache.delete(pair);
+        } else if (!found.has(pair)) {
+          found.set(pair, entry.row);
+        }
+      }
     }
 
     return Array.from(found.values())
@@ -202,6 +324,7 @@
         payoutPct: row.payoutPct,
         availability: row.availability,
         evidence: row.evidence,
+        sourceType: row.sourceType,
       }));
   }
 
@@ -233,6 +356,7 @@
       intervalId = null;
     }
     observer.disconnect();
+    document.removeEventListener('scroll', schedulePublish, true);
   }
 
   function publishSnapshot() {
@@ -261,7 +385,6 @@
     }
   }
 
-  /* ───────── debounced mutation-driven publish ───────── */
   let scheduled = false;
   function schedulePublish() {
     if (scheduled) return;
@@ -269,7 +392,7 @@
     window.setTimeout(() => {
       scheduled = false;
       publishSnapshot();
-    }, 500);
+    }, 350);
   }
 
   const observer = new MutationObserver(schedulePublish);
@@ -281,10 +404,12 @@
       attributes: true,
       attributeFilter: [
         'aria-label', 'aria-disabled', 'data-asset', 'data-symbol',
-        'data-test', 'data-testid', 'class', 'disabled', 'title',
+        'data-test', 'data-testid', 'data-disabled', 'data-locked', 'class', 'disabled', 'title',
       ],
     });
   }
+
+  document.addEventListener('scroll', schedulePublish, { capture: true, passive: true });
 
   chrome.runtime.onMessage.addListener(message => {
     if (message && message.type === 'OLYMP_SCAN_NOW') publishSnapshot();

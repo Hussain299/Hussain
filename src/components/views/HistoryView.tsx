@@ -554,6 +554,13 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
                           <span className="px-2 py-0.5 rounded text-[10px] font-bold border bg-[#72A98B]/10 text-[#72A98B] border-[#72A98B]/30">
                             {trade.strategyName || trade.ruleFamily || 'Momentum'}
                           </span>
+                          <span className={`ml-1.5 px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border ${
+                            trade.brokerEligibility
+                              ? 'bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/30'
+                              : 'bg-[#C5A36A]/10 text-[#C5A36A] border-[#C5A36A]/25'
+                          }`}>
+                            {trade.brokerEligibility ? `OLYMP ${trade.brokerEligibility.payoutPct}%` : 'LEGACY'}
+                          </span>
                         </td>
 
                         {/* Symbol & Direction */}

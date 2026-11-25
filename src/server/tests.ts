@@ -12,9 +12,14 @@ import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS 
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { buildAccuracyReport } from '../utils/accuracyAnalytics.js';
-import { sanitizeOlympTradeBridgeStatus, normalizePair, resolveActiveTradingPairs } from '../services/olympTradeBridge.js';
 import { telegramService } from './telegramService.js';
-import { isWithinStrictSignalDiscoveryWindow } from './scheduler.js';
+import { isWithinStrictSignalDiscoveryWindow, AutonomousScheduler } from './scheduler.js';
+import {
+  sanitizeOlympTradeBridgeStatus,
+  normalizePair,
+  resolveActiveTradingPairs,
+  authorizeSignalWithBrokerSnapshot,
+} from '../services/olympTradeBridge.js';
 import {
   createInitialOnlineLearnerState,
   getOnlineLearnerSummary,
@@ -456,49 +461,251 @@ export async function runAllVerificationTests(): Promise<{
     if (status.connected) throw new Error('READY with no instruments should not be connected');
   });
 
-  await runTest('DATA', 'Olymp Trade active-pair filter: uses >=80% available configured pairs when live and falls back to 29 when offline', () => {
+  await runTest('DATA', 'Fail-closed broker eligibility: missing, restarted, stale, login-required and disconnected snapshots yield zero pairs', () => {
     const now = Date.now();
-    // 1. Offline / null -> fallback 29
-    const offline = resolveActiveTradingPairs(null, now);
-    if (offline.mode !== 'FALLBACK_29' || offline.pairs.length !== 29) {
-      throw new Error('Offline bridge must fall back to 29-pair universe');
+    // 1. No broker snapshot
+    const noSnap = resolveActiveTradingPairs(null, now);
+    if (noSnap.mode !== 'OLYMP_WAITING_FOR_SNAPSHOT' || noSnap.pairs.length !== 0) {
+      throw new Error(`Expected OLYMP_WAITING_FOR_SNAPSHOT with 0 pairs, got ${noSnap.mode} (${noSnap.pairs.length})`);
     }
-
-    // 2. Live snapshot -> filters to >=80% non-unavailable pairs within FOREX_PAIRS
+    // 2. Freshly restarted scheduler has zero eligible pairs
+    const freshScheduler = new AutonomousScheduler();
+    const restarted = freshScheduler.getActiveTradingUniverse(now);
+    if (restarted.mode !== 'OLYMP_WAITING_FOR_SNAPSHOT' || restarted.pairs.length !== 0) {
+      throw new Error(`Restarted scheduler must fail closed with 0 pairs, got ${restarted.mode}`);
+    }
+    // 3. Stale snapshot (>45s) yields 0 pairs
     const liveStatus = sanitizeOlympTradeBridgeStatus({
-      extensionInstalled: true, extensionVersion: '1.1.2', platformTabOpen: true,
+      extensionInstalled: true, extensionVersion: '1.2.0', platformTabOpen: true,
       connected: true, sessionState: 'READY',
       capturedAt: new Date(now - 5_000).toISOString(), ageMs: 5_000,
-      instruments: [
-        { pair: 'EUR/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH' },
-        { pair: 'GBP/JPY', payoutPct: 75, availability: 'AVAILABLE', evidence: 'HIGH' }, // <80% excluded
-        { pair: 'AUD/CAD', payoutPct: 85, availability: 'UNAVAILABLE', evidence: 'HIGH' }, // unavailable excluded
-        { pair: 'BTC/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH' }, // non-29 excluded
-      ],
+      instruments: [{ pair: 'EUR/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH' }],
     });
-    const active = resolveActiveTradingPairs(liveStatus, now);
-    if (active.mode !== 'OLYMP_ACTIVE' || active.pairs.length !== 1 || active.pairs[0] !== 'EUR/USD') {
-      throw new Error(`Expected OLYMP_ACTIVE with [EUR/USD], got ${active.mode} ${JSON.stringify(active.pairs)}`);
+    const stale = resolveActiveTradingPairs(liveStatus, now + 50_000);
+    if (stale.mode !== 'OLYMP_STALE' || stale.pairs.length !== 0) {
+      throw new Error(`Stale snapshot must produce 0 pairs in OLYMP_STALE mode, got ${stale.mode} (${stale.pairs.length})`);
     }
-
-    // 3. Stale snapshot (>90s) -> fallback 29
-    const stale = resolveActiveTradingPairs(liveStatus, now + 120_000);
-    if (stale.mode !== 'FALLBACK_29' || stale.pairs.length !== 29) {
-      throw new Error('Stale server snapshot must fall back to 29-pair universe');
+    // 4. Login-required yields 0 pairs
+    const loginReq = resolveActiveTradingPairs(sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.2.0', platformTabOpen: true,
+      connected: false, sessionState: 'LOGIN_REQUIRED',
+      capturedAt: new Date(now - 1_000).toISOString(), ageMs: 1_000,
+      instruments: [{ pair: 'EUR/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH' }],
+    }), now);
+    if (loginReq.mode !== 'OLYMP_LOGIN_REQUIRED' || loginReq.pairs.length !== 0) {
+      throw new Error(`LOGIN_REQUIRED must yield 0 pairs, got ${loginReq.mode}`);
     }
+    // 19. Disconnected browser cannot reactivate 29 pairs
+    const disconnected = resolveActiveTradingPairs(sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.2.0', platformTabOpen: false,
+      connected: false, sessionState: 'NO_PLATFORM_TAB',
+      capturedAt: null, ageMs: null, instruments: [],
+    }), now);
+    if (disconnected.pairs.length !== 0) {
+      throw new Error('Disconnected browser must never reactivate the 29-pair universe');
+    }
+  });
 
-    // 4. Live snapshot with zero >=80% pairs -> OLYMP_NO_ELIGIBLE_PAIRS (empty)
-    const lowPayoutStatus = sanitizeOlympTradeBridgeStatus({
-      extensionInstalled: true, extensionVersion: '1.1.2', platformTabOpen: true,
+  await runTest('DATA', 'Fail-closed broker eligibility: enforces AVAILABLE, HIGH evidence, >=80.00% payout, and 15+ pair market discovery', () => {
+    const now = Date.now();
+    // 5-9: UNKNOWN, UNAVAILABLE, missing payout, 79.99%, MEDIUM evidence rejected; exactly 80% + AVAILABLE + HIGH qualifies
+    const strictCheck = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.2.0', platformTabOpen: true,
       connected: true, sessionState: 'READY',
       capturedAt: new Date(now - 2_000).toISOString(), ageMs: 2_000,
       instruments: [
-        { pair: 'EUR/USD', payoutPct: 70, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'EUR/USD', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'GBP/USD', payoutPct: 79.99, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'USD/JPY', payoutPct: 85, availability: 'UNKNOWN', evidence: 'HIGH', sourceType: 'TAB' },
+        { pair: 'AUD/CAD', payoutPct: 85, availability: 'UNAVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'EUR/GBP', payoutPct: null, availability: 'AVAILABLE', evidence: 'NONE', sourceType: 'MARKET_LIST' },
+        { pair: 'EUR/AUD', payoutPct: 84, availability: 'AVAILABLE', evidence: 'MEDIUM', sourceType: 'MARKET_LIST' },
+        { pair: 'BTC/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
       ],
     });
-    const noEligible = resolveActiveTradingPairs(lowPayoutStatus, now);
-    if (noEligible.mode !== 'OLYMP_NO_ELIGIBLE_PAIRS' || noEligible.pairs.length !== 0) {
-      throw new Error('Live Olymp Trade with 0 eligible >=80% pairs must return OLYMP_NO_ELIGIBLE_PAIRS');
+    const strictRes = resolveActiveTradingPairs(strictCheck, now);
+    if (
+      strictRes.mode !== 'OLYMP_ACTIVE' ||
+      strictRes.pairs.length !== 1 ||
+      strictRes.pairs[0] !== 'EUR/USD' ||
+      strictRes.counts.outsideUniverse !== 1 ||
+      strictRes.counts.unknownAvailability !== 1 ||
+      strictRes.counts.unavailable !== 1
+    ) {
+      throw new Error(`Strict eligibility filter failed: ${JSON.stringify(strictRes)}`);
+    }
+
+    // 10-13: 15+ observed pairs produce exact eligible subset, keep accurate payouts, deduplicate, and exclude non-29
+    const fifteenPlus = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.2.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date(now - 2_000).toISOString(), ageMs: 2_000,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'EUR/USD', payoutPct: 80, availability: 'UNKNOWN', evidence: 'MEDIUM', sourceType: 'TAB' }, // duplicate lower-score
+        { pair: 'GBP/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'USD/JPY', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'AUD/USD', payoutPct: 81, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'USD/CAD', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'EUR/JPY', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'GBP/JPY', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'EUR/GBP', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'AUD/CAD', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'EUR/AUD', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'USD/CHF', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'NZD/USD', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'AUD/JPY', payoutPct: 78, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' }, // <80%
+        { pair: 'CAD/JPY', payoutPct: 80, availability: 'UNAVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' }, // unavailable
+        { pair: 'USD/NOK', payoutPct: 85, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' }, // outside 29
+        { pair: 'EUR/NOK', payoutPct: 85, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' }, // outside 29
+      ],
+    });
+    const res15 = resolveActiveTradingPairs(fifteenPlus, now);
+    if (
+      res15.counts.observed !== 16 ||
+      res15.counts.outsideUniverse !== 2 ||
+      res15.pairs.length !== 12 ||
+      res15.eligibleDetails['EUR/USD']?.payoutPct !== 82 ||
+      res15.pairs.includes('AUD/JPY') ||
+      res15.pairs.includes('CAD/JPY') ||
+      res15.pairs.includes('USD/NOK' as any)
+    ) {
+      throw new Error(`15+ instrument discovery eligibility mismatch: ${JSON.stringify(res15)}`);
+    }
+  });
+
+  await runTest('ENTRY_EXIT', 'Authoritative scheduler & signal gate blocks ineligible pairs, blocks Telegram dispatch, and preserves legacy settlement', async () => {
+    const now = Date.now();
+    const scheduler = new AutonomousScheduler();
+    const candle: Candle = {
+      symbol: 'GBP/NZD',
+      timestamp: new Date(now).toISOString(),
+      timestampMs: now,
+      open: 2.11,
+      high: 2.112,
+      low: 2.109,
+      close: 2.111,
+      volume: 100,
+      source: 'yahoo',
+    };
+
+    // 14. Attempting non-test signal creation without active broker snapshot throws
+    let blockedNoSnap = false;
+    try {
+      entryExitEngine.createResearchSignal({
+        symbol: 'GBP/NZD',
+        direction: 'BUY',
+        signalCandle: candle,
+        ruleFamily: 'momentum_5',
+        expiryMinutes: 5,
+        confidence: 0.8,
+        modelVersion: 'vTest',
+      });
+    } catch (e: any) {
+      blockedNoSnap = String(e.message).includes('BROKER_ELIGIBILITY_BLOCKED');
+    }
+    if (!blockedNoSnap) throw new Error('createResearchSignal allowed non-test signal creation without broker eligibility');
+
+    // 18 & 20. Updating snapshot on scheduler updates universe dynamically without restart & matches UI resolver
+    const snap = {
+      extensionInstalled: true, extensionVersion: '1.2.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date(now - 1_000).toISOString(), ageMs: 1_000,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      ],
+    };
+    const serverUni = scheduler.updateOlympTradeSnapshot(snap);
+    const uiUni = resolveActiveTradingPairs(sanitizeOlympTradeBridgeStatus(snap), now);
+    if (serverUni.pairs.length !== uiUni.pairs.length || serverUni.pairs[0] !== 'EUR/USD') {
+      throw new Error('Server universe and UI resolver must produce identical eligible counts');
+    }
+
+    // Attempting scheduler signal creation for ineligible pair GBP/NZD must fail closed
+    let blockedIneligible = false;
+    try {
+      scheduler.createBrokerGatedSignal({
+        symbol: 'GBP/NZD',
+        direction: 'BUY',
+        signalCandle: candle,
+        ruleFamily: 'momentum_5',
+        expiryMinutes: 5,
+        confidence: 0.82,
+        modelVersion: 'vTest',
+      }, now);
+    } catch (e: any) {
+      blockedIneligible = String(e.message).includes('BROKER_ELIGIBILITY_BLOCKED');
+    }
+    if (!blockedIneligible) throw new Error('Scheduler allowed signal creation for pair outside eligible Olymp Trade universe');
+
+    // 15. Telegram dispatch blocks legacy / ineligible signals
+    const legacySignal: any = {
+      id: 'sig_legacy_block_test',
+      symbol: 'GBP/NZD',
+      direction: 'SELL',
+      predictionTimeUtc: new Date(now).toISOString(),
+      predictionTimeIst: '07:41:53 PM IST',
+      signalCandleTime: new Date(now).toISOString(),
+      entryCondition: 'test',
+      entryWindowStartUtc: new Date(now).toISOString(),
+      entryWindowEndUtc: new Date(now + 300_000).toISOString(),
+      triggerPrice: 2.11,
+      invalidationPrice: 2.12,
+      actualEntryTimeUtc: null,
+      actualEntryPrice: null,
+      entrySource: null,
+      expiryMinutes: 5,
+      plannedExitTimeUtc: null,
+      actualExitTimeUtc: null,
+      actualExitPrice: null,
+      confidence: 0.9,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'WAITING_FOR_ENTRY',
+      lifecycleHistory: [],
+      grossReturnPips: null,
+      estimatedSpreadPips: 2.4,
+      netReturnPips: null,
+      outcomeResult: 'PENDING',
+      ruleFamily: 'test_legacy_telegram',
+      modelVersion: 'vTest',
+    };
+    const tgResult = await telegramService.sendSignalAlert(legacySignal);
+    if (tgResult.length !== 0) {
+      throw new Error('Telegram must block new signal dispatch when brokerEligibility is missing/ineligible');
+    }
+
+    // 16 & 17. Eligible authorization + legacy active position continues normal settlement & stays preserved
+    const auth = authorizeSignalWithBrokerSnapshot('EUR/USD', sanitizeOlympTradeBridgeStatus(snap), now);
+    if (!auth.authorized || auth.eligibility.payoutPct !== 82) {
+      throw new Error('Eligible EUR/USD authorization failed');
+    }
+    const baseMs = Math.floor((now - 15 * 60_000) / 60_000) * 60_000;
+    const legacySigCandle: Candle = {
+      symbol: 'GBP/NZD', timestamp: new Date(baseMs).toISOString(), timestampMs: baseMs,
+      open: 2.100, high: 2.101, low: 2.099, close: 2.1005, volume: 100, source: 'test_fixture',
+    };
+    const openLegacy = entryExitEngine.createResearchSignal({
+      symbol: 'GBP/NZD',
+      direction: 'BUY',
+      signalCandle: legacySigCandle,
+      ruleFamily: `test_legacy_open_${now}`,
+      expiryMinutes: 5,
+      confidence: 0.78,
+      modelVersion: 'vLegacy',
+    });
+    const legacyEntryCandle: Candle = {
+      ...legacySigCandle, timestamp: new Date(baseMs + 60_000).toISOString(), timestampMs: baseMs + 60_000,
+      open: 2.1006, high: 2.1015, low: 2.1002, close: 2.1012,
+    };
+    const legacyExitCandle: Candle = {
+      ...legacySigCandle, timestamp: new Date(baseMs + 5 * 60_000).toISOString(), timestampMs: baseMs + 5 * 60_000,
+      open: 2.1012, high: 2.1025, low: 2.1010, close: 2.1020,
+    };
+    entryExitEngine.evaluateSignals({ 'GBP/NZD': [legacySigCandle, legacyEntryCandle] } as any, true);
+    entryExitEngine.evaluateSignals({ 'GBP/NZD': [legacySigCandle, legacyEntryCandle, legacyExitCandle] } as any, true);
+    const settledLegacy = db.getSignalById(openLegacy.id);
+    if (!settledLegacy || settledLegacy.lifecycleState !== 'CLOSED' || settledLegacy.outcomeResult !== 'WIN') {
+      throw new Error(`Legacy open signal must continue normal settlement, got ${settledLegacy?.lifecycleState}/${settledLegacy?.outcomeResult}`);
     }
   });
 

@@ -13,24 +13,36 @@ function isSignalForgeUrl(value) {
   return host === 'signalforge-ml.ai.studio' || host === 'localhost' || host === '127.0.0.1';
 }
 
+function instrumentScore(row) {
+  return (
+    (row.availability === 'AVAILABLE' ? 200 : row.availability === 'UNAVAILABLE' ? 50 : 0) +
+    (row.evidence === 'HIGH' ? 100 : row.evidence === 'MEDIUM' ? 30 : 0) +
+    (row.payoutPct !== null ? 40 : 0) +
+    (row.sourceType === 'MARKET_LIST' ? 10 : 0)
+  );
+}
+
 function cleanSnapshot(value, tabId) {
   if (!value || typeof value !== 'object' || !Array.isArray(value.instruments)) return null;
-  const instruments = [];
-  const seen = new Set();
+  const byPair = new Map();
   for (const row of value.instruments.slice(0, 300)) {
     if (!row || typeof row.pair !== 'string') continue;
     const pair = row.pair.trim().toUpperCase();
-    if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(pair) || seen.has(pair)) continue;
-    // Reject same-currency pairs like USD/USD
+    if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(pair)) continue;
     const [base, quote] = pair.split('/');
     if (base === quote) continue;
-    seen.add(pair);
     const payoutPct = typeof row.payoutPct === 'number' && Number.isFinite(row.payoutPct) && row.payoutPct >= 50 && row.payoutPct <= 100
       ? Math.round(row.payoutPct * 100) / 100 : null;
     const availability = row.availability === 'AVAILABLE' || row.availability === 'UNAVAILABLE' ? row.availability : 'UNKNOWN';
     const evidence = row.evidence === 'HIGH' || row.evidence === 'MEDIUM' ? row.evidence : 'NONE';
-    instruments.push({ pair, payoutPct, availability, evidence });
+    const sourceType = row.sourceType === 'MARKET_LIST' || row.sourceType === 'TAB' ? row.sourceType : 'UNKNOWN';
+    const cleaned = { pair, payoutPct, availability, evidence, sourceType };
+    const prev = byPair.get(pair);
+    if (!prev || instrumentScore(cleaned) > instrumentScore(prev)) {
+      byPair.set(pair, cleaned);
+    }
   }
+  const instruments = Array.from(byPair.values()).sort((a, b) => a.pair.localeCompare(b.pair));
   const sessionState = value.sessionState === 'READY' || value.sessionState === 'LOGIN_REQUIRED'
     ? value.sessionState : 'WAITING_FOR_MARKET_DATA';
   return { tabId, capturedAt: new Date().toISOString(), sessionState, instruments };
@@ -53,7 +65,6 @@ async function makeStatus() {
   else if (snapshotTabOpen && !fresh) sessionState = 'STALE';
   else if (fresh) sessionState = snapshot.sessionState;
 
-  // Clear stale snapshot data when OT tab is closed
   const instruments = (fresh && snapshot) ? snapshot.instruments : [];
   const capturedAt = (fresh && snapshot) ? snapshot.capturedAt : null;
 
@@ -69,7 +80,6 @@ async function makeStatus() {
   };
 }
 
-/* ───────── Clean up stored snapshot when OT tabs are closed ───────── */
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   try {
     const stored = await chrome.storage.local.get(STORAGE_KEY);
@@ -80,7 +90,6 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   } catch {}
 });
 
-/* ───────── Message handler ───────── */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
 
@@ -110,7 +119,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await Promise.all(tabs.map(tab => tab.id
           ? chrome.tabs.sendMessage(tab.id, { type: 'OLYMP_SCAN_NOW' }).catch(() => undefined)
           : Promise.resolve()));
-        // Small delay to let content script publish before we read
         await new Promise(r => setTimeout(r, 600));
         sendResponse(await makeStatus());
       }).catch(async () => sendResponse(await makeStatus()));

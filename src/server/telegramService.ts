@@ -6,6 +6,7 @@
 
 import { FOREX_PAIRS, ResearchSignal, TelegramConfig, TelegramSubscriber, TelegramDispatchResult } from '../types/index.js';
 import { db } from './db.js';
+import { isValidBrokerEligibilitySnapshot } from '../services/olympTradeBridge.js';
 
 function escapeHtml(text: string | number | undefined | null): string {
   if (text === undefined || text === null) return '';
@@ -415,6 +416,14 @@ export class TelegramService {
    * Format and send an institutional trading signal alert
    */
   public async sendSignalAlert(signal: ResearchSignal): Promise<TelegramDispatchResult[]> {
+    // Fail-closed broker eligibility check: never dispatch new alerts for legacy or ineligible pairs.
+    if (!isValidBrokerEligibilitySnapshot(signal.brokerEligibility, signal.symbol)) {
+      console.warn(
+        `[Telegram] Blocked dispatch for ${signal.symbol} (${signal.id}): missing or stale Olymp Trade eligibility snapshot.`
+      );
+      return [];
+    }
+
     const config = db.getTelegramConfig();
     if (!config.enabled || !config.notifyOnNewSignal) {
       return [];
