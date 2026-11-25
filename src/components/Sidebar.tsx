@@ -18,6 +18,7 @@ import {
   Layers,
   Sliders,
   Server,
+  Link2,
 } from 'lucide-react';
 
 export type ViewTab =
@@ -27,6 +28,7 @@ export type ViewTab =
   | 'history'
   | 'analytics'
   | 'accuracy'
+  | 'broker'
   | 'brain'
   | 'behaviour'
   | 'system'
@@ -103,6 +105,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
           label: 'Session & Pair Accuracy',
           desc: 'Verified win rate by market session and currency pair',
           icon: Target,
+        },
+        {
+          id: 'broker',
+          label: 'Olymp Trade Feed',
+          desc: 'Read-only live instruments & payout snapshot',
+          icon: Link2,
+          badge: 'READ ONLY',
         },
         {
           id: 'brain',
