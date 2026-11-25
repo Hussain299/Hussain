@@ -1,7 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Activity, AlertCircle, AlertTriangle, CheckCircle2, CircleHelp, ExternalLink, Link2, RefreshCw, ShieldCheck, Wifi, WifiOff, Clock, Eye } from 'lucide-react';
 import { FOREX_PAIRS } from '../../types/index.js';
-import { OlympTradeBridgeStatus, requestOlympTradeBridgeStatus } from '../../services/olympTradeBridge.js';
+import {
+  ActiveTradingUniverse,
+  OlympTradeBridgeStatus,
+  requestOlympTradeBridgeStatus,
+  resolveActiveTradingPairs,
+} from '../../services/olympTradeBridge.js';
 
 const EMPTY_STATUS: OlympTradeBridgeStatus = {
   extensionInstalled: false, extensionVersion: null, platformTabOpen: false,
@@ -27,6 +32,7 @@ export const BrokerConnectionView: React.FC = () => {
   const [status, setStatus] = useState<OlympTradeBridgeStatus>(EMPTY_STATUS);
   const [checking, setChecking] = useState(false);
   const [lastRefreshTime, setLastRefreshTime] = useState<string | null>(null);
+  const [serverUniverse, setServerUniverse] = useState<ActiveTradingUniverse | null>(null);
 
   const refresh = useCallback(async (forceScan = false) => {
     setChecking(true);
@@ -34,6 +40,17 @@ export const BrokerConnectionView: React.FC = () => {
       const result = await requestOlympTradeBridgeStatus(forceScan ? 'REFRESH' : 'GET_STATUS');
       setStatus(result);
       setLastRefreshTime(new Date().toISOString());
+      if (result.extensionInstalled) {
+        const res = await fetch('/api/broker/olymptrade/snapshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(result),
+        }).catch(() => null);
+        if (res && res.ok) {
+          const data = await res.json();
+          setServerUniverse(data);
+        }
+      }
     } finally { setChecking(false); }
   }, []);
 
@@ -50,6 +67,7 @@ export const BrokerConnectionView: React.FC = () => {
   const mediumPayoutCount = status.instruments.filter(row => row.payoutPct !== null && row.evidence === 'MEDIUM').length;
   const trackedCount = status.instruments.filter(row => configuredPairs.has(row.pair)).length;
   const dataIsFresh = status.connected && status.ageMs !== null && status.ageMs <= 45_000;
+  const activeUniverse = serverUniverse ?? resolveActiveTradingPairs(status);
 
   const stateLabel = !status.extensionInstalled ? 'COMPANION NOT INSTALLED'
     : !status.platformTabOpen ? 'OLYMP TRADE TAB NOT OPEN'
@@ -86,7 +104,22 @@ export const BrokerConnectionView: React.FC = () => {
         <section className="rounded-xl border border-[#354251] bg-[#161F2B] p-4 sm:p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">{dataIsFresh ? <Wifi className="h-5 w-5 text-[#72A98B]" /> : <WifiOff className="h-5 w-5 text-[#C5A36A]" />}<span className="font-mono text-sm font-bold">LOCAL BROWSER COMPANION</span></div>
-            <span className={'rounded-full border px-3 py-1 text-[10px] font-mono font-bold tracking-wide ' + stateClass}>{stateLabel}</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={'rounded-full border px-3 py-1 text-[10px] font-mono font-bold tracking-wide ' + (
+                activeUniverse.mode === 'OLYMP_ACTIVE'
+                  ? 'bg-[#72A98B]/15 border-[#72A98B]/40 text-[#72A98B]'
+                  : activeUniverse.mode === 'OLYMP_NO_ELIGIBLE_PAIRS'
+                  ? 'bg-[#C67D83]/15 border-[#C67D83]/40 text-[#C67D83]'
+                  : 'bg-[#1B2633] border-[#354251] text-[#AAB4BF]'
+              )}>
+                {activeUniverse.mode === 'OLYMP_ACTIVE'
+                  ? `SCHEDULER: OLYMP ACTIVE (${activeUniverse.pairs.length} PAIRS ≥80%)`
+                  : activeUniverse.mode === 'OLYMP_NO_ELIGIBLE_PAIRS'
+                  ? 'SCHEDULER: PAUSED (0 OLYMP PAIRS ≥80%)'
+                  : 'SCHEDULER: FALLBACK 29 PAIRS'}
+              </span>
+              <span className={'rounded-full border px-3 py-1 text-[10px] font-mono font-bold tracking-wide ' + stateClass}>{stateLabel}</span>
+            </div>
           </div>
           <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="rounded-lg border border-[#2B3949] bg-[#121820] p-3"><div className="text-[10px] text-[#82909D] font-mono uppercase">Extension</div><div className="mt-1 text-sm font-bold">{status.extensionInstalled ? 'Installed · v' + (status.extensionVersion || 'unknown') : 'Not detected'}</div></div>

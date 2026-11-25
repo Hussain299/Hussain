@@ -28,6 +28,7 @@ import {
   ResearchSignal,
 } from './types/index.ts';
 import { useFirebase } from './contexts/FirebaseContext.tsx';
+import { requestOlympTradeBridgeStatus } from './services/olympTradeBridge.ts';
 
 function isSettledImmutable(sig?: ResearchSignal | null): boolean {
   return Boolean(
@@ -71,6 +72,27 @@ export default function App() {
       localStorage.removeItem('signalforge_cached_signals');
       localStorage.removeItem('signalforge_cached_prices');
     } catch {}
+  }, []);
+
+  // Forward sanitized read-only Olymp Trade companion snapshots to the scheduler while app is open
+  useEffect(() => {
+    const syncBridgeToServer = async () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      try {
+        const status = await requestOlympTradeBridgeStatus('GET_STATUS');
+        if (!status.extensionInstalled) return;
+        await fetch('/api/broker/olymptrade/snapshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(status),
+        });
+      } catch {
+        // Non-fatal: scheduler automatically falls back to 29-pair universe when offline
+      }
+    };
+    void syncBridgeToServer();
+    const timer = window.setInterval(() => void syncBridgeToServer(), 10_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   // Merge live server signals with persistent Firestore cloud ledger (immutable settled outcomes win on conflict)

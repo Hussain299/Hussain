@@ -1,6 +1,16 @@
+import { FOREX_PAIRS, ForexSymbol } from '../types/index.js';
+
 export type OlympTradeSessionState = 'READY' | 'LOGIN_REQUIRED' | 'WAITING_FOR_MARKET_DATA' | 'NO_PLATFORM_TAB' | 'STALE' | 'UNKNOWN';
 export type OlympTradeAvailability = 'AVAILABLE' | 'UNAVAILABLE' | 'UNKNOWN';
 export type OlympTradeEvidence = 'HIGH' | 'MEDIUM' | 'NONE';
+export type OlympTradeUniverseMode = 'OLYMP_ACTIVE' | 'OLYMP_NO_ELIGIBLE_PAIRS' | 'FALLBACK_29';
+
+export interface ActiveTradingUniverse {
+  mode: OlympTradeUniverseMode;
+  pairs: ForexSymbol[];
+  liveCount: number;
+  capturedAt: string | null;
+}
 
 export interface OlympTradeInstrument {
   pair: string;
@@ -116,4 +126,49 @@ export async function requestOlympTradeBridgeStatus(
     window.addEventListener('message', onMessage);
     window.postMessage({ channel: CHANNEL, direction: 'APP_REQUEST', requestId, command }, window.location.origin);
   });
+}
+
+const SERVER_SNAPSHOT_MAX_AGE_MS = 90_000;
+const MIN_ELIGIBLE_PAYOUT_PCT = 80;
+
+/**
+ * Resolve which configured pairs are eligible for signal discovery based on the
+ * latest sanitized Olymp Trade companion snapshot. Falls back to the 29-pair
+ * universe only when the companion is offline/stale/not ready.
+ */
+export function resolveActiveTradingPairs(
+  status: OlympTradeBridgeStatus | null | undefined,
+  nowMs: number = Date.now()
+): ActiveTradingUniverse {
+  if (!status || !status.connected || status.sessionState !== 'READY' || !status.capturedAt) {
+    return { mode: 'FALLBACK_29', pairs: [...FOREX_PAIRS], liveCount: 0, capturedAt: null };
+  }
+  const capturedMs = Date.parse(status.capturedAt);
+  if (!Number.isFinite(capturedMs) || Math.max(0, nowMs - capturedMs) > SERVER_SNAPSHOT_MAX_AGE_MS) {
+    return { mode: 'FALLBACK_29', pairs: [...FOREX_PAIRS], liveCount: 0, capturedAt: status.capturedAt };
+  }
+
+  const eligibleSet = new Set<string>();
+  for (const inst of status.instruments) {
+    if (inst.availability === 'UNAVAILABLE') continue;
+    if (inst.payoutPct === null || inst.payoutPct < MIN_ELIGIBLE_PAYOUT_PCT) continue;
+    eligibleSet.add(inst.pair);
+  }
+
+  const pairs = FOREX_PAIRS.filter(pair => eligibleSet.has(pair));
+  if (pairs.length === 0) {
+    return {
+      mode: 'OLYMP_NO_ELIGIBLE_PAIRS',
+      pairs: [],
+      liveCount: 0,
+      capturedAt: status.capturedAt,
+    };
+  }
+
+  return {
+    mode: 'OLYMP_ACTIVE',
+    pairs,
+    liveCount: pairs.length,
+    capturedAt: status.capturedAt,
+  };
 }

@@ -156,6 +156,8 @@
         /\b(disabled|unavailable|closed|suspended|locked)\b/i.test(classText) ||
         /\b(disabled|unavailable|closed|suspended|locked)\b/i.test(text);
       const isInteractive = rowEl.matches('button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"],li,tr') ||
+        Boolean(rowEl.closest('button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"]')) ||
+        Boolean(rowEl.querySelector('button,[role="button"]')) ||
         window.getComputedStyle(rowEl).cursor === 'pointer';
       const availability = isDisabled ? 'UNAVAILABLE' : isInteractive ? 'AVAILABLE' : 'UNKNOWN';
 

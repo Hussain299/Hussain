@@ -1086,3 +1086,18 @@ apiRouter.post('/telegram/audit-report', async (req: Request, res: Response) => 
   }
 });
 
+// POST /api/broker/olymptrade/snapshot — Sync sanitized read-only Olymp Trade snapshot from browser companion
+apiRouter.post('/broker/olymptrade/snapshot', (req: Request, res: Response) => {
+  try {
+    const universe = autonomousScheduler.updateOlympTradeSnapshot(req.body);
+    res.json({ ok: true, ...universe });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/broker/olymptrade/status — Inspect which pair universe the scheduler is currently using
+apiRouter.get('/broker/olymptrade/status', (_req: Request, res: Response) => {
+  res.json(autonomousScheduler.getActiveTradingUniverse());
+});
+

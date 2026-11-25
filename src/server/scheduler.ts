@@ -23,6 +23,12 @@ import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
 import { behaviouralEngine } from './behaviouralEngine.js';
 import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
+import {
+  ActiveTradingUniverse,
+  OlympTradeBridgeStatus,
+  resolveActiveTradingPairs,
+  sanitizeOlympTradeBridgeStatus,
+} from '../services/olympTradeBridge.js';
 
 const FIVE_MINUTE_MS = 5 * 60 * 1000;
 
@@ -47,6 +53,21 @@ export class AutonomousScheduler {
   private currentGeneration = 1;
   private cycleCount = 0;
   private hasBootstrappedOnlineModel = false;
+  private latestOlympTradeStatus: OlympTradeBridgeStatus | null = null;
+
+  public updateOlympTradeSnapshot(rawStatus: unknown): ActiveTradingUniverse {
+    const sanitized = sanitizeOlympTradeBridgeStatus(rawStatus);
+    if (sanitized.connected) {
+      this.latestOlympTradeStatus = sanitized;
+    } else if (sanitized.extensionInstalled && sanitized.sessionState !== 'READY') {
+      this.latestOlympTradeStatus = sanitized;
+    }
+    return this.getActiveTradingUniverse();
+  }
+
+  public getActiveTradingUniverse(nowMs: number = Date.now()): ActiveTradingUniverse {
+    return resolveActiveTradingPairs(this.latestOlympTradeStatus, nowMs);
+  }
 
   constructor() {
     const existingGens = db.getGenerations();
@@ -572,7 +593,14 @@ export class AutonomousScheduler {
       }
 
       if (shouldScanForSignals && inFlightTrades.length < 6) {
-        for (const symbol of FOREX_PAIRS) {
+        const universe = this.getActiveTradingUniverse();
+        if (universe.mode === 'OLYMP_NO_ELIGIBLE_PAIRS') {
+          this.logMind(
+            'AUDITOR',
+            '[OLYMP TRADE FILTER] Live companion is active, but 0 configured pairs currently meet >= 80% payout and availability. Skipping signal discovery.'
+          );
+        }
+        for (const symbol of universe.pairs) {
           // Strict Pair Isolation: If this pair already has an active in-flight trade, NEVER create another!
           if (inFlightSymbols.has(symbol)) {
             continue;

@@ -12,7 +12,7 @@ import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS 
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { buildAccuracyReport } from '../utils/accuracyAnalytics.js';
-import { sanitizeOlympTradeBridgeStatus, normalizePair } from '../services/olympTradeBridge.js';
+import { sanitizeOlympTradeBridgeStatus, normalizePair, resolveActiveTradingPairs } from '../services/olympTradeBridge.js';
 import { telegramService } from './telegramService.js';
 import { isWithinStrictSignalDiscoveryWindow } from './scheduler.js';
 import {
@@ -454,6 +454,52 @@ export async function runAllVerificationTests(): Promise<{
       instruments: [],
     });
     if (status.connected) throw new Error('READY with no instruments should not be connected');
+  });
+
+  await runTest('DATA', 'Olymp Trade active-pair filter: uses >=80% available configured pairs when live and falls back to 29 when offline', () => {
+    const now = Date.now();
+    // 1. Offline / null -> fallback 29
+    const offline = resolveActiveTradingPairs(null, now);
+    if (offline.mode !== 'FALLBACK_29' || offline.pairs.length !== 29) {
+      throw new Error('Offline bridge must fall back to 29-pair universe');
+    }
+
+    // 2. Live snapshot -> filters to >=80% non-unavailable pairs within FOREX_PAIRS
+    const liveStatus = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.1.2', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date(now - 5_000).toISOString(), ageMs: 5_000,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'GBP/JPY', payoutPct: 75, availability: 'AVAILABLE', evidence: 'HIGH' }, // <80% excluded
+        { pair: 'AUD/CAD', payoutPct: 85, availability: 'UNAVAILABLE', evidence: 'HIGH' }, // unavailable excluded
+        { pair: 'BTC/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH' }, // non-29 excluded
+      ],
+    });
+    const active = resolveActiveTradingPairs(liveStatus, now);
+    if (active.mode !== 'OLYMP_ACTIVE' || active.pairs.length !== 1 || active.pairs[0] !== 'EUR/USD') {
+      throw new Error(`Expected OLYMP_ACTIVE with [EUR/USD], got ${active.mode} ${JSON.stringify(active.pairs)}`);
+    }
+
+    // 3. Stale snapshot (>90s) -> fallback 29
+    const stale = resolveActiveTradingPairs(liveStatus, now + 120_000);
+    if (stale.mode !== 'FALLBACK_29' || stale.pairs.length !== 29) {
+      throw new Error('Stale server snapshot must fall back to 29-pair universe');
+    }
+
+    // 4. Live snapshot with zero >=80% pairs -> OLYMP_NO_ELIGIBLE_PAIRS (empty)
+    const lowPayoutStatus = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.1.2', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date(now - 2_000).toISOString(), ageMs: 2_000,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 70, availability: 'AVAILABLE', evidence: 'HIGH' },
+      ],
+    });
+    const noEligible = resolveActiveTradingPairs(lowPayoutStatus, now);
+    if (noEligible.mode !== 'OLYMP_NO_ELIGIBLE_PAIRS' || noEligible.pairs.length !== 0) {
+      throw new Error('Live Olymp Trade with 0 eligible >=80% pairs must return OLYMP_NO_ELIGIBLE_PAIRS');
+    }
   });
 
   await runTest('ML', 'Legacy 20-pair shadow learner weights migrate into the 29-pair layout', () => {
