@@ -4,7 +4,7 @@
  * and verified trade settlements directly to Telegram channels, groups, and personal subscribers.
  */
 
-import { ResearchSignal, TelegramConfig, TelegramSubscriber, TelegramDispatchResult } from '../types/index.js';
+import { FOREX_PAIRS, ResearchSignal, TelegramConfig, TelegramSubscriber, TelegramDispatchResult } from '../types/index.js';
 import { db } from './db.js';
 
 function escapeHtml(text: string | number | undefined | null): string {
@@ -737,7 +737,7 @@ export class TelegramService {
       `✅ <b>Status:</b> System Connected &amp; Calibrated\n` +
       `🕒 <b>Time:</b> <code>${nowIst}</code>\n` +
       `🤖 <b>Bot Profile:</b> <code>@Forex_new_calender_bot</code>\n` +
-      `📊 <b>Monitoring:</b> 20 Forex Pairs (5M Candle Timeframe)\n` +
+      `📊 <b>Monitoring:</b> ${FOREX_PAIRS.length} Forex Pairs (5M Candle Timeframe)\n` +
       `⚡ <b>Advance Notice:</b> 3 Minutes Prior to 5M Candle Open\n` +
       `📋 <b>Settlement Audits:</b> Automatic Win &amp; Loss Audit Report for every signal result\n` +
       `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
