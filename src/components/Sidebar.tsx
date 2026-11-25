@@ -28,6 +28,7 @@ export type ViewTab =
   | 'history'
   | 'analytics'
   | 'accuracy'
+  | 'portfolio'
   | 'broker'
   | 'brain'
   | 'behaviour'
@@ -105,6 +106,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
           label: 'Session & Pair Accuracy',
           desc: 'Verified win rate by market session and currency pair',
           icon: Target,
+        },
+        {
+          id: 'portfolio',
+          label: 'Institutional Quant Desk',
+          desc: 'Quarter-Kelly sizing, 8-currency strength & promotion gate',
+          icon: ShieldAlert,
+          badge: 'RISK',
         },
         {
           id: 'broker',

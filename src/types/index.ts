@@ -207,6 +207,24 @@ export interface DebateChallengeRecord {
   outcome: 'CONCEDED_REVISION' | 'DEFENDED' | 'RISK_WARNING';
 }
 
+export interface InstitutionalSignalRiskAudit {
+  evaluatedAtUtc: string;
+  payoutPctUsed: number;
+  breakEvenProbability: number;
+  probabilityUsed: number;
+  fullKellyPct: number;
+  quarterKellyPct: number;
+  suggestedStakePct: number;
+  drawdownThrottleFactor: number;
+  m5TrendBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  m15TrendBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  mtfAlignmentScore: number;
+  currencyStrengthSpread: number;
+  sameFactorOpenCount: number;
+  correlationRiskLevel: 'LOW' | 'MODERATE' | 'HIGH';
+  riskNotes: string[];
+}
+
 export interface MultiAgentDebateResult {
   debateVersion: string;
   evaluatedAtUtc: string;
@@ -349,6 +367,8 @@ export interface ResearchSignal {
   shadowCandidate?: ShadowCandidateEvaluation;
   /** Adversarial 2-round multi-agent debate & Hedge meta-learner consensus (shadow telemetry). */
   agentDebate?: MultiAgentDebateResult;
+  /** Institutional Kelly sizing, MTF alignment, currency-strength spread & correlation factor audit. */
+  institutionalRisk?: InstitutionalSignalRiskAudit;
   /** Durable per-component training & skip audit for this settled signal. */
   trainingAudit?: SignalTrainingAudit;
 }

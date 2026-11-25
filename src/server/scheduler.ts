@@ -24,6 +24,7 @@ import { onlinePolicyNetwork } from './onlinePolicyNetwork.js';
 import { behaviouralEngine } from './behaviouralEngine.js';
 import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
+import { quantMicrostructure } from './quantMicrostructure.js';
 import {
   ActiveTradingUniverse,
   authorizeSignalWithBrokerSnapshot,
@@ -574,6 +575,7 @@ export class AutonomousScheduler {
       // 1. Targeted Market Sensing: fetch ONLY active eligible Olymp Trade pairs + open/recovering settlements.
       // Batches of 10 keep multi-pair fetches well below the 45s Olymp Trade snapshot freshness window.
       totalCandlesFetched += await this.fetchCandlesForSymbols(fetchPlan.symbolsToFetch, candlesMap);
+      quantMicrostructure.updateCurrencyStrength(candlesMap);
 
       // 1b. Reconcile any stale or previously candle-delayed settlements using freshly fetched real candles
       const sweptSignals = entryExitEngine.sweepStaleActiveSignals(candlesMap);
@@ -772,6 +774,7 @@ export class AutonomousScheduler {
           );
           if (missingActivePairs.length > 0) {
             totalCandlesFetched += await this.fetchCandlesForSymbols(missingActivePairs, candlesMap);
+            quantMicrostructure.updateCurrencyStrength(candlesMap);
           }
         }
         for (const symbol of universe.pairs) {

@@ -2547,6 +2547,130 @@ export async function runAllVerificationTests(): Promise<{
     }
   });
 
+  await runTest('ML', 'Institutional Quant Engine: Causal M5/M15 Resampling, 8-Currency Strength, Kelly Sizing & Factor Correlation', async () => {
+    const {
+      resampleCandlesCausal,
+      computeCurrencyStrengthMatrix,
+      getDirectionalStrengthSpread,
+    } = await import('./quantMicrostructure.js');
+    const {
+      evaluateInstitutionalSignalRisk,
+      computeFactorExposureMatrix,
+      computePortfolioStatistics,
+      evaluatePromotionReadiness,
+    } = await import('./portfolioRiskEngine.js');
+
+    const baseCandles = makeM1TestCandles('EUR/USD', 40).map((c, idx) => ({
+      ...c,
+      open: 1.08 + idx * 0.0001,
+      high: 1.08 + idx * 0.00015,
+      low: 1.08 + idx * 0.00005,
+      close: 1.08 + (idx + 1) * 0.0001,
+      source: 'yahoo' as const,
+    }));
+    const cutoffTs = baseCandles[24].timestampMs;
+    const causalM5 = resampleCandlesCausal(baseCandles, 5, cutoffTs);
+    if (causalM5.some((b) => b.bucketMs > cutoffTs)) {
+      throw new Error('Causal M5 resampling leaked future bucket timestamps.');
+    }
+
+    const strength = computeCurrencyStrengthMatrix({
+      'EUR/USD': baseCandles,
+      'GBP/USD': baseCandles.map((c) => ({ ...c, symbol: 'GBP/USD' })),
+    });
+    const eurEntry = strength.currencies.find((c) => c.currency === 'EUR');
+    const usdEntry = strength.currencies.find((c) => c.currency === 'USD');
+    if (!eurEntry || !usdEntry || eurEntry.score <= usdEntry.score) {
+      throw new Error(`Expected rising EUR/USD & GBP/USD to rank EUR > USD, got EUR=${eurEntry?.score} USD=${usdEntry?.score}`);
+    }
+    const buySpread = getDirectionalStrengthSpread('EUR/USD', 'BUY', strength);
+    if (buySpread <= 0) {
+      throw new Error(`Expected positive BUY strength spread for rising EUR/USD, got ${buySpread}`);
+    }
+
+    const mkOpen = (id: string, symbol: ForexSymbol, direction: 'BUY' | 'SELL'): ResearchSignal => ({
+      id,
+      symbol,
+      direction,
+      predictionTimeUtc: new Date().toISOString(),
+      predictionTimeIst: '',
+      signalCandleTime: new Date().toISOString(),
+      entryCondition: 'NEXT_5M_OPEN',
+      entryWindowStartUtc: new Date().toISOString(),
+      entryWindowEndUtc: new Date().toISOString(),
+      triggerPrice: 1.08,
+      invalidationPrice: 1.078,
+      actualEntryTimeUtc: new Date().toISOString(),
+      actualEntryPrice: 1.08,
+      entrySource: 'yahoo',
+      expiryMinutes: 15,
+      plannedExitTimeUtc: new Date(Date.now() + 600_000).toISOString(),
+      actualExitTimeUtc: null,
+      actualExitPrice: null,
+      confidence: 0.78,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'ACTIVE',
+      lifecycleHistory: [],
+      grossReturnPips: null,
+      estimatedSpreadPips: 1.2,
+      netReturnPips: null,
+      outcomeResult: 'PENDING',
+      ruleFamily: 'order_flow_imbalance',
+      modelVersion: 'vTest',
+    });
+
+    const openStack = [
+      mkOpen('open_1', 'EUR/USD', 'BUY'),
+      mkOpen('open_2', 'EUR/JPY', 'BUY'),
+    ];
+    const exposure = computeFactorExposureMatrix(openStack);
+    const eurExp = exposure.find((e) => e.currency === 'EUR');
+    if (!eurExp || eurExp.netExposureUnits !== 2) {
+      throw new Error(`Expected EUR factor exposure +2 across 2 long EUR positions, got ${eurExp?.netExposureUnits}`);
+    }
+
+    const highCorrEdge = evaluateInstitutionalSignalRisk({
+      symbol: 'EUR/GBP',
+      direction: 'BUY',
+      payoutPct: 80,
+      modelProbability: 0.64,
+      predictionHistory: baseCandles.slice(0, 25),
+      predictionCandleTimestampMs: cutoffTs,
+      openSignals: openStack,
+      allSignals: [],
+      currencyStrengthSnapshot: strength,
+    });
+    if (highCorrEdge.correlationRiskLevel !== 'HIGH' || highCorrEdge.quarterKellyPct <= 0) {
+      throw new Error(`Expected HIGH correlation risk & positive Quarter-Kelly stake, got ${JSON.stringify(highCorrEdge)}`);
+    }
+
+    const noEdge = evaluateInstitutionalSignalRisk({
+      symbol: 'EUR/GBP',
+      direction: 'BUY',
+      payoutPct: 80,
+      modelProbability: 0.52,
+      predictionHistory: baseCandles.slice(0, 25),
+      predictionCandleTimestampMs: cutoffTs,
+      openSignals: [],
+      allSignals: [],
+      currencyStrengthSnapshot: strength,
+    });
+    if (noEdge.quarterKellyPct !== 0 || noEdge.suggestedStakePct !== 0) {
+      throw new Error(`Expected 0 Kelly stake below break-even (52% <= 55.6%), got ${JSON.stringify(noEdge)}`);
+    }
+
+    const settledSample: ResearchSignal[] = [
+      { ...mkOpen('s_1', 'EUR/USD', 'BUY'), lifecycleState: 'CLOSED', outcomeResult: 'WIN', netReturnUnits: 0.8 },
+      { ...mkOpen('s_2', 'EUR/USD', 'SELL'), lifecycleState: 'CLOSED', outcomeResult: 'LOSS', netReturnUnits: -1.0 },
+      { ...mkOpen('s_3', 'USD/JPY', 'BUY'), lifecycleState: 'CLOSED', outcomeResult: 'WIN', netReturnUnits: 0.85 },
+    ];
+    const stats = computePortfolioStatistics(settledSample);
+    const promo = evaluatePromotionReadiness(settledSample);
+    if (stats.settledCount !== 3 || stats.wins !== 2 || stats.losses !== 1 || promo.shadowCalibrator.status !== 'COLLECTING_EVIDENCE') {
+      throw new Error(`Unexpected portfolio stats or promotion gate output: ${JSON.stringify({ stats, promo })}`);
+    }
+  });
+
   // Purge test signals so they never appear on the user's trading terminal
   db.purgeTestSignals();
 

@@ -23,6 +23,8 @@ import { hasTrustedPredictionFeatures, onlinePolicyNetwork } from './onlinePolic
 import { isValidBrokerEligibilitySnapshot } from '../services/olympTradeBridge.js';
 import { evaluateShadowCandidate, PriorEpisodeRecord } from './shadowPredictor.js';
 import { multiAgentCouncil } from './multiAgentCouncil.js';
+import { evaluateInstitutionalSignalRisk } from './portfolioRiskEngine.js';
+import { quantMicrostructure } from './quantMicrostructure.js';
 
 /** Maximum delay to wait for a provider to deliver the exact 5-minute entry bar. */
 export const LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS = 5 * 60_000;
@@ -426,6 +428,21 @@ export class EntryExitEngine {
             knnSampleCount: knnEval.neighbors,
             immuneDampingPenalty: immuneEval.resistanceApplied ? immuneEval.dampingPenalty : 0,
             priorSettledRecords,
+          });
+
+          signal.institutionalRisk = evaluateInstitutionalSignalRisk({
+            symbol: params.symbol,
+            direction: params.direction,
+            payoutPct: signal.payoutPct,
+            modelProbability:
+              signal.shadowCandidate?.calibratedProbability ??
+              signal.agentDebate?.hedgeWeightedProbability ??
+              0.5,
+            predictionHistory,
+            predictionCandleTimestampMs: params.signalCandle.timestampMs,
+            openSignals: db.getActiveSignals(),
+            allSignals: db.getSignals(false),
+            currencyStrengthSnapshot: quantMicrostructure.getCurrencyStrength(),
           });
         }
       }

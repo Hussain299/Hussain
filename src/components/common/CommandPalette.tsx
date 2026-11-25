@@ -111,6 +111,15 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         icon: Target,
       },
       {
+        id: 'nav_portfolio',
+        label: 'Institutional Quant Desk & Risk',
+        description: 'Quarter-Kelly sizing, 8-currency strength matrix, VaR/CVaR & promotion gate',
+        category: 'VIEW',
+        tab: 'portfolio',
+        badge: 'RISK',
+        icon: Target,
+      },
+      {
         id: 'nav_system',
         label: 'System Health & Diagnostics',
         description: 'Feeds, cron heartbeats, Telegram bot & ML learning recovery',

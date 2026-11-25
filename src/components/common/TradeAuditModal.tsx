@@ -270,6 +270,41 @@ export const TradeAuditModal: React.FC<TradeAuditModalProps> = ({ signal, onClos
             </div>
           )}
 
+          {/* Institutional Risk, Kelly Sizing & MTF Context (If present) */}
+          {signal.institutionalRisk && (
+            <div className="p-4 rounded-xl bg-[#121820] border border-[#243040] space-y-2 font-mono text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-[#C4A574] font-bold uppercase">
+                  <Shield className="w-4 h-4 text-[#C4A574]" />
+                  <span>Institutional Kelly Sizing &amp; Factor Risk</span>
+                </div>
+                <span className="px-2 py-0.5 rounded bg-[#72A98B]/15 text-[#72A98B] text-[10px] font-bold">
+                  Stake: {signal.institutionalRisk.suggestedStakePct.toFixed(2)}% (¼-Kelly)
+                </span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                <div>
+                  <span className="text-[#AAB4BF] block text-[10px]">M5 / M15 Bias</span>
+                  <strong className="text-[#E8E5DE]">{signal.institutionalRisk.m5TrendBias} / {signal.institutionalRisk.m15TrendBias}</strong>
+                </div>
+                <div>
+                  <span className="text-[#AAB4BF] block text-[10px]">MTF Align</span>
+                  <strong className="text-[#6C9D91]">{signal.institutionalRisk.mtfAlignmentScore >= 0 ? '+' : ''}{signal.institutionalRisk.mtfAlignmentScore.toFixed(2)}</strong>
+                </div>
+                <div>
+                  <span className="text-[#AAB4BF] block text-[10px]">Currency Spread</span>
+                  <strong className="text-[#E8E5DE]">{signal.institutionalRisk.currencyStrengthSpread >= 0 ? '+' : ''}{signal.institutionalRisk.currencyStrengthSpread.toFixed(2)}</strong>
+                </div>
+                <div>
+                  <span className="text-[#AAB4BF] block text-[10px]">Correlation Heat</span>
+                  <strong className={signal.institutionalRisk.correlationRiskLevel === 'HIGH' ? 'text-[#B7797D]' : 'text-[#72A98B]'}>
+                    {signal.institutionalRisk.correlationRiskLevel} ({signal.institutionalRisk.sameFactorOpenCount})
+                  </strong>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Loss Autopsy (If present) */}
           {signal.lossAutopsy && (
             <div className="p-4 rounded-xl bg-[#B7797D]/10 border border-[#B7797D]/40 space-y-2">

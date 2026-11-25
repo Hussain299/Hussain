@@ -18,6 +18,7 @@ import {
   LogIn,
   LogOut,
   Search,
+  ShieldCheck,
 } from 'lucide-react';
 import { soundNotificationService } from '../utils/notifications.ts';
 import { ViewTab } from './Sidebar.tsx';
@@ -84,6 +85,7 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'history', label: 'History', icon: History },
     { id: 'analytics', label: 'Analytics', icon: BarChart3 },
     { id: 'accuracy', label: 'Accuracy', icon: Target },
+    { id: 'portfolio', label: 'Quant Desk', icon: ShieldCheck },
     { id: 'broker', label: 'Broker', icon: Link2 },
     { id: 'brain', label: 'Brain', icon: Brain },
     { id: 'system', label: 'System', icon: Server },

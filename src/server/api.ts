@@ -24,6 +24,12 @@ import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
 import { evaluateShadowCandidateChronologically } from './shadowPredictor.js';
 import { multiAgentCouncil } from './multiAgentCouncil.js';
+import { quantMicrostructure } from './quantMicrostructure.js';
+import {
+  computeFactorExposureMatrix,
+  computePortfolioStatistics,
+  evaluatePromotionReadiness,
+} from './portfolioRiskEngine.js';
 
 interface StrategySearchJob {
   jobId: string;
@@ -909,6 +915,39 @@ apiRouter.get('/agi/council', (_req: Request, res: Response) => {
     council: multiAgentCouncil.getState(),
     benchmark: multiAgentCouncil.computeCouncilBenchmark(signals),
     recentDebates,
+  });
+});
+
+// GET /api/quant/institutional — Institutional Risk Desk: Kelly sizing, Currency Strength, Factor Exposure & Promotion Gate
+apiRouter.get('/quant/institutional', (_req: Request, res: Response) => {
+  const signals = db.getSignals(false);
+  const openSignals = db.getActiveSignals(false);
+  const currencyStrength = quantMicrostructure.getCurrencyStrength();
+  const exposureMatrix = computeFactorExposureMatrix(openSignals);
+  const portfolioStats = computePortfolioStatistics(signals);
+  const promotionGate = evaluatePromotionReadiness(signals);
+  const recentRiskSnapshots = signals
+    .filter((s) => Boolean(s.institutionalRisk))
+    .slice(0, 15)
+    .map((s) => ({
+      signalId: s.id,
+      symbol: s.symbol,
+      direction: s.direction,
+      predictionTimeUtc: s.predictionTimeUtc,
+      predictionTimeIst: s.predictionTimeIst,
+      lifecycleState: s.lifecycleState,
+      outcomeResult: s.outcomeResult,
+      netReturnUnits: s.netReturnUnits,
+      institutionalRisk: s.institutionalRisk!,
+    }));
+
+  res.json({
+    generatedAtUtc: new Date().toISOString(),
+    currencyStrength,
+    exposureMatrix,
+    portfolioStats,
+    promotionGate,
+    recentRiskSnapshots,
   });
 });
 

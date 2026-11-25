@@ -6,6 +6,7 @@ import { SignalTerminalView } from './components/views/SignalTerminalView.tsx';
 import { HistoryView } from './components/views/HistoryView.tsx';
 import { AnalyticsView } from './components/views/AnalyticsView.tsx';
 import { AccuracyView } from './components/views/AccuracyView.tsx';
+import { PortfolioRiskView } from './components/views/PortfolioRiskView.tsx';
 import { BrokerConnectionView } from './components/views/BrokerConnectionView.tsx';
 import { BrainView } from './components/views/BrainView.tsx';
 import { SystemView } from './components/views/SystemView.tsx';
@@ -413,6 +414,7 @@ export default function App() {
 
           {/* 5. ACCURACY: Verified outcome rates by market session and currency pair */}
           {activeTab === 'accuracy' && <AccuracyView signals={signals} />}
+          {activeTab === 'portfolio' && <PortfolioRiskView />}
           {activeTab === 'broker' && <BrokerConnectionView />}
 
           {/* 5. BRAIN: Research, learning and model intelligence */}
