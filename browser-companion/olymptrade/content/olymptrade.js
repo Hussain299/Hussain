@@ -6,9 +6,9 @@
     'ZAR', 'TRY', 'PLN', 'HKD', 'CNY', 'INR', 'BRL', 'CZK', 'HUF', 'DKK', 'ILS', 'AED',
     'SAR', 'THB', 'IDR', 'MYR', 'PHP', 'KRW',
   ]);
-  const PAIR_REGEX = /\\b([A-Z]{3})\\s*\\/\\s*([A-Z]{3})\\b/g;
-  const PAYOUT_LABEL_REGEX = /(?:payout|profit|return|income|yield)[^\\d]{0,32}(\\d{2,3}(?:\\.\\d{1,2})?)\\s*%/i;
-  const PERCENT_REGEX = /(?:^|[\\s+])([5-9]\\d(?:\\.\\d{1,2})?|100(?:\\.0{1,2})?)\\s*%/g;
+  const PAIR_REGEX = /\b([A-Z]{3})\s*\/\s*([A-Z]{3})\b/g;
+  const PAYOUT_LABEL_REGEX = /(?:payout|profit|return|income|yield)[^\d]{0,32}(\d{2,3}(?:\.\d{1,2})?)\s*%/i;
+  const PERCENT_REGEX = /(?:^|[\s+])([5-9]\d(?:\.\d{1,2})?|100(?:\.0{1,2})?)\s*%/g;
   const CANDIDATE_SELECTOR = ['button', '[role="button"]', '[role="option"]', '[role="tab"]',
     '[data-testid]', '[data-asset]', '[data-symbol]', '[aria-label]', 'li'].join(',');
 
@@ -22,7 +22,7 @@
   function readText(element) {
     return [element.innerText || '', element.getAttribute('aria-label') || '',
       element.getAttribute('title') || '', element.getAttribute('data-asset') || '',
-      element.getAttribute('data-symbol') || ''].join(' ').replace(/\\s+/g, ' ').trim().slice(0, 240);
+      element.getAttribute('data-symbol') || ''].join(' ').replace(/\s+/g, ' ').trim().slice(0, 240);
   }
   function findPairs(text) {
     const pairs = new Set();
@@ -40,7 +40,7 @@
     const pairIndex = text.toUpperCase().indexOf(pair);
     if (pairIndex >= 0) {
       const afterPair = text.slice(pairIndex + pair.length, pairIndex + pair.length + 36);
-      const adjacent = afterPair.match(/^[^\\d]{0,16}(\\d{2,3}(?:\\.\\d{1,2})?)\\s*%/);
+      const adjacent = afterPair.match(/^[^\d]{0,16}(\d{2,3}(?:\.\d{1,2})?)\s*%/);
       if (adjacent) {
         const value = Number(adjacent[1]);
         if (value >= 50 && value <= 100) return { payoutPct: value, evidence: 'HIGH' };
@@ -63,7 +63,7 @@
       const classText = typeof element.className === 'string' ? element.className : '';
       const isDisabled = element.hasAttribute('disabled') ||
         element.getAttribute('aria-disabled') === 'true' ||
-        /\\b(disabled|unavailable|closed)\\b/i.test(classText);
+        /\b(disabled|unavailable|closed)\b/i.test(classText);
       const isInteractive = element.matches('button,[role="button"],[role="option"]');
       const availability = isDisabled ? 'UNAVAILABLE' : isInteractive ? 'AVAILABLE' : 'UNKNOWN';
       for (const pair of pairs) {
