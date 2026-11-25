@@ -85,7 +85,7 @@ export async function runAllVerificationTests(): Promise<{
     }
   });
 
-  await runTest('SIGNALS', 'Strict 3-minute discovery window includes only the intended 65-second lead window', () => {
+  await runTest('DATA', 'Strict 3-minute discovery window includes only the intended 65-second lead window', () => {
     const fiveMinuteBoundary = Date.UTC(2026, 10, 25, 12, 0, 0);
     if (
       !isWithinStrictSignalDiscoveryWindow(fiveMinuteBoundary + 90_000) ||
