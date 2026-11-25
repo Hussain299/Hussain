@@ -120,7 +120,7 @@
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
       let visited = 0;
-      while ((node = walker.nextNode()) && visited < 6000) {
+      while ((node = walker.nextNode()) && visited < 30000) {
         visited++;
         const raw = node.nodeValue;
         if (!raw || raw.length < 6 || raw.length > 80) continue;
