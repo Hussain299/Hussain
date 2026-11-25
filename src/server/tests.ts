@@ -6,7 +6,7 @@
 
 import { Candle, ForexSymbol, FOREX_PAIRS, ResearchExperiment, ResearchSignal, VerificationTestResult } from '../types/index.js';
 import { summarizeForwardObservations, summarizeSignalAccounting } from '../utils/tradeAccounting.js';
-import { dataFeedEngine, filterFreshRealCandles, LIVE_CANDLE_MAX_AGE_MS } from './dataFeeds.js';
+import { dataFeedEngine, filterFreshRealCandles, getFreshRealCandleWindow, LIVE_CANDLE_MAX_AGE_MS } from './dataFeeds.js';
 import { db } from './db.js';
 import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS } from './entryExitEngine.js';
 import { researchEngine } from './researchEngine.js';
@@ -427,6 +427,68 @@ export async function runAllVerificationTests(): Promise<{
       throw new Error(
         `Live freshness filter accepted/rejected the wrong candles. Expected ${expected.length}, got ${accepted.length}.`
       );
+    }
+  });
+
+  await runTest('DATA', 'Fresh live candle window preserves historical M1 candles for strategy features', () => {
+    const nowMs = Date.UTC(2026, 10, 25, 10, 0, 30);
+    const history: Candle[] = Array.from({ length: 100 }, (_, index) => {
+      const timestampMs = nowMs - ((99 - index) * 60_000) - 30_000;
+      return {
+        symbol: 'EUR/USD',
+        timestamp: new Date(timestampMs).toISOString(),
+        timestampMs,
+        open: 1.0850 + index * 0.00001,
+        high: 1.0860 + index * 0.00001,
+        low: 1.0840 + index * 0.00001,
+        close: 1.0855 + index * 0.00001,
+        volume: 100,
+        source: 'yahoo',
+      };
+    });
+    const syntheticNow: Candle = {
+      ...history[history.length - 1],
+      timestamp: new Date(nowMs).toISOString(),
+      timestampMs: nowMs,
+      source: 'synthetic',
+    };
+    const retained = getFreshRealCandleWindow(
+      [...history, syntheticNow],
+      'EUR/USD',
+      nowMs,
+      LIVE_CANDLE_MAX_AGE_MS,
+      100
+    );
+
+    if (retained.length !== 100 ||
+        retained[0].timestampMs !== history[0].timestampMs ||
+        retained[retained.length - 1].timestampMs !== history[history.length - 1].timestampMs ||
+        retained.some(candle => candle.source === 'synthetic')) {
+      throw new Error(
+        `Expected 100 verified historical candles with a fresh newest real observation; got ${retained.length}.`
+      );
+    }
+
+    const staleWindow = getFreshRealCandleWindow(
+      history.map(candle => ({
+        ...candle,
+        timestampMs: candle.timestampMs - 70_001,
+        timestamp: new Date(candle.timestampMs - 70_001).toISOString(),
+      })),
+      'EUR/USD',
+      nowMs,
+      LIVE_CANDLE_MAX_AGE_MS,
+      100
+    );
+    if (staleWindow.length !== 0) {
+      throw new Error('A stale newest real candle must reject the complete live feature window.');
+    }
+
+    // The legacy single-candle freshness filter remains strict for callers
+    // that need only currently fresh observations.
+    const pointFresh = filterFreshRealCandles(history, 'EUR/USD', nowMs);
+    if (pointFresh.length > 2 || pointFresh.length === 0) {
+      throw new Error('Point freshness filter unexpectedly changed its strict per-candle behavior.');
     }
   });
 
