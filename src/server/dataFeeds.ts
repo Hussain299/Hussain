@@ -56,6 +56,64 @@ export function filterFreshRealCandles(
     .sort((a, b) => a.timestampMs - b.timestampMs);
 }
 
+/**
+ * Preserve the full real-candle feature window while enforcing freshness on
+ * its newest observation. Historical M1 candles are required by the scanner's
+ * 35-candle minimum and technical indicators; applying the 90s age check to
+ * every row would leave only 1–2 candles and prevent every setup from scanning.
+ *
+ * Synthetic/imported/test candles are excluded. If the newest verified real
+ * candle is stale or too far in the future, the whole window is rejected.
+ */
+export function getFreshRealCandleWindow(
+  candles: readonly Candle[],
+  symbol: ForexSymbol,
+  nowMs: number = Date.now(),
+  maxAgeMs: number = LIVE_CANDLE_MAX_AGE_MS,
+  limit: number = 100
+): Candle[] {
+  if (
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(maxAgeMs) ||
+    maxAgeMs < 0 ||
+    !Number.isInteger(limit) ||
+    limit < 1
+  ) {
+    return [];
+  }
+
+  const validRealCandles = candles
+    .filter(candle => {
+      if (!candle || candle.symbol !== symbol || !LIVE_FEED_SOURCES.has(candle.source)) {
+        return false;
+      }
+      if (!Number.isFinite(candle.timestampMs)) return false;
+
+      const parsedTimestampMs = Date.parse(candle.timestamp);
+      if (!Number.isFinite(parsedTimestampMs) ||
+          Math.abs(parsedTimestampMs - candle.timestampMs) > 1_000) {
+        return false;
+      }
+
+      // Reject implausibly future-dated rows but retain legitimate historical
+      // observations for the technical feature window.
+      return nowMs - candle.timestampMs >= -LIVE_CANDLE_FUTURE_SKEW_TOLERANCE_MS;
+    })
+    .sort((a, b) => a.timestampMs - b.timestampMs);
+
+  const newest = validRealCandles[validRealCandles.length - 1];
+  if (!newest) return [];
+
+  const newestAgeMs = nowMs - newest.timestampMs;
+  if (newestAgeMs > maxAgeMs || newestAgeMs < -LIVE_CANDLE_FUTURE_SKEW_TOLERANCE_MS) {
+    return [];
+  }
+
+  const byTimestamp = new Map<number, Candle>();
+  for (const candle of validRealCandles) byTimestamp.set(candle.timestampMs, candle);
+  return Array.from(byTimestamp.values()).sort((a, b) => a.timestampMs - b.timestampMs).slice(-limit);
+}
+
 export class DataFeedEngine {
   private basePrices: Record<ForexSymbol, number> = {
     'EUR/USD': 1.0854,
