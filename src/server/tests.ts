@@ -12,6 +12,7 @@ import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS 
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { telegramService } from './telegramService.js';
+import { isWithinStrictSignalDiscoveryWindow } from './scheduler.js';
 import {
   createInitialOnlineLearnerState,
   getOnlineLearnerSummary,
@@ -81,6 +82,18 @@ export async function runAllVerificationTests(): Promise<{
         FOREX_PAIRS.includes('USD/NOK' as ForexSymbol) ||
         FOREX_PAIRS.includes('USD/SGD' as ForexSymbol)) {
       throw new Error('The scanner pair universe does not match the 29 qualifying audit pairs.');
+    }
+  });
+
+  await runTest('DATA', 'Strict 3-minute discovery window includes only the intended 65-second lead window', () => {
+    const fiveMinuteBoundary = Date.UTC(2026, 10, 25, 12, 0, 0);
+    if (
+      !isWithinStrictSignalDiscoveryWindow(fiveMinuteBoundary + 90_000) ||
+      !isWithinStrictSignalDiscoveryWindow(fiveMinuteBoundary + 155_000) ||
+      isWithinStrictSignalDiscoveryWindow(fiveMinuteBoundary + 89_999) ||
+      isWithinStrictSignalDiscoveryWindow(fiveMinuteBoundary + 155_001)
+    ) {
+      throw new Error('The strict 3-minute signal discovery window boundaries are incorrect.');
     }
   });
 
