@@ -212,7 +212,20 @@
   }
 
   /* ───────── publish snapshot to service worker ───────── */
+  let intervalId = null;
+  function stopObserver() {
+    if (intervalId !== null) {
+      window.clearInterval(intervalId);
+      intervalId = null;
+    }
+    observer.disconnect();
+  }
+
   function publishSnapshot() {
+    if (!chrome.runtime?.id) {
+      stopObserver();
+      return;
+    }
     const instruments = readInstruments();
     let sessionState;
 
@@ -224,10 +237,14 @@
       sessionState = 'WAITING_FOR_MARKET_DATA';
     }
 
-    chrome.runtime.sendMessage({
-      type: 'OLYMP_SNAPSHOT',
-      payload: { sessionState, instruments },
-    }).catch(() => undefined);
+    try {
+      chrome.runtime.sendMessage({
+        type: 'OLYMP_SNAPSHOT',
+        payload: { sessionState, instruments },
+      }).catch(() => undefined);
+    } catch {
+      stopObserver();
+    }
   }
 
   /* ───────── debounced mutation-driven publish ───────── */
@@ -260,5 +277,5 @@
   });
 
   publishSnapshot();
-  window.setInterval(publishSnapshot, 5000);
+  intervalId = window.setInterval(publishSnapshot, 5000);
 })();

@@ -13,35 +13,46 @@
     // Validate requestId format to prevent injection
     if (data.requestId.length > 64) return;
 
-    chrome.runtime.sendMessage({ type: data.command }).then(
-      payload => {
-        // Strip any unexpected fields before forwarding
-        const safe = payload && typeof payload === 'object' ? {
-          extensionInstalled: payload.extensionInstalled === true,
-          extensionVersion: typeof payload.extensionVersion === 'string' ? payload.extensionVersion : null,
-          platformTabOpen: payload.platformTabOpen === true,
-          connected: payload.connected === true,
-          sessionState: typeof payload.sessionState === 'string' ? payload.sessionState : 'UNKNOWN',
-          capturedAt: typeof payload.capturedAt === 'string' ? payload.capturedAt : null,
-          ageMs: typeof payload.ageMs === 'number' ? payload.ageMs : null,
-          instruments: Array.isArray(payload.instruments) ? payload.instruments : [],
-        } : {
-          extensionInstalled: false, platformTabOpen: false, connected: false,
-          sessionState: 'UNKNOWN', instruments: [],
-        };
+    try {
+      if (!chrome.runtime?.id) throw new Error('CONTEXT_INVALIDATED');
+      chrome.runtime.sendMessage({ type: data.command }).then(
+        payload => {
+          // Strip any unexpected fields before forwarding
+          const safe = payload && typeof payload === 'object' ? {
+            extensionInstalled: payload.extensionInstalled === true,
+            extensionVersion: typeof payload.extensionVersion === 'string' ? payload.extensionVersion : null,
+            platformTabOpen: payload.platformTabOpen === true,
+            connected: payload.connected === true,
+            sessionState: typeof payload.sessionState === 'string' ? payload.sessionState : 'UNKNOWN',
+            capturedAt: typeof payload.capturedAt === 'string' ? payload.capturedAt : null,
+            ageMs: typeof payload.ageMs === 'number' ? payload.ageMs : null,
+            instruments: Array.isArray(payload.instruments) ? payload.instruments : [],
+          } : {
+            extensionInstalled: false, platformTabOpen: false, connected: false,
+            sessionState: 'UNKNOWN', instruments: [],
+          };
 
-        window.postMessage({
-          channel: CHANNEL, direction: 'EXTENSION_RESPONSE',
-          requestId: data.requestId, payload: safe,
-        }, window.location.origin);
-      },
-      () => window.postMessage({
+          window.postMessage({
+            channel: CHANNEL, direction: 'EXTENSION_RESPONSE',
+            requestId: data.requestId, payload: safe,
+          }, window.location.origin);
+        },
+        () => window.postMessage({
+          channel: CHANNEL, direction: 'EXTENSION_RESPONSE', requestId: data.requestId,
+          payload: {
+            extensionInstalled: false, platformTabOpen: false, connected: false,
+            sessionState: 'UNKNOWN', instruments: [],
+          },
+        }, window.location.origin)
+      );
+    } catch {
+      window.postMessage({
         channel: CHANNEL, direction: 'EXTENSION_RESPONSE', requestId: data.requestId,
         payload: {
           extensionInstalled: false, platformTabOpen: false, connected: false,
           sessionState: 'UNKNOWN', instruments: [],
         },
-      }, window.location.origin)
-    );
+      }, window.location.origin);
+    }
   });
 })();
