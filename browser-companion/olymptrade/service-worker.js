@@ -19,7 +19,7 @@ function cleanSnapshot(value, tabId) {
   for (const row of value.instruments.slice(0, 300)) {
     if (!row || typeof row.pair !== 'string') continue;
     const pair = row.pair.trim().toUpperCase();
-    if (!/^[A-Z]{3}\\/[A-Z]{3}$/.test(pair) || seen.has(pair)) continue;
+    if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(pair) || seen.has(pair)) continue;
     seen.add(pair);
     const payoutPct = typeof row.payoutPct === 'number' && Number.isFinite(row.payoutPct) && row.payoutPct >= 50 && row.payoutPct <= 100
       ? Math.round(row.payoutPct * 100) / 100 : null;
