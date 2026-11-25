@@ -95,9 +95,9 @@
   function findRowContainer(startElement, pair) {
     let best = startElement;
     let current = startElement.parentElement;
-    for (let depth = 0; depth < 5 && current && current !== document.body; depth++) {
+    for (let depth = 0; depth < 6 && current && current !== document.body; depth++) {
       const rect = current.getBoundingClientRect();
-      if (rect.height > 180 || rect.width > 900) break;
+      if (rect.height > 180 || rect.width > 1400) break;
       const text = readText(current);
       if (!text || text.length > 260) break;
       const pairs = findPairs(text);
@@ -115,19 +115,25 @@
     const found = new Map();
     const candidateLeaves = new Set();
 
-    // 1. Walk visible text nodes containing currency-like letters
+    // 1. Walk visible text nodes containing currency-like letters (including split <span>EUR</span><span>/USD</span>)
     if (document.body) {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
       let visited = 0;
       while ((node = walker.nextNode()) && visited < 30000) {
         visited++;
-        const raw = node.nodeValue;
-        if (!raw || raw.length < 6 || raw.length > 80) continue;
+        const raw = node.nodeValue ? node.nodeValue.trim() : '';
+        if (!raw || raw.length < 3 || raw.length > 80) continue;
         if (!/[A-Z]{3}/i.test(raw)) continue;
         const parent = node.parentElement;
-        if (parent && isVisible(parent) && findPairs(raw).length > 0) {
+        if (!parent || !isVisible(parent)) continue;
+        if (findPairs(raw).length > 0) {
           candidateLeaves.add(parent);
+        } else if (CURRENCIES.has(raw.toUpperCase()) && parent.parentElement && isVisible(parent.parentElement)) {
+          candidateLeaves.add(parent.parentElement);
+          if (parent.parentElement.parentElement && isVisible(parent.parentElement.parentElement)) {
+            candidateLeaves.add(parent.parentElement.parentElement);
+          }
         }
       }
     }
@@ -221,11 +227,14 @@
     observer.disconnect();
   }
 
-  function publishSnapshot() {
+  function publishSnapshot(force = false) {
     if (!chrome.runtime?.id) {
       stopObserver();
       return;
     }
+    // Avoid overwriting a freshly observed dropdown list when tab blurs/hides;
+    // service-worker MAX_AGE_MS (30s) still transitions stale tabs to STALE.
+    if (!force && document.hidden) return;
     const instruments = readInstruments();
     let sessionState;
 
@@ -273,9 +282,9 @@
   }
 
   chrome.runtime.onMessage.addListener(message => {
-    if (message && message.type === 'OLYMP_SCAN_NOW') publishSnapshot();
+    if (message && message.type === 'OLYMP_SCAN_NOW') publishSnapshot(true);
   });
 
-  publishSnapshot();
-  intervalId = window.setInterval(publishSnapshot, 5000);
+  publishSnapshot(true);
+  intervalId = window.setInterval(() => publishSnapshot(false), 5000);
 })();

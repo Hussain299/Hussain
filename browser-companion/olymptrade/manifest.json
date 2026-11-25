@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SignalForge — Olymp Trade Read-only Companion",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Shares visible Olymp Trade instrument and payout labels with SignalForge. Does not read credentials or place trades.",
   "permissions": ["storage", "tabs"],
   "host_permissions": [
