@@ -13,7 +13,7 @@ import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { buildAccuracyReport } from '../utils/accuracyAnalytics.js';
 import { telegramService } from './telegramService.js';
-import { isWithinStrictSignalDiscoveryWindow, AutonomousScheduler } from './scheduler.js';
+import { isWithinStrictSignalDiscoveryWindow, AutonomousScheduler, resolvePulseFetchPlan } from './scheduler.js';
 import {
   sanitizeOlympTradeBridgeStatus,
   normalizePair,
@@ -2243,6 +2243,307 @@ export async function runAllVerificationTests(): Promise<{
     const secondImmediateCheck = agi.isStrategyThrottled(losingStrat, Date.now() + 66 * 60 * 1000);
     if (!secondImmediateCheck.throttled) {
       throw new Error('Expected throttled arm to allow at most one recovery probe per 60m window.');
+    }
+  });
+
+  await runTest('SYSTEM', 'Targeted Olymp-Only Sensing: Fail-closed empty fetch when no active pairs, minimal fetch for active + settlement pairs', async () => {
+    const nowMs = Date.now();
+    const staleUniverse = resolveActiveTradingPairs(null, nowMs);
+    const planIdle = resolvePulseFetchPlan(staleUniverse, [], [], nowMs);
+    if (planIdle.shouldFetch || planIdle.shouldDiscover || planIdle.symbolsToFetch.length !== 0) {
+      throw new Error(`Expected fail-closed empty fetch plan when Olymp has no active pairs, got ${JSON.stringify(planIdle)}`);
+    }
+
+    const activeTrade: ResearchSignal = {
+      id: 'sig_plan_active_eurusd',
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      predictionTimeUtc: new Date(nowMs - 60_000).toISOString(),
+      predictionTimeIst: '',
+      signalCandleTime: new Date(nowMs - 60_000).toISOString(),
+      entryCondition: 'NEXT_5M_OPEN',
+      entryWindowStartUtc: new Date(nowMs - 30_000).toISOString(),
+      entryWindowEndUtc: new Date(nowMs + 30_000).toISOString(),
+      triggerPrice: 1.08,
+      invalidationPrice: 1.078,
+      actualEntryTimeUtc: new Date(nowMs - 30_000).toISOString(),
+      actualEntryPrice: 1.08,
+      entrySource: 'yahoo',
+      expiryMinutes: 30,
+      plannedExitTimeUtc: new Date(nowMs + 25 * 60_000).toISOString(),
+      actualExitTimeUtc: null,
+      actualExitPrice: null,
+      confidence: 0.78,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'ACTIVE',
+      lifecycleHistory: [],
+      grossReturnPips: null,
+      estimatedSpreadPips: 1.2,
+      netReturnPips: null,
+      payoutPct: 82,
+      payoutSource: 'BROKER_OBSERVED',
+      netReturnUnits: null,
+      outcomeResult: 'PENDING',
+      ruleFamily: 'order_flow_imbalance',
+      modelVersion: 'vTest',
+      notes: '',
+    };
+    const recoveringExpired: ResearchSignal = {
+      ...activeTrade,
+      id: 'sig_plan_expired_gbpjpy',
+      symbol: 'GBP/JPY',
+      lifecycleState: 'EXPIRED',
+      outcomeResult: 'CANCELLED',
+      plannedExitTimeUtc: new Date(nowMs - 10 * 60_000).toISOString(),
+      lifecycleHistory: [
+        {
+          timestamp: new Date(nowMs - 5 * 60_000).toISOString(),
+          fromState: 'ACTIVE',
+          toState: 'EXPIRED',
+          reason: 'No verified market candle within ±6m of planned expiry time.',
+        },
+      ],
+    };
+
+    const planSettleOnly = resolvePulseFetchPlan(staleUniverse, [activeTrade], [recoveringExpired], nowMs);
+    if (
+      !planSettleOnly.shouldFetch ||
+      planSettleOnly.shouldDiscover ||
+      planSettleOnly.symbolsToFetch.length !== 2 ||
+      !planSettleOnly.symbolsToFetch.includes('EUR/USD') ||
+      !planSettleOnly.symbolsToFetch.includes('GBP/JPY')
+    ) {
+      throw new Error(`Expected settlement-only fetch for EUR/USD + GBP/JPY, got ${JSON.stringify(planSettleOnly)}`);
+    }
+
+    const activeSnapshot = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true,
+      extensionVersion: '1.3.0',
+      platformTabOpen: true,
+      connected: true,
+      sessionState: 'READY',
+      capturedAt: new Date(nowMs).toISOString(),
+      ageMs: 500,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 85, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'USD/JPY', payoutPct: 84, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'GBP/USD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'EUR/GBP', payoutPct: 74, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'USD/CAD', payoutPct: 88, availability: 'DISABLED', evidence: 'HIGH' },
+      ],
+    });
+    const olympActiveUniverse = resolveActiveTradingPairs(activeSnapshot, nowMs);
+    const inactiveOpenTrade: ResearchSignal = {
+      ...activeTrade,
+      id: 'sig_plan_open_audnzd',
+      symbol: 'AUD/NZD',
+    };
+    const planActive = resolvePulseFetchPlan(olympActiveUniverse, [inactiveOpenTrade], [], nowMs);
+    if (
+      !planActive.shouldFetch ||
+      !planActive.shouldDiscover ||
+      planActive.brokerPairsCount !== 3 ||
+      planActive.symbolsToFetch.length !== 4 ||
+      !planActive.symbolsToFetch.includes('EUR/USD') ||
+      !planActive.symbolsToFetch.includes('USD/JPY') ||
+      !planActive.symbolsToFetch.includes('GBP/USD') ||
+      !planActive.symbolsToFetch.includes('AUD/NZD')
+    ) {
+      throw new Error(`Expected active-only fetch for 3 Olymp pairs + 1 open settlement pair, got ${JSON.stringify(planActive)}`);
+    }
+  });
+
+  await runTest('ML', 'Multi-Agent Adversarial Debate, Counterfactual Stress & Hedge (MWU) Adaptation', async () => {
+    const {
+      createInitialAgentCouncilState,
+      runMultiAgentDebate,
+      MultiAgentCouncilEngine,
+    } = await import('./multiAgentCouncil.js');
+
+    // 1. Overextended BUY setup with weak counterfactual survival & immune penalty must draw Contrarian + Red-Team challenges
+    const fragileVec = [
+      0.8, 1.5, 2.0, 2.5, 1.0,
+      0.55, 0.52, 0.05, 0.47, 0.5,
+      1.2, 1.8, 0.4, 0.72, 0.72,
+      0.92, 0.94, 1.2, 0.0,
+    ];
+    const councilInit = createInitialAgentCouncilState();
+    const fragileDebate = runMultiAgentDebate(
+      {
+        symbol: 'EUR/USD',
+        direction: 'BUY',
+        ruleFamily: 'momentum_5',
+        payoutPct: 80,
+        marketFeatureVector: fragileVec,
+        regime: {
+          symbol: 'EUR/USD',
+          hurstExponent: 0.48,
+          regimeType: 'RANDOM_WALK_CHOP',
+          shannonEntropy: 0.91,
+          atrPercentile: 75,
+          recommendedFamily: 'stand_down',
+          calculatedAt: new Date().toISOString(),
+        },
+        ftrlProbability: 0.44,
+        ftrlSampleSize: 30,
+        mlpUpProbability: 0.41,
+        mlpStepCount: 25,
+        mlpOosBce: 0.66,
+        immuneDampingPenalty: 0.14,
+        severeTrapCount: 1,
+        priorSettledRecords: [],
+      },
+      councilInit,
+      () => ({ probabilityUp: 0.41 })
+    );
+
+    if (fragileDebate.votes.length !== 5) {
+      throw new Error(`Expected 5 voting agents, got ${fragileDebate.votes.length}`);
+    }
+    const concededChallenges = fragileDebate.challenges.filter((c) => c.outcome === 'CONCEDED_REVISION');
+    if (concededChallenges.length === 0) {
+      throw new Error('Expected Contrarian/Red-Team challenges to force Round 2 revision on overextended setup.');
+    }
+    if (fragileDebate.round2MeanProbability >= fragileDebate.round1MeanProbability) {
+      throw new Error(
+        `Expected Round 2 mean (${fragileDebate.round2MeanProbability}) < Round 1 mean (${fragileDebate.round1MeanProbability}) after challenges.`
+      );
+    }
+    if (fragileDebate.verdict !== 'VETO_SHADOW') {
+      throw new Error(`Expected fragile setup verdict VETO_SHADOW, got ${fragileDebate.verdict}`);
+    }
+
+    // 2. Robust aligned BUY setup should defend counterfactual suite cleanly
+    const strongVec = [
+      1.6, 2.8, 3.6, 4.4, 1.0,
+      0.78, 0.06, 0.12, -0.06, 0.85,
+      1.35, 3.2, 1.4, 0.12, 0.12,
+      0.62, 0.58, 1.25, 0.0,
+    ];
+    const strongDebate = runMultiAgentDebate(
+      {
+        symbol: 'EUR/USD',
+        direction: 'BUY',
+        ruleFamily: 'order_flow_imbalance',
+        payoutPct: 85,
+        marketFeatureVector: strongVec,
+        regime: {
+          symbol: 'EUR/USD',
+          hurstExponent: 0.63,
+          regimeType: 'TRENDING',
+          shannonEntropy: 0.68,
+          atrPercentile: 62,
+          recommendedFamily: 'momentum',
+          calculatedAt: new Date().toISOString(),
+        },
+        ftrlProbability: 0.72,
+        ftrlSampleSize: 40,
+        mlpUpProbability: 0.74,
+        mlpStepCount: 40,
+        mlpOosBce: 0.61,
+        priorSettledRecords: Array.from({ length: 12 }, (_, idx) => ({
+          symbol: 'EUR/USD' as ForexSymbol,
+          direction: 'BUY' as const,
+          ruleFamily: 'order_flow_imbalance',
+          outcome: idx < 9 ? 'WIN' as const : 'LOSS' as const,
+          netReturnUnits: idx < 9 ? 0.85 : -1.0,
+        })),
+      },
+      councilInit,
+      (v) => ({ probabilityUp: v[0] > 0.2 ? 0.73 : 0.62 })
+    );
+    if (strongDebate.counterfactualSurvivalRate < 0.8 || strongDebate.verdict !== 'APPROVE') {
+      throw new Error(`Expected robust setup to survive counterfactual shocks & APPROVE, got ${JSON.stringify(strongDebate)}`);
+    }
+
+    // 3. Hedge / Multiplicative Weights Update: reward accurate challengers, keep weights normalized, block duplicates
+    const engine = new MultiAgentCouncilEngine();
+    const beforeW = engine.getState().agents.ADVERSARIAL_RED_TEAM.weight;
+    const settledLoss: ResearchSignal = {
+      id: 'sig_council_hedge_test_1',
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      predictionTimeUtc: new Date().toISOString(),
+      predictionTimeIst: '',
+      signalCandleTime: new Date().toISOString(),
+      entryCondition: 'NEXT_5M_OPEN',
+      entryWindowStartUtc: new Date().toISOString(),
+      entryWindowEndUtc: new Date().toISOString(),
+      triggerPrice: 1.09,
+      invalidationPrice: 1.088,
+      actualEntryTimeUtc: new Date().toISOString(),
+      actualEntryPrice: 1.09,
+      entrySource: 'yahoo',
+      expiryMinutes: 15,
+      plannedExitTimeUtc: new Date().toISOString(),
+      actualExitTimeUtc: new Date().toISOString(),
+      actualExitPrice: 1.089,
+      confidence: 0.78,
+      calibrationStatus: 'UNCALIBRATED',
+      lifecycleState: 'CLOSED',
+      lifecycleHistory: [],
+      grossReturnPips: -10,
+      estimatedSpreadPips: 1.2,
+      netReturnPips: null,
+      payoutPct: 80,
+      payoutSource: 'BROKER_OBSERVED',
+      netReturnUnits: -1.0,
+      outcomeResult: 'LOSS',
+      ruleFamily: 'momentum_5',
+      modelVersion: 'vTest',
+      agentDebate: {
+        ...fragileDebate,
+        votes: fragileDebate.votes.map((v) =>
+          v.agentId === 'ADVERSARIAL_RED_TEAM'
+            ? { ...v, round2Probability: 0.25 }
+            : v.agentId === 'BULL_MOMENTUM'
+              ? { ...v, round2Probability: 0.80 }
+              : v
+        ),
+      },
+    };
+    const firstTrain = engine.trainFromSettledSignal(settledLoss);
+    const dupTrain = engine.trainFromSettledSignal(settledLoss);
+    if (!firstTrain.trained || !dupTrain.duplicateBlocked) {
+      throw new Error(`Expected first council Hedge train=true and second duplicateBlocked=true, got ${JSON.stringify({ firstTrain, dupTrain })}`);
+    }
+    const afterState = engine.getState();
+    const sumWeights = Object.values(afterState.agents).reduce((acc, a) => acc + a.weight, 0);
+    if (Math.abs(sumWeights - 1.0) > 1e-4) {
+      throw new Error(`Expected Hedge weights normalized to 1.0, got ${sumWeights}`);
+    }
+    if (afterState.agents.ADVERSARIAL_RED_TEAM.weight <= beforeW ||
+        afterState.agents.ADVERSARIAL_RED_TEAM.weight <= afterState.agents.BULL_MOMENTUM.weight) {
+      throw new Error('Expected accurate Red-Team challenger on LOSS to gain Hedge weight above overconfident Bull agent.');
+    }
+
+    // 4. Live isolation check: Debate evaluation must NEVER touch signal.confidence when creating a ResearchSignal
+    const testCandle: Candle = makeM1TestCandles('EUR/USD', 1)[0];
+    const createdShadowTest = entryExitEngine.createResearchSignal({
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      signalCandle: testCandle,
+      ruleFamily: 'test_council_isolation',
+      modelVersion: 'test-council-v1',
+      expiryMinutes: 15,
+      confidence: 0.81,
+    });
+    if (createdShadowTest.confidence !== 0.81) {
+      throw new Error(`Expected live confidence 0.81 preserved untouched by shadow council, got ${createdShadowTest.confidence}`);
+    }
+  });
+
+  await runTest('SYSTEM', 'Scheduler Anti-Hang: Recover stalled cycle locks after 75s without starving normal cycles', async () => {
+    const sched: any = new AutonomousScheduler();
+    const now = Date.now();
+    sched.isRunningCycle = true;
+    sched.currentCycleStartedAtMs = now - 20_000;
+    if (sched.recoverIfStalled(now)) {
+      throw new Error('Active 20s cycle should NOT be flagged as stalled.');
+    }
+    sched.currentCycleStartedAtMs = now - 80_000;
+    if (!sched.recoverIfStalled(now) || sched.isRunningCycle !== false || sched.currentCycleStartedAtMs !== 0) {
+      throw new Error('Expected 80s hung cycle lock to be released cleanly by recoverIfStalled().');
     }
   });
 

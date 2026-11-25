@@ -26,6 +26,7 @@ import {
   ShadowModeComparison,
   TelegramConfig,
   TelegramSubscriber,
+  AgentCouncilState,
 } from '../types/index.js';
 import { getSessionFromTimestamp } from './dataFeeds.js';
 import {
@@ -126,6 +127,7 @@ interface DatabaseSchema {
     y: number;
     timestamp: string;
   }>;
+  agentCouncil?: AgentCouncilState;
 }
 
 const DEFAULT_DB_FILE = path.join(path.resolve(process.cwd(), 'data'), 'signalforge.db.json');
@@ -2000,6 +2002,15 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
 
   public saveEpisodicMemories(memories: DatabaseSchema['episodicMemories']) {
     this.state.episodicMemories = memories;
+    this.scheduleSave('high');
+  }
+
+  public getAgentCouncilState(): AgentCouncilState | undefined {
+    return this.state.agentCouncil;
+  }
+
+  public saveAgentCouncilState(council: AgentCouncilState) {
+    this.state.agentCouncil = council;
     this.scheduleSave('high');
   }
 

@@ -76,7 +76,18 @@ export default function App() {
     };
     void syncBridgeToServer();
     const timer = window.setInterval(() => void syncBridgeToServer(), 15_000);
-    return () => window.clearInterval(timer);
+    const onResume = () => {
+      if (document.visibilityState === 'visible') {
+        void syncBridgeToServer();
+      }
+    };
+    document.addEventListener('visibilitychange', onResume);
+    window.addEventListener('focus', onResume);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onResume);
+      window.removeEventListener('focus', onResume);
+    };
   }, []);
 
   // Merge live server signals with persistent Firestore cloud ledger (drops orphaned non-settled zombie docs)

@@ -23,6 +23,7 @@ import { behaviouralEngine } from './behaviouralEngine.js';
 import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
 import { evaluateShadowCandidateChronologically } from './shadowPredictor.js';
+import { multiAgentCouncil } from './multiAgentCouncil.js';
 
 interface StrategySearchJob {
   jobId: string;
@@ -883,6 +884,31 @@ apiRouter.get('/autopilot/status', (_req: Request, res: Response) => {
 apiRouter.get('/agi/state', (_req: Request, res: Response) => {
   res.json({
     agi: agiSelfLearningEngine.getSelfLearningState(),
+  });
+});
+
+// GET /api/agi/council — Multi-Agent Adversarial Debate Arena & Hedge Meta-Learner telemetry
+apiRouter.get('/agi/council', (_req: Request, res: Response) => {
+  const signals = db.getSignals(false);
+  const recentDebates = signals
+    .filter((s) => Boolean(s.agentDebate))
+    .slice(0, 20)
+    .map((s) => ({
+      signalId: s.id,
+      symbol: s.symbol,
+      direction: s.direction,
+      predictionTimeUtc: s.predictionTimeUtc,
+      predictionTimeIst: s.predictionTimeIst,
+      lifecycleState: s.lifecycleState,
+      outcomeResult: s.outcomeResult,
+      payoutPct: s.payoutPct,
+      netReturnUnits: s.netReturnUnits,
+      agentDebate: s.agentDebate!,
+    }));
+  res.json({
+    council: multiAgentCouncil.getState(),
+    benchmark: multiAgentCouncil.computeCouncilBenchmark(signals),
+    recentDebates,
   });
 });
 

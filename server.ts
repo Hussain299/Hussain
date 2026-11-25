@@ -142,9 +142,10 @@ async function startServer() {
       autonomousScheduler.start();
     }, 3000);
 
-    // Lightweight in-process scheduler watchdog
+    // Lightweight in-process scheduler & stalled-cycle watchdog
     setInterval(() => {
       try {
+        autonomousScheduler.recoverIfStalled();
         if (!autonomousScheduler.isRunning()) {
           console.warn('[Watchdog] autonomousScheduler was idle! Auto-restarting background coordinator...');
           autonomousScheduler.start();

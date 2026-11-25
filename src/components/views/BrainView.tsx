@@ -19,6 +19,7 @@ import {
   AgentReview,
   EvolutionGeneration,
   LossAutopsy,
+  MultiAgentDebateResult,
   ResearchExperiment,
   SynthesizedStrategyGene,
 } from '../../types/index.js';
@@ -27,7 +28,7 @@ interface BrainViewProps {
   onRefresh?: () => void;
 }
 
-type BrainTab = 'neural' | 'agi' | 'behavioural' | 'trinity' | 'strategies';
+type BrainTab = 'neural' | 'council' | 'agi' | 'behavioural' | 'trinity' | 'strategies';
 
 export const BrainView: React.FC<BrainViewProps> = () => {
   const [activeTab, setActiveTab] = useState<BrainTab>('neural');
@@ -38,12 +39,28 @@ export const BrainView: React.FC<BrainViewProps> = () => {
   const [autopsies, setAutopsies] = useState<LossAutopsy[]>([]);
   const [reviews, setReviews] = useState<AgentReview[]>([]);
   const [strategies, setStrategies] = useState<SynthesizedStrategyGene[]>([]);
+  const [councilData, setCouncilData] = useState<{
+    council: any;
+    benchmark: any;
+    recentDebates: Array<{
+      signalId: string;
+      symbol: string;
+      direction: string;
+      predictionTimeUtc: string;
+      predictionTimeIst: string;
+      lifecycleState: string;
+      outcomeResult: string;
+      payoutPct?: number;
+      netReturnUnits?: number | null;
+      agentDebate: MultiAgentDebateResult;
+    }>;
+  } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
   const fetchBrainData = async () => {
     setIsLoading(true);
     try {
-      const [telRes, wtRes, agiRes, diagRes, autRes, revRes, stratRes] = await Promise.all([
+      const [telRes, wtRes, agiRes, diagRes, autRes, revRes, stratRes, councilRes] = await Promise.all([
         fetch('/api/online-model/telemetry').then(r => r.json()).catch(() => ({ telemetry: null })),
         fetch('/api/online-model/weights').then(r => r.json()).catch(() => ({ weights: null })),
         fetch('/api/agi/state').then(r => r.json()).catch(() => ({ agi: null })),
@@ -51,6 +68,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
         fetch('/api/research/autopsies').then(r => r.json()).catch(() => ({ autopsies: [] })),
         fetch('/api/research/agents').then(r => r.json()).catch(() => ({ reviews: [] })),
         fetch('/api/strategies/synthesized').then(r => r.json()).catch(() => ({ strategies: [] })),
+        fetch('/api/agi/council').then(r => r.json()).catch(() => null),
       ]);
 
       if (telRes?.telemetry) setTelemetry(telRes.telemetry);
@@ -60,6 +78,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
       if (autRes?.autopsies) setAutopsies(autRes.autopsies);
       if (revRes?.reviews) setReviews(revRes.reviews);
       if (stratRes?.strategies) setStrategies(stratRes.strategies);
+      if (councilRes?.council) setCouncilData(councilRes);
     } catch (err) {
       console.error('Failed to sync brain telemetry:', err);
     } finally {
@@ -90,6 +109,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
             <div className="flex flex-wrap items-center bg-[#121820] border border-[#243040] p-1 rounded-lg gap-1">
               {[
                 { id: 'neural', label: 'Neural Policy Network', icon: Cpu },
+                { id: 'council', label: 'Adversarial Debate Arena', icon: Sparkles },
                 { id: 'agi', label: 'AGI Self-Learning & Autopsies', icon: Microscope },
                 { id: 'behavioural', label: 'Market Psychology', icon: Brain },
                 { id: 'trinity', label: 'Trinity Agents', icon: Users },
@@ -361,6 +381,192 @@ export const BrainView: React.FC<BrainViewProps> = () => {
                     Continuously checks that stated model confidence matches realized historical win rates.
                   </p>
                 </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* MODULE 1B: ADVERSARIAL MULTI-AGENT DEBATE ARENA & HEDGE   */}
+        {/* ========================================================= */}
+        {activeTab === 'council' && (
+          <div className="space-y-6 font-mono text-xs animate-in fade-in duration-150">
+            <div className="bg-[#161F2B] border border-[#243040] rounded-xl p-5 sm:p-6 shadow-lg space-y-5">
+              <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#243040] gap-2">
+                <div>
+                  <h2 className="text-base font-bold text-[#E8E5DE] tracking-tight">
+                    Multi-Agent Adversarial Debate Arena &amp; Hedge Meta-Learner
+                  </h2>
+                  <p className="text-xs text-[#AAB4BF] mt-0.5">
+                    5 autonomous quantitative agents propose, challenge via 5 counterfactual market shocks, revise beliefs in Round 2, and adapt weights via online Hedge (MWU) on settled outcomes. Shadow + Audit mode only.
+                  </p>
+                </div>
+                <span className="px-2.5 py-1 rounded bg-[#6C9D91]/15 text-[#6C9D91] border border-[#6C9D91]/30 font-bold">
+                  SHADOW + AUDIT · {councilData?.council?.totalDebatesEvaluated ?? 0} DEBATES
+                </span>
+              </div>
+
+              {/* Shadow Benchmark Cards */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="p-4 rounded-xl bg-[#121820] border border-[#243040]">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase block">Debated Settled</span>
+                  <span className="text-xl font-black text-[#E8E5DE] mt-1 block">
+                    {councilData?.benchmark?.debatedSettledCount ?? 0}
+                  </span>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                    All WR: {councilData?.benchmark?.hedgeAllWinRate !== null && councilData?.benchmark?.hedgeAllWinRate !== undefined ? `${councilData.benchmark.hedgeAllWinRate}%` : 'Collecting'}
+                  </span>
+                </div>
+                <div className="p-4 rounded-xl bg-[#121820] border border-[#243040]">
+                  <span className="text-[10px] text-[#72A98B] uppercase block">Council APPROVE WR</span>
+                  <span className="text-xl font-black text-[#72A98B] mt-1 block">
+                    {councilData?.benchmark?.hedgeApproveWinRate !== null && councilData?.benchmark?.hedgeApproveWinRate !== undefined ? `${councilData.benchmark.hedgeApproveWinRate}%` : 'Pending'}
+                  </span>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                    n={councilData?.benchmark?.hedgeApproveCount ?? 0} · {(councilData?.benchmark?.hedgeApproveNetUnits ?? 0) >= 0 ? '+' : ''}{councilData?.benchmark?.hedgeApproveNetUnits ?? 0} U
+                  </span>
+                </div>
+                <div className="p-4 rounded-xl bg-[#121820] border border-[#243040]">
+                  <span className="text-[10px] text-[#C4A574] uppercase block">Shadow-Vetoed Loss Block</span>
+                  <span className="text-xl font-black text-[#C4A574] mt-1 block">
+                    {councilData?.benchmark?.hedgeVetoedLossAvoidancePct !== null && councilData?.benchmark?.hedgeVetoedLossAvoidancePct !== undefined ? `${councilData.benchmark.hedgeVetoedLossAvoidancePct}%` : 'Pending'}
+                  </span>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                    Vetoed setups: {councilData?.benchmark?.hedgeVetoedCount ?? 0}
+                  </span>
+                </div>
+                <div className="p-4 rounded-xl bg-[#121820] border border-[#243040]">
+                  <span className="text-[10px] text-[#6C9D91] uppercase block">Hedge Ensemble Brier</span>
+                  <span className="text-xl font-black text-[#6C9D91] mt-1 block">
+                    {councilData?.benchmark?.hedgeBrier !== null && councilData?.benchmark?.hedgeBrier !== undefined ? councilData.benchmark.hedgeBrier : 'Pending'}
+                  </span>
+                  <span className="text-[10px] text-[#AAB4BF] mt-1 block">
+                    Fixed-share η={councilData?.council?.eta ?? 0.25}
+                  </span>
+                </div>
+              </div>
+
+              {/* Hedge Weights & Performance Leaderboard */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-[#E8E5DE] uppercase">
+                    Agent Hedge Weights &amp; Accountability Leaderboard
+                  </span>
+                  <span className="text-[10px] text-[#AAB4BF]">
+                    Regret-minimizing multiplicative updates shift weight toward winning challengers
+                  </span>
+                </div>
+                <div className="overflow-x-auto border border-[#243040] rounded-xl bg-[#121820]">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-[#243040] text-[#AAB4BF] text-[10px] uppercase">
+                        <th className="py-2.5 px-4">Agent</th>
+                        <th className="py-2.5 px-3">Hedge Weight</th>
+                        <th className="py-2.5 px-3">Last Delta</th>
+                        <th className="py-2.5 px-3">Observations</th>
+                        <th className="py-2.5 px-3">Call Accuracy</th>
+                        <th className="py-2.5 px-3">Brier</th>
+                        <th className="py-2.5 px-3">Challenge Win %</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(councilData?.benchmark?.agentLeaderboard || []).map((row: any) => (
+                        <tr key={row.agentId} className="border-b border-[#243040]/50 hover:bg-[#161F2B]/50">
+                          <td className="py-2.5 px-4 font-bold text-[#E8E5DE]">{row.agentName}</td>
+                          <td className="py-2.5 px-3">
+                            <span className="px-2 py-0.5 rounded bg-[#6C9D91]/20 text-[#6C9D91] font-bold">
+                              {row.weightPct.toFixed(1)}%
+                            </span>
+                          </td>
+                          <td className={`py-2.5 px-3 font-semibold ${row.lastWeightDeltaPct > 0 ? 'text-[#72A98B]' : row.lastWeightDeltaPct < 0 ? 'text-[#B7797D]' : 'text-[#AAB4BF]'}`}>
+                            {row.lastWeightDeltaPct > 0 ? '+' : ''}{row.lastWeightDeltaPct.toFixed(2)}%
+                          </td>
+                          <td className="py-2.5 px-3 text-[#E8E5DE]">{row.observations}</td>
+                          <td className="py-2.5 px-3 text-[#E8E5DE]">{row.accuracyPct !== null ? `${row.accuracyPct}%` : '—'}</td>
+                          <td className="py-2.5 px-3 text-[#AAB4BF]">{row.brierScore !== null ? row.brierScore : '—'}</td>
+                          <td className="py-2.5 px-3 text-[#C4A574]">{row.challengeWinRatePct !== null ? `${row.challengeWinRatePct}%` : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Recent Multi-Round Signal Debates */}
+              <div className="space-y-3 pt-2">
+                <span className="text-xs font-bold text-[#E8E5DE] uppercase block">
+                  Recent Setup Cross-Examinations &amp; Counterfactual Challenges
+                </span>
+                {(!councilData?.recentDebates || councilData.recentDebates.length === 0) ? (
+                  <div className="p-6 rounded-xl bg-[#121820] border border-[#243040] text-center text-[#AAB4BF]">
+                    No live setup debates recorded yet. Every new active Olymp Trade signal automatically triggers a 2-round multi-agent debate and counterfactual stress suite.
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {councilData.recentDebates.slice(0, 8).map((item) => {
+                      const d = item.agentDebate;
+                      return (
+                        <div key={item.signalId} className="p-4 rounded-xl bg-[#121820] border border-[#243040] space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[#243040]">
+                            <div className="flex items-center gap-2">
+                              <span className="font-black text-sm text-[#E8E5DE]">{item.symbol}</span>
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${item.direction === 'BUY' ? 'bg-[#72A98B]/20 text-[#72A98B]' : 'bg-[#B7797D]/20 text-[#B7797D]'}`}>
+                                {item.direction}
+                              </span>
+                              <span className="text-[11px] text-[#AAB4BF]">{item.predictionTimeIst || item.predictionTimeUtc}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {item.outcomeResult === 'WIN' || item.outcomeResult === 'LOSS' ? (
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${item.outcomeResult === 'WIN' ? 'bg-[#72A98B]/20 text-[#72A98B]' : 'bg-[#B7797D]/20 text-[#B7797D]'}`}>
+                                  ACTUAL: {item.outcomeResult}
+                                </span>
+                              ) : null}
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                d.verdict === 'APPROVE'
+                                  ? 'bg-[#72A98B]/20 text-[#72A98B] border border-[#72A98B]/40'
+                                  : d.verdict === 'CAUTION'
+                                    ? 'bg-[#C4A574]/20 text-[#C4A574] border border-[#C4A574]/40'
+                                    : 'bg-[#B7797D]/20 text-[#B7797D] border border-[#B7797D]/40'
+                              }`}>
+                                COUNCIL: {d.verdict}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="text-[11px] text-[#E8E5DE]">{d.consensusSummary}</div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
+                            {d.votes.map((v) => (
+                              <div key={v.agentId} className="p-2.5 rounded-lg bg-[#161F2B] border border-[#243040] space-y-1">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] font-bold text-[#E8E5DE] truncate">{v.agentName}</span>
+                                  <span className={`text-[9px] font-bold ${v.stance === 'SUPPORT' ? 'text-[#72A98B]' : v.stance === 'OPPOSE' ? 'text-[#B7797D]' : 'text-[#C4A574]'}`}>
+                                    {v.stance}
+                                  </span>
+                                </div>
+                                <div className="text-[11px] text-[#6C9D91]">
+                                  R1 {(v.round1Probability * 100).toFixed(0)}% → R2 <strong>{(v.round2Probability * 100).toFixed(0)}%</strong>
+                                </div>
+                                <div className="text-[9px] text-[#AAB4BF] leading-snug">{v.rationale}</div>
+                              </div>
+                            ))}
+                          </div>
+
+                          {d.challenges.length > 0 && (
+                            <div className="space-y-1.5 pt-1">
+                              {d.challenges.map((c, idx) => (
+                                <div key={idx} className="p-2 rounded bg-[#161F2B]/70 border border-[#354251] text-[10px] text-[#AAB4BF]">
+                                  <strong className="text-[#C4A574]">{c.challenger} → {c.target}:</strong> {c.flawCited}{' '}
+                                  <span className="text-[#E8E5DE]">{c.rebuttal}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           </div>

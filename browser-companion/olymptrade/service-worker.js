@@ -1,5 +1,57 @@
 const STORAGE_KEY = 'signalforgeOlympTradeSnapshot';
-const MAX_AGE_MS = 30_000;
+const MAX_AGE_MS = 35_000;
+const SIGNALFORGE_PROD_SNAPSHOT_URL = 'https://signalforge-ml.ai.studio/api/broker/olymptrade/snapshot';
+const PUSH_MIN_INTERVAL_MS = 12_000;
+const ALARM_NAME = 'signalforgeOlympKeepalive';
+let lastServerPushAtMs = 0;
+
+async function pushStatusToServer(force = false) {
+  const nowMs = Date.now();
+  if (!force && nowMs - lastServerPushAtMs < PUSH_MIN_INTERVAL_MS) return;
+  try {
+    const status = await makeStatus();
+    if (!status || !status.extensionInstalled) return;
+    lastServerPushAtMs = nowMs;
+    await fetch(SIGNALFORGE_PROD_SNAPSHOT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(status),
+      signal: AbortSignal.timeout(4000),
+    });
+  } catch {
+    // Non-fatal: tab relay or next alarm will retry
+  }
+}
+
+function ensureKeepaliveAlarm() {
+  if (!chrome.alarms) return;
+  chrome.alarms.get(ALARM_NAME, (existing) => {
+    if (!existing) {
+      chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+    }
+  });
+}
+
+chrome.runtime.onInstalled.addListener(() => ensureKeepaliveAlarm());
+chrome.runtime.onStartup.addListener(() => ensureKeepaliveAlarm());
+ensureKeepaliveAlarm();
+
+if (chrome.alarms) {
+  chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name !== ALARM_NAME) return;
+    try {
+      const tabs = await chrome.tabs.query({ url: ['https://olymptrade.com/*', 'https://*.olymptrade.com/*'] });
+      if (tabs.length === 0) return;
+      await Promise.all(
+        tabs.map((tab) =>
+          tab.id ? chrome.tabs.sendMessage(tab.id, { type: 'OLYMP_SCAN_NOW' }).catch(() => undefined) : Promise.resolve()
+        )
+      );
+      await new Promise((r) => setTimeout(r, 450));
+      await pushStatusToServer(true);
+    } catch {}
+  });
+}
 
 function hostnameOf(value) {
   try { return new URL(value).hostname.toLowerCase(); } catch { return ''; }
@@ -102,7 +154,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const snapshot = cleanSnapshot(message.payload, sender.tab.id);
     if (!snapshot) { sendResponse({ ok: false, error: 'INVALID_SNAPSHOT' }); return false; }
     chrome.storage.local.set({ [STORAGE_KEY]: snapshot }).then(
-      () => sendResponse({ ok: true }),
+      () => {
+        void pushStatusToServer(snapshot.instruments.length > 0 && snapshot.sessionState === 'READY');
+        sendResponse({ ok: true });
+      },
       () => sendResponse({ ok: false, error: 'STORAGE_FAILED' })
     );
     return true;

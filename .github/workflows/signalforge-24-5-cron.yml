@@ -19,4 +19,4 @@ jobs:
             echo "Set SIGNALFORGE_APP_URL secret to your deployed public URL."
             exit 0
           fi
-          curl -fsS -m 25 "${{ secrets.SIGNALFORGE_APP_URL }}/api/cron/tick?source=GITHUB_ACTIONS_24_5"
+          curl -fsS -m 45 "${{ secrets.SIGNALFORGE_APP_URL }}/api/cron/tick?source=GITHUB_ACTIONS_24_5"

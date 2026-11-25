@@ -224,6 +224,52 @@ export const TradeAuditModal: React.FC<TradeAuditModalProps> = ({ signal, onClos
             </p>
           </div>
 
+          {/* Adversarial Multi-Agent Debate Summary (If present) */}
+          {signal.agentDebate && (
+            <div className="p-4 rounded-xl bg-[#6C9D91]/10 border border-[#6C9D91]/35 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-[#6C9D91] font-bold text-xs uppercase font-mono">
+                  <Brain className="w-4 h-4 text-[#6C9D91]" />
+                  <span>Multi-Agent Debate &amp; Red-Team Stress Audit (Shadow)</span>
+                </div>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
+                  signal.agentDebate.verdict === 'APPROVE'
+                    ? 'bg-[#72A98B]/20 text-[#72A98B]'
+                    : signal.agentDebate.verdict === 'CAUTION'
+                      ? 'bg-[#C4A574]/20 text-[#C4A574]'
+                      : 'bg-[#B7797D]/20 text-[#B7797D]'
+                }`}>
+                  {signal.agentDebate.verdict} · Hedge {(signal.agentDebate.hedgeWeightedProbability * 100).toFixed(1)}%
+                </span>
+              </div>
+              <p className="text-[11px] font-mono text-[#E8E5DE]">
+                {signal.agentDebate.consensusSummary}
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {signal.agentDebate.votes.map((v) => (
+                  <div key={v.agentId} className="p-2 rounded bg-[#161F2B] border border-[#243040] text-[10px] font-mono">
+                    <div className="flex items-center justify-between text-[#E8E5DE] font-bold">
+                      <span>{v.agentName}</span>
+                      <span className={v.stance === 'SUPPORT' ? 'text-[#72A98B]' : v.stance === 'OPPOSE' ? 'text-[#B7797D]' : 'text-[#C4A574]'}>
+                        {v.stance} · R2 {(v.round2Probability * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <div className="text-[#AAB4BF] mt-0.5">{v.rationale}</div>
+                  </div>
+                ))}
+              </div>
+              {signal.agentDebate.challenges.length > 0 && (
+                <div className="space-y-1">
+                  {signal.agentDebate.challenges.map((c, idx) => (
+                    <div key={idx} className="text-[10px] font-mono text-[#AAB4BF]">
+                      <strong className="text-[#C4A574]">{c.challenger}:</strong> {c.flawCited} {c.rebuttal}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Loss Autopsy (If present) */}
           {signal.lossAutopsy && (
             <div className="p-4 rounded-xl bg-[#B7797D]/10 border border-[#B7797D]/40 space-y-2">

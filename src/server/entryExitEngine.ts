@@ -22,6 +22,7 @@ import { agiSelfLearningEngine } from './agiEngine.js';
 import { hasTrustedPredictionFeatures, onlinePolicyNetwork } from './onlinePolicyNetwork.js';
 import { isValidBrokerEligibilitySnapshot } from '../services/olympTradeBridge.js';
 import { evaluateShadowCandidate, PriorEpisodeRecord } from './shadowPredictor.js';
+import { multiAgentCouncil } from './multiAgentCouncil.js';
 
 /** Maximum delay to wait for a provider to deliver the exact 5-minute entry bar. */
 export const LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS = 5 * 60_000;
@@ -393,6 +394,37 @@ export class EntryExitEngine {
             linUcbV2Score: v2Eval.ucbScore,
             linUcbV2Obs: v2Eval.actionObservations,
             regime,
+            priorSettledRecords,
+          });
+
+          const knnEval = onlinePolicyNetwork.queryEpisodicKNN(
+            marketFeatureVector,
+            params.symbol,
+            params.direction
+          );
+          const immuneEval = agiSelfLearningEngine.evaluateAntidoteImmuneResistance(
+            params.symbol,
+            params.direction,
+            params.signalCandle
+          );
+          signal.agentDebate = multiAgentCouncil.evaluateSignalDebate({
+            symbol: params.symbol,
+            direction: params.direction,
+            ruleFamily: params.ruleFamily,
+            strategyId: signal.strategyId,
+            payoutPct: signal.payoutPct,
+            marketFeatureVector,
+            regime,
+            ftrlProbability: prediction.probability,
+            ftrlSampleSize: prediction.sampleSize,
+            mlpUpProbability: mlpFwd.probabilityUp,
+            mlpStepCount: mlpTel.stepCount,
+            mlpOosBce: mlpTel.validationLossOos,
+            linUcbV2Score: v2Eval.ucbScore,
+            linUcbV2Obs: v2Eval.actionObservations,
+            knnWinProbability: knnEval.neighbors >= 4 ? knnEval.localWinRate : null,
+            knnSampleCount: knnEval.neighbors,
+            immuneDampingPenalty: immuneEval.resistanceApplied ? immuneEval.dampingPenalty : 0,
             priorSettledRecords,
           });
         }
@@ -975,6 +1007,7 @@ export class EntryExitEngine {
 
       const mlpTrained = !stepRes.duplicateBlocked && stepRes.step > 0;
       const linUcbV2Trained = Boolean(stepRes.linUcbV2Trained) && !stepRes.linUcbV2DuplicateBlocked;
+      const councilRes = multiAgentCouncil.trainFromSettledSignal(signal);
 
       signal.trainingAudit = {
         ...(signal.trainingAudit || { ftrlTrained: false }),
@@ -992,8 +1025,10 @@ export class EntryExitEngine {
             : 'NOT_TRAINED',
         episodicRecorded,
         episodicSkippedReason: episodicRecorded ? undefined : 'ALREADY_TRAINED',
+        councilTrained: councilRes.trained,
+        councilSkippedReason: councilRes.trained ? undefined : councilRes.skippedReason,
         trainedAtUtc:
-          mlpTrained || linUcbV2Trained || episodicRecorded
+          mlpTrained || linUcbV2Trained || episodicRecorded || councilRes.trained
             ? observedAt
             : signal.trainingAudit?.trainedAtUtc,
       };
@@ -1001,6 +1036,7 @@ export class EntryExitEngine {
     } else {
       // No frozen prediction-time features: classify transparently as skipped without fabricating future features.
       onlinePolicyNetwork.recordSkippedTraining(signal.id, 'MISSING_FROZEN_PREDICTION_FEATURES');
+      const councilRes = multiAgentCouncil.trainFromSettledSignal(signal);
       signal.trainingAudit = {
         ...(signal.trainingAudit || { ftrlTrained: false }),
         mlpTrained: false,
@@ -1009,6 +1045,8 @@ export class EntryExitEngine {
         linUcbV2SkippedReason: 'MISSING_FROZEN_PREDICTION_FEATURES',
         episodicRecorded: false,
         episodicSkippedReason: 'MISSING_FROZEN_PREDICTION_FEATURES',
+        councilTrained: councilRes.trained,
+        councilSkippedReason: councilRes.trained ? undefined : councilRes.skippedReason,
       };
       db.updateSignal(signal);
 

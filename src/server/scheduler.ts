@@ -11,6 +11,7 @@ import {
   FOREX_PAIRS,
   ForexSymbol,
   ResearchExperiment,
+  ResearchSignal,
   RuleFamily,
 } from '../types/index.js';
 import { dataFeedEngine, getFreshRealCandleWindow, getSessionFromTimestamp, isForexMarketOpen } from './dataFeeds.js';
@@ -32,6 +33,62 @@ import {
 } from '../services/olympTradeBridge.js';
 
 const FIVE_MINUTE_MS = 5 * 60 * 1000;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const SENSE_BATCH_SIZE = 10;
+
+export interface PulseFetchPlan {
+  shouldFetch: boolean;
+  shouldDiscover: boolean;
+  symbolsToFetch: ForexSymbol[];
+  settlementSymbolsCount: number;
+  brokerPairsCount: number;
+}
+
+/**
+ * Determine the exact minimal set of symbols to fetch for a scheduler pulse.
+ * Only fetches active eligible Olymp Trade pairs plus any open/recovering
+ * settlement contracts, failing closed with an empty list when no broker
+ * pairs or open settlements require market data.
+ */
+export function resolvePulseFetchPlan(
+  universe: ActiveTradingUniverse,
+  activeSignals: ResearchSignal[],
+  recentSignals: ResearchSignal[],
+  nowMs: number = Date.now()
+): PulseFetchPlan {
+  const settlementSet = new Set<ForexSymbol>();
+  for (const sig of activeSignals) {
+    if (sig.symbol) settlementSet.add(sig.symbol);
+  }
+  for (const sig of recentSignals) {
+    if (sig.lifecycleState !== 'EXPIRED' || sig.outcomeResult !== 'CANCELLED') continue;
+    if (!sig.actualEntryPrice || !sig.plannedExitTimeUtc) continue;
+    const exitTimeMs = Date.parse(sig.plannedExitTimeUtc);
+    if (!exitTimeMs || nowMs - exitTimeMs > ONE_DAY_MS || nowMs < exitTimeMs) continue;
+    const lastReason = sig.lifecycleHistory?.[sig.lifecycleHistory.length - 1]?.reason || '';
+    if (lastReason.includes('No verified market candle within')) {
+      settlementSet.add(sig.symbol);
+    }
+  }
+
+  const combined = new Set<ForexSymbol>(settlementSet);
+  const shouldDiscover = universe.mode === 'OLYMP_ACTIVE' && universe.pairs.length > 0;
+  const brokerPairsCount = shouldDiscover ? universe.pairs.length : 0;
+  if (shouldDiscover) {
+    for (const pair of universe.pairs) {
+      combined.add(pair);
+    }
+  }
+
+  const symbolsToFetch = Array.from(combined);
+  return {
+    shouldFetch: symbolsToFetch.length > 0,
+    shouldDiscover,
+    symbolsToFetch,
+    settlementSymbolsCount: settlementSet.size,
+    brokerPairsCount,
+  };
+}
 
 /**
  * Whether a pulse request arrived inside the strict 3-minute advance discovery
@@ -45,7 +102,10 @@ export function isWithinStrictSignalDiscoveryWindow(timestampMs: number): boolea
 }
 
 export class AutonomousScheduler {
+  private static readonly CYCLE_STALL_TIMEOUT_MS = 75_000;
+  private static readonly SYMBOL_FETCH_TIMEOUT_MS = 9_500;
   private isRunningCycle = false;
+  private currentCycleStartedAtMs = 0;
   // Preserve exact/cron scan requests when a slower sensing cycle currently owns the scheduler.
   private pendingSignalScan = false;
   private autopilotTimer: NodeJS.Timeout | null = null;
@@ -67,8 +127,71 @@ export class AutonomousScheduler {
     this.latestOlympTradeStatus = null;
   }
 
+  public recoverIfStalled(nowMs: number = Date.now()): boolean {
+    if (
+      this.isRunningCycle &&
+      this.currentCycleStartedAtMs > 0 &&
+      nowMs - this.currentCycleStartedAtMs >= AutonomousScheduler.CYCLE_STALL_TIMEOUT_MS
+    ) {
+      const stalledForMs = nowMs - this.currentCycleStartedAtMs;
+      this.isRunningCycle = false;
+      this.currentCycleStartedAtMs = 0;
+      this.logMind(
+        'AUDITOR',
+        `[AUTOPILOT RECOVERY] Released stalled sensing cycle lock after ${stalledForMs}ms so autonomous pulses & 3M discovery resume cleanly.`
+      );
+      return true;
+    }
+    return false;
+  }
+
   public getActiveTradingUniverse(nowMs: number = Date.now()): ActiveTradingUniverse {
     return resolveActiveTradingPairs(this.latestOlympTradeStatus, nowMs);
+  }
+
+  private async fetchCandlesForSymbols(
+    symbols: ForexSymbol[],
+    candlesMap: Record<ForexSymbol, Candle[]>
+  ): Promise<number> {
+    let fetchedTotal = 0;
+    for (let i = 0; i < symbols.length; i += SENSE_BATCH_SIZE) {
+      const batch = symbols.slice(i, i + SENSE_BATCH_SIZE);
+      await Promise.all(
+        batch.map(async (symbol) => {
+          let timeoutId: NodeJS.Timeout | null = null;
+          try {
+            const res = await Promise.race([
+              dataFeedEngine.fetchCandles(symbol, 100),
+              new Promise<never>((_, reject) => {
+                timeoutId = setTimeout(
+                  () => reject(new Error(`Hard sensing timeout (${AutonomousScheduler.SYMBOL_FETCH_TIMEOUT_MS}ms)`)),
+                  AutonomousScheduler.SYMBOL_FETCH_TIMEOUT_MS
+                );
+              }),
+            ]);
+            // Require a fresh newest real candle, but retain the preceding real M1
+            // history for EMA/RSI/ATR/regime features. Applying a 90s age filter to
+            // every candle leaves fewer than 35 rows and silently disables discovery.
+            const nowMs = Date.now();
+            const freshStoredWindow = getFreshRealCandleWindow(db.getCandles(symbol, 100), symbol, nowMs, undefined, 100);
+            const freshFetchedWindow = getFreshRealCandleWindow(res.candles, symbol, nowMs, undefined, 100);
+            const byTimestamp = new Map<number, Candle>();
+            for (const candle of freshStoredWindow) byTimestamp.set(candle.timestampMs, candle);
+            // Prefer this cycle's provider candle if it shares a timestamp with persisted data.
+            for (const candle of freshFetchedWindow) byTimestamp.set(candle.timestampMs, candle);
+            candlesMap[symbol] = Array.from(byTimestamp.values())
+              .sort((a, b) => a.timestampMs - b.timestampMs)
+              .slice(-100);
+            fetchedTotal += candlesMap[symbol].length;
+          } catch (err: any) {
+            console.error(`[Autopilot] Sensing failed for ${symbol}:`, err.message);
+          } finally {
+            if (timeoutId) clearTimeout(timeoutId);
+          }
+        })
+      );
+    }
+    return fetchedTotal;
   }
 
   /**
@@ -319,6 +442,8 @@ export class AutonomousScheduler {
       this.pendingSignalScan = true;
     }
 
+    this.recoverIfStalled();
+
     if (this.isRunningCycle) {
       return {
         durationMs: 0,
@@ -332,6 +457,7 @@ export class AutonomousScheduler {
 
     this.isRunningCycle = true;
     const startTime = Date.now();
+    this.currentCycleStartedAtMs = startTime;
     this.cycleCount++;
 
     try {
@@ -403,38 +529,51 @@ export class AutonomousScheduler {
         telegramService.syncSubscribersFromUpdates().catch(() => {});
       }
 
+      const prePulseUniverse = this.getActiveTradingUniverse();
+      const fetchPlan = resolvePulseFetchPlan(
+        prePulseUniverse,
+        db.getActiveSignals(),
+        db.getSignals(false)
+      );
+
+      if (!fetchPlan.shouldFetch) {
+        this.pendingSignalScan = false;
+        const failNowMs = Date.now();
+        if (failNowMs - this.lastBlockedLogMs >= 60_000) {
+          this.lastBlockedLogMs = failNowMs;
+          this.logMind(
+            'AUDITOR',
+            `[OLYMP TRADE FAIL-CLOSED · ${prePulseUniverse.mode}] ${prePulseUniverse.reason}`
+          );
+        }
+        const idleDurationMs = Date.now() - startTime;
+        db.logCronRun(
+          idleDurationMs,
+          'SUCCESS',
+          `Autopilot pulse #${this.cycleCount} (${triggerSource}) skipped market sensing in ${idleDurationMs}ms (fail-closed: ${prePulseUniverse.mode}, 0 open settlements).`
+        );
+        if (
+          triggerSource === 'EXTERNAL_24_5_CRON' ||
+          triggerSource === 'SERVICE_WORKER_BACKGROUND_PULSE'
+        ) {
+          await db.flushAsync();
+        }
+        return {
+          durationMs: idleDurationMs,
+          pairsProcessed: 0,
+          signalsCreated: 0,
+          signalsUpdated: 0,
+          experimentsRun: 0,
+          topExperiment: null,
+        };
+      }
+
       const candlesMap: Record<ForexSymbol, Candle[]> = {} as any;
       let totalCandlesFetched = 0;
 
-      // 1. Autonomous Market Sensing across all configured ranked forex pairs in bounded concurrency batches of 5
-      // Prevents socket/memory/CPU spikes while still fetching all fresh real candles BEFORE sweeping or evaluating trades.
-      const FETCH_BATCH_SIZE = 5;
-      for (let i = 0; i < FOREX_PAIRS.length; i += FETCH_BATCH_SIZE) {
-        const batch = FOREX_PAIRS.slice(i, i + FETCH_BATCH_SIZE);
-        await Promise.all(
-          batch.map(async (symbol) => {
-            try {
-              const res = await dataFeedEngine.fetchCandles(symbol, 100);
-              // Require a fresh newest real candle, but retain the preceding real M1
-              // history for EMA/RSI/ATR/regime features. Applying a 90s age filter to
-              // every candle leaves fewer than 35 rows and silently disables discovery.
-              const nowMs = Date.now();
-              const freshStoredWindow = getFreshRealCandleWindow(db.getCandles(symbol, 100), symbol, nowMs, undefined, 100);
-              const freshFetchedWindow = getFreshRealCandleWindow(res.candles, symbol, nowMs, undefined, 100);
-              const byTimestamp = new Map<number, Candle>();
-              for (const candle of freshStoredWindow) byTimestamp.set(candle.timestampMs, candle);
-              // Prefer this cycle's provider candle if it shares a timestamp with persisted data.
-              for (const candle of freshFetchedWindow) byTimestamp.set(candle.timestampMs, candle);
-              candlesMap[symbol] = Array.from(byTimestamp.values())
-                .sort((a, b) => a.timestampMs - b.timestampMs)
-                .slice(-100);
-              totalCandlesFetched += candlesMap[symbol].length;
-            } catch (err: any) {
-              console.error(`[Autopilot] Sensing failed for ${symbol}:`, err.message);
-            }
-          })
-        );
-      }
+      // 1. Targeted Market Sensing: fetch ONLY active eligible Olymp Trade pairs + open/recovering settlements.
+      // Batches of 10 keep multi-pair fetches well below the 45s Olymp Trade snapshot freshness window.
+      totalCandlesFetched += await this.fetchCandlesForSymbols(fetchPlan.symbolsToFetch, candlesMap);
 
       // 1b. Reconcile any stale or previously candle-delayed settlements using freshly fetched real candles
       const sweptSignals = entryExitEngine.sweepStaleActiveSignals(candlesMap);
@@ -625,6 +764,14 @@ export class AutonomousScheduler {
               'AUDITOR',
               `[OLYMP TRADE FAIL-CLOSED · ${universe.mode}] ${universe.reason}`
             );
+          }
+        } else {
+          // If an active Olymp Trade snapshot arrived while settling open trades, fetch any newly active pairs on demand.
+          const missingActivePairs = universe.pairs.filter(
+            (symbol) => !candlesMap[symbol] && !inFlightSymbols.has(symbol)
+          );
+          if (missingActivePairs.length > 0) {
+            totalCandlesFetched += await this.fetchCandlesForSymbols(missingActivePairs, candlesMap);
           }
         }
         for (const symbol of universe.pairs) {
@@ -1240,6 +1387,7 @@ export class AutonomousScheduler {
       };
     } finally {
       this.isRunningCycle = false;
+      this.currentCycleStartedAtMs = 0;
     }
   }
 

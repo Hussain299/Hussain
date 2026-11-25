@@ -179,6 +179,76 @@ export interface ShadowCandidateEvaluation {
   calibrationSampleSize: number;
 }
 
+export type DebateAgentRole =
+  | 'BULL_MOMENTUM'
+  | 'BEAR_CONTRARIAN'
+  | 'NEURAL_BANDIT'
+  | 'ADVERSARIAL_RED_TEAM'
+  | 'RISK_AUDITOR';
+
+export interface DebateAgentVote {
+  agentId: DebateAgentRole;
+  agentName: string;
+  stance: 'SUPPORT' | 'NEUTRAL' | 'OPPOSE';
+  round1Probability: number;
+  round2Probability: number;
+  confidence: number;
+  hedgeWeightAtDecision: number;
+  rationale: string;
+  keyMetrics: string[];
+}
+
+export interface DebateChallengeRecord {
+  challenger: DebateAgentRole;
+  target: DebateAgentRole | 'CONSENSUS';
+  flawCited: string;
+  rebuttal: string;
+  probabilityAdjustment: number;
+  outcome: 'CONCEDED_REVISION' | 'DEFENDED' | 'RISK_WARNING';
+}
+
+export interface MultiAgentDebateResult {
+  debateVersion: string;
+  evaluatedAtUtc: string;
+  round1MeanProbability: number;
+  round2MeanProbability: number;
+  hedgeWeightedProbability: number;
+  breakEvenProbability: number;
+  hedgeExpectedValueUnits: number;
+  disagreementStdDev: number;
+  counterfactualSurvivalRate: number;
+  verdict: 'APPROVE' | 'CAUTION' | 'VETO_SHADOW';
+  consensusSummary: string;
+  votes: DebateAgentVote[];
+  challenges: DebateChallengeRecord[];
+}
+
+export interface HedgeAgentWeightState {
+  agentId: DebateAgentRole;
+  agentName: string;
+  roleSummary: string;
+  weight: number;
+  observations: number;
+  correctCalls: number;
+  cumulativeBrier: number;
+  cumulativeLogLoss: number;
+  challengeWins: number;
+  challengeAttempts: number;
+  lastWeightDelta: number;
+  lastUpdatedAt: string | null;
+}
+
+export interface AgentCouncilState {
+  version: string;
+  eta: number;
+  mixingAlpha: number;
+  totalDebatesEvaluated: number;
+  trainedSignalIds: string[];
+  duplicateBlocks: number;
+  agents: Record<DebateAgentRole, HedgeAgentWeightState>;
+  lastUpdatedAt: string | null;
+}
+
 export interface SignalTrainingAudit {
   mlpTrained: boolean;
   mlpSkippedReason?: string;
@@ -188,6 +258,8 @@ export interface SignalTrainingAudit {
   ftrlSkippedReason?: string;
   episodicRecorded: boolean;
   episodicSkippedReason?: string;
+  councilTrained?: boolean;
+  councilSkippedReason?: string;
   trainedAtUtc?: string;
 }
 
@@ -275,6 +347,8 @@ export interface ResearchSignal {
   predictionMarketRegime?: 'TRENDING' | 'MEAN_REVERTING' | 'RANDOM_WALK_CHOP' | 'UNKNOWN';
   /** Frozen shadow candidate evaluation at signal creation (never alters live selection until promoted). */
   shadowCandidate?: ShadowCandidateEvaluation;
+  /** Adversarial 2-round multi-agent debate & Hedge meta-learner consensus (shadow telemetry). */
+  agentDebate?: MultiAgentDebateResult;
   /** Durable per-component training & skip audit for this settled signal. */
   trainingAudit?: SignalTrainingAudit;
 }
