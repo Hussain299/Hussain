@@ -33,13 +33,31 @@
 
 body {
   font-family: var(--font-sans);
-  background-color: #17212D;
+  background-color: #121820;
+  background-image:
+    radial-gradient(ellipse 80% 45% at 50% -10%, rgba(108, 157, 145, 0.09), transparent 70%),
+    radial-gradient(circle at 85% 15%, rgba(196, 165, 116, 0.045), transparent 45%);
   color: #E8E5DE;
   margin: 0;
   padding: 0;
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.sf-panel {
+  background: linear-gradient(180deg, rgba(24, 34, 47, 0.96) 0%, rgba(20, 29, 40, 0.98) 100%);
+  border: 1px solid rgba(53, 66, 81, 0.72);
+  box-shadow: 0 12px 32px -12px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(232, 229, 222, 0.04);
 }
 
 /* Universal Tabular Figures for high-density financial metrics */

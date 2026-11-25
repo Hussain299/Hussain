@@ -41,6 +41,7 @@ interface OverviewViewProps {
   latestPrices: Record<string, number>;
   marketSessions: MarketSessionInfo[];
   providers: ProviderHealth[];
+  brokerStatus?: { mode: string; liveCount: number; pairs?: string[]; reason?: string } | null;
   onNavigateTab: (tab: any, filterParams?: any) => void;
   onEvaluateSignals: () => void;
   isEvaluating: boolean;
@@ -51,6 +52,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   latestPrices,
   marketSessions,
   providers,
+  brokerStatus,
   onNavigateTab,
   onEvaluateSignals,
   isEvaluating,
@@ -241,7 +243,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </span>
             <span className="text-[#354251]">/</span>
             <span className="text-[#AAB4BF]">
-              Autonomous Quantitative Engine · 20 Monitored Forex Pairs
+              Autonomous Quantitative Engine · {FOREX_PAIRS.length} Ranked Pairs (Olymp-Gated)
             </span>
           </div>
 
@@ -269,6 +271,48 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
       </div>
 
       <div className="max-w-7xl mx-auto px-4 lg:px-8 py-6 space-y-8">
+        {/* Live Olymp Trade Gate & Multi-Agent Council Strip */}
+        <div className="sf-panel rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+          <div className="flex flex-wrap items-center gap-3">
+            <span
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-bold border ${
+                brokerStatus?.mode === 'OLYMP_ACTIVE'
+                  ? 'bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/40'
+                  : 'bg-[#C5A36A]/15 text-[#C5A36A] border-[#C5A36A]/40'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  brokerStatus?.mode === 'OLYMP_ACTIVE' ? 'bg-[#72A98B] animate-pulse' : 'bg-[#C5A36A]'
+                }`}
+              />
+              {brokerStatus?.mode === 'OLYMP_ACTIVE'
+                ? `OLYMP ACTIVE · ${brokerStatus.liveCount} ELIGIBLE PAIRS`
+                : `FAIL-CLOSED · ${brokerStatus?.mode || 'WAITING FOR OLYMP SNAPSHOT'}`}
+            </span>
+            <span className="text-[#AAB4BF] text-[11px]">
+              {brokerStatus?.mode === 'OLYMP_ACTIVE' && brokerStatus.pairs && brokerStatus.pairs.length > 0
+                ? `Scanning: ${brokerStatus.pairs.slice(0, 6).join(', ')}${brokerStatus.pairs.length > 6 ? ` +${brokerStatus.pairs.length - 6} more` : ''}`
+                : brokerStatus?.reason || 'Open Olymp Trade in Chrome with companion v1.3+ to unlock live discovery.'}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => onNavigateTab('broker')}
+              className="px-3 py-1.5 rounded-lg bg-[#121820] hover:bg-[#243040] border border-[#354251] text-[#E8E5DE] font-semibold transition-colors cursor-pointer"
+            >
+              Broker Feed →
+            </button>
+            <button
+              onClick={() => onNavigateTab('brain')}
+              className="px-3 py-1.5 rounded-lg bg-[#6C9D91]/15 hover:bg-[#6C9D91]/25 border border-[#6C9D91]/40 text-[#6C9D91] font-bold transition-colors cursor-pointer"
+            >
+              5-Agent Debate Arena →
+            </button>
+          </div>
+        </div>
+
         {/* ------------------------------------------------------------- */}
         {/* SECTION 1: UNIFIED AUTONOMOUS BOT COMMAND CARD */}
         {/* ------------------------------------------------------------- */}

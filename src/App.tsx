@@ -17,6 +17,7 @@ import { EvolutionLabView } from './components/views/EvolutionLabView.tsx';
 import { ResearchAgentsView } from './components/views/ResearchAgentsView.tsx';
 import { EntryExitMonitorView } from './components/views/EntryExitMonitorView.tsx';
 import { NotificationBanner } from './components/NotificationBanner.tsx';
+import { CommandPalette } from './components/common/CommandPalette.tsx';
 import {
   AgentReview,
   AppNotification,
@@ -50,6 +51,8 @@ export default function App() {
   const [isRunningCycle, setIsRunningCycle] = useState(false);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [isCommandOpen, setIsCommandOpen] = useState(false);
+  const [brokerStatus, setBrokerStatus] = useState<{ mode: string; liveCount: number; pairs?: string[]; reason?: string } | null>(null);
 
   // Purge legacy localStorage signal snapshots on boot so stale win/loss numbers never flash on refresh
   useEffect(() => {
@@ -65,13 +68,17 @@ export default function App() {
       try {
         const status = await requestOlympTradeBridgeStatus('GET_STATUS');
         if (!status.extensionInstalled) return;
-        await fetch('/api/broker/olymptrade/snapshot', {
+        const res = await fetch('/api/broker/olymptrade/snapshot', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(status),
         });
+        if (res.ok) {
+          const universe = await res.json();
+          if (universe?.mode) setBrokerStatus(universe);
+        }
       } catch {
-        // Non-fatal: scheduler automatically falls back to 29-pair universe when offline
+        // Non-fatal: scheduler fails closed when Olymp Trade snapshot is absent/stale
       }
     };
     void syncBridgeToServer();
@@ -141,10 +148,12 @@ export default function App() {
       const now = Date.now();
       const shouldFetchSecondary = isManual || now - lastSecondaryFetchMsRef.current >= 45_000;
 
-      const [sigRes, autoRes] = await Promise.all([
+      const [sigRes, autoRes, brokerRes] = await Promise.all([
         fetchJsonSafely('/api/signals'),
         fetchJsonSafely('/api/autopilot/logs'),
+        fetchJsonSafely('/api/broker/olymptrade/status'),
       ]);
+      if (brokerRes?.mode) setBrokerStatus(brokerRes);
 
       let histRes: any = null;
       let revRes: any = null;
@@ -309,6 +318,17 @@ export default function App() {
     ['WAITING_FOR_ENTRY', 'ENTRY_TRIGGERED', 'ACTIVE'].includes(s.lifecycleState)
   ).length;
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsCommandOpen(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   return (
     <div className="min-h-screen w-full bg-[#121820] text-[#E8E5DE] antialiased font-sans flex flex-col relative">
       {/* Real-time In-App Signal Alert Banner */}
@@ -316,6 +336,15 @@ export default function App() {
         notification={activeNotification}
         onDismiss={handleDismissNotification}
         onSelectSignal={handleSelectSignal}
+      />
+
+      {/* Instant Workspace & Signal Command Palette (Ctrl/Cmd+K) */}
+      <CommandPalette
+        isOpen={isCommandOpen}
+        onClose={() => setIsCommandOpen(false)}
+        onSelectTab={setActiveTab}
+        signals={signals}
+        brokerStatus={brokerStatus}
       />
 
       {/* Top Header with Single-Line Nav & Top Bar Contract */}
@@ -328,6 +357,8 @@ export default function App() {
         isRefreshing={isRefreshing}
         activeSignalsCount={activeSignalsCount}
         onToggleSidebar={() => setIsMobileMenuOpen(prev => !prev)}
+        brokerStatus={brokerStatus}
+        onOpenCommandPalette={() => setIsCommandOpen(true)}
       />
 
       {/* Main Content Area — Full-page natural single document flow */}
@@ -351,6 +382,7 @@ export default function App() {
               latestPrices={latestPrices}
               marketSessions={marketSessions}
               providers={providers}
+              brokerStatus={brokerStatus}
               onNavigateTab={setActiveTab}
               onEvaluateSignals={handleEvaluateSignals}
               isEvaluating={isEvaluating}

@@ -47,8 +47,10 @@ export const BackgroundEngineBadge: React.FC = () => {
 
           <Cpu className="w-3.5 h-3.5 text-[#6C9D91] group-hover:rotate-45 transition-transform" />
 
-          <span className="text-[11px] font-bold tracking-wider uppercase text-[#E8E5DE]">
-            SW ENGINE: <span className="text-[#72A98B]">ACTIVE</span>
+          <span className="text-[11px] font-bold tracking-wider uppercase text-[#E8E5DE] whitespace-nowrap">
+            <span className="hidden 2xl:inline">SW ENGINE: </span>
+            <span className="2xl:hidden">SW: </span>
+            <span className="text-[#72A98B]">ACTIVE</span>
           </span>
         </button>
       </div>

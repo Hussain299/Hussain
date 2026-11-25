@@ -729,6 +729,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                   const countdownToEntryStr = secToEntry > 0
                     ? `${Math.floor(secToEntry / 60)}m ${(secToEntry % 60).toString().padStart(2, '0')}s`
                     : 'Entering Now';
+                  const entryPillText = secToEntry > 0 ? `⏳ Enters in ${countdownToEntryStr}` : '⚡ Entering at 5M Open';
 
                   return (
                     <div
@@ -759,7 +760,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         <div className="flex items-center gap-2 text-right">
                           <span className="px-3.5 py-1.5 rounded-full text-xs font-bold bg-[#C4A574]/20 border border-[#C4A574]/50 text-[#C4A574] flex items-center gap-2 shadow-inner">
                             <span className="w-2 h-2 rounded-full bg-[#C4A574] animate-ping" />
-                            <span>⏳ Enters in {countdownToEntryStr}</span>
+                            <span>{entryPillText}</span>
                             <span className="text-[#AAB4BF] font-normal border-l border-[#C4A574]/30 pl-1.5">3-Min Advance</span>
                           </span>
                         </div>
@@ -776,7 +777,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                             {timings.entryTimeIst}
                           </div>
                           <span className="text-[10px] text-[#72A98B] font-bold block flex items-center gap-1.5">
-                            <span>⏳ Enters in {countdownToEntryStr}</span>
+                            <span>{entryPillText}</span>
                             <span className="text-[#AAB4BF] font-normal">({timings.alertTimeIst} alert)</span>
                           </span>
                         </div>
@@ -832,7 +833,20 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                           ))}
                         </div>
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          {alert.agentDebate && (
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                                alert.agentDebate.verdict === 'APPROVE'
+                                  ? 'bg-[#6C9D91]/15 text-[#6C9D91] border-[#6C9D91]/35'
+                                  : alert.agentDebate.verdict === 'CAUTION'
+                                    ? 'bg-[#C4A574]/15 text-[#C4A574] border-[#C4A574]/35'
+                                    : 'bg-[#B7797D]/15 text-[#B7797D] border-[#B7797D]/35'
+                              }`}
+                            >
+                              COUNCIL: {alert.agentDebate.verdict} · {(alert.agentDebate.hedgeWeightedProbability * 100).toFixed(0)}%
+                            </span>
+                          )}
                           {alert.brokerEligibility ? (
                             <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/30">
                               OLYMP VERIFIED · {alert.brokerEligibility.payoutPct}%
@@ -952,7 +966,20 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                         <span className="text-[#AAB4BF] truncate max-w-[280px]">
                           Strategy: <strong className="text-[#E8E5DE]">{trade.strategyName || trade.ruleFamily}</strong>
                         </span>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          {trade.agentDebate && (
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                                trade.agentDebate.verdict === 'APPROVE'
+                                  ? 'bg-[#6C9D91]/15 text-[#6C9D91] border-[#6C9D91]/35'
+                                  : trade.agentDebate.verdict === 'CAUTION'
+                                    ? 'bg-[#C4A574]/15 text-[#C4A574] border-[#C4A574]/35'
+                                    : 'bg-[#B7797D]/15 text-[#B7797D] border-[#B7797D]/35'
+                              }`}
+                            >
+                              COUNCIL: {trade.agentDebate.verdict} · {(trade.agentDebate.hedgeWeightedProbability * 100).toFixed(0)}%
+                            </span>
+                          )}
                           {trade.brokerEligibility ? (
                             <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/30">
                               OLYMP VERIFIED · {trade.brokerEligibility.payoutPct}%
