@@ -20,15 +20,22 @@ export interface OlympTradeBridgeStatus {
 }
 
 const CHANNEL = 'SIGNALFORGE_OLYMP_TRADE_BRIDGE';
+const STALE_THRESHOLD_MS = 45_000;
+
 const EMPTY_STATUS: OlympTradeBridgeStatus = {
   extensionInstalled: false, extensionVersion: null, platformTabOpen: false,
   connected: false, sessionState: 'UNKNOWN', capturedAt: null, ageMs: null, instruments: [],
 };
 
-function normalizePair(value: unknown): string | null {
+export function normalizePair(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const pair = value.trim().toUpperCase().replace(/\s+/g, '');
-  return /^[A-Z]{3}\/[A-Z]{3}$/.test(pair) ? pair : null;
+  if (/^[A-Z]{3}\/[A-Z]{3}$/.test(pair)) {
+    const [base, quote] = pair.split('/');
+    if (base === quote) return null; // Reject same-currency pairs
+    return pair;
+  }
+  return null;
 }
 
 /** Accept only the fields needed by this read-only panel from the local extension. */
@@ -72,7 +79,9 @@ export function sanitizeOlympTradeBridgeStatus(value: unknown): OlympTradeBridge
   const extensionInstalled = raw.extensionInstalled === true;
   const platformTabOpen = raw.platformTabOpen === true;
   const connected = extensionInstalled && platformTabOpen && raw.connected === true &&
-    sessionState === 'READY' && ageMs !== null && ageMs <= 45_000 && unique.size > 0;
+    sessionState === 'READY' && ageMs !== null && ageMs <= STALE_THRESHOLD_MS && unique.size > 0;
+
+  // Build result with ONLY the expected fields — no credential data forwarded
   return {
     extensionInstalled,
     extensionVersion: typeof raw.extensionVersion === 'string' ? raw.extensionVersion.slice(0, 32) : null,
@@ -103,7 +112,7 @@ export async function requestOlympTradeBridgeStatus(
           data.requestId !== requestId) return;
       finish(sanitizeOlympTradeBridgeStatus(data.payload));
     };
-    timeoutId = window.setTimeout(() => finish({ ...EMPTY_STATUS }), 1400);
+    timeoutId = window.setTimeout(() => finish({ ...EMPTY_STATUS }), 1800);
     window.addEventListener('message', onMessage);
     window.postMessage({ channel: CHANNEL, direction: 'APP_REQUEST', requestId, command }, window.location.origin);
   });

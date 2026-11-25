@@ -12,7 +12,7 @@ import { entryExitEngine, findExactEntryCandle, LIVE_ENTRY_BAR_ARRIVAL_GRACE_MS 
 import { researchEngine } from './researchEngine.js';
 import { calculateBinarySettlement } from './binarySettlement.js';
 import { buildAccuracyReport } from '../utils/accuracyAnalytics.js';
-import { sanitizeOlympTradeBridgeStatus } from '../services/olympTradeBridge.js';
+import { sanitizeOlympTradeBridgeStatus, normalizePair } from '../services/olympTradeBridge.js';
 import { telegramService } from './telegramService.js';
 import { isWithinStrictSignalDiscoveryWindow } from './scheduler.js';
 import {
@@ -228,6 +228,232 @@ export async function runAllVerificationTests(): Promise<{
     if ('password' in status) {
       throw new Error('Credential-like fields must never be included in the SignalForge broker snapshot.');
     }
+  });
+
+  // ─── Comprehensive Olymp Trade Bridge Tests ───
+
+  await runTest('DATA', 'Olymp Trade bridge: exact symbol normalization', () => {
+    // Standard format
+    if (normalizePair('EUR/USD') !== 'EUR/USD') throw new Error('Standard pair normalization failed');
+    if (normalizePair('eur/usd') !== 'EUR/USD') throw new Error('Lowercase pair normalization failed');
+    if (normalizePair('  eur / usd  ') !== 'EUR/USD') throw new Error('Whitespace pair normalization failed');
+    if (normalizePair('Gbp/Jpy') !== 'GBP/JPY') throw new Error('Mixed case pair normalization failed');
+    // Invalid formats
+    if (normalizePair('EURUSD') !== null) throw new Error('No-slash pair should be rejected');
+    if (normalizePair('EUR') !== null) throw new Error('Single currency should be rejected');
+    if (normalizePair('') !== null) throw new Error('Empty string should be rejected');
+    if (normalizePair(null) !== null) throw new Error('Null should be rejected');
+    if (normalizePair(123) !== null) throw new Error('Number should be rejected');
+    if (normalizePair('USD/USD') !== null) throw new Error('Same-currency pair should be rejected');
+    if (normalizePair('AB/CDE') !== null) throw new Error('Short base currency should be rejected');
+    if (normalizePair('ABCD/EUR') !== null) throw new Error('Long base currency should be rejected');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: pair/payout association prevents cross-contamination', () => {
+    // When two pairs exist in the same snapshot, payouts must stay with their own pair
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true,
+      extensionVersion: '1.0.0',
+      platformTabOpen: true,
+      connected: true,
+      sessionState: 'READY',
+      capturedAt: new Date().toISOString(),
+      ageMs: 500,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 92, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'GBP/USD', payoutPct: 85, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'AUD/JPY', payoutPct: 88, availability: 'AVAILABLE', evidence: 'MEDIUM' },
+      ],
+    });
+    const eurUsd = status.instruments.find(r => r.pair === 'EUR/USD');
+    const gbpUsd = status.instruments.find(r => r.pair === 'GBP/USD');
+    const audJpy = status.instruments.find(r => r.pair === 'AUD/JPY');
+    if (eurUsd?.payoutPct !== 92) throw new Error('EUR/USD payout misassociated');
+    if (gbpUsd?.payoutPct !== 85) throw new Error('GBP/USD payout misassociated');
+    if (audJpy?.payoutPct !== 88) throw new Error('AUD/JPY payout misassociated');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: duplicate instrument handling keeps best evidence', () => {
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: null, availability: 'AVAILABLE', evidence: 'NONE' },
+        { pair: 'EUR/USD', payoutPct: 92, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'EUR/USD', payoutPct: 88, availability: 'AVAILABLE', evidence: 'MEDIUM' },
+      ],
+    });
+    const eur = status.instruments.filter(r => r.pair === 'EUR/USD');
+    if (eur.length !== 1) throw new Error('Duplicate EUR/USD not deduplicated');
+    if (eur[0].payoutPct !== 92 || eur[0].evidence !== 'HIGH') throw new Error('Best evidence not kept');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: missing payout handled correctly', () => {
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: null, availability: 'AVAILABLE', evidence: 'NONE' },
+        { pair: 'GBP/JPY', availability: 'AVAILABLE', evidence: 'NONE' },
+      ],
+    });
+    const eur = status.instruments.find(r => r.pair === 'EUR/USD');
+    const gbp = status.instruments.find(r => r.pair === 'GBP/JPY');
+    if (eur?.payoutPct !== null) throw new Error('Null payout should stay null');
+    if (gbp?.payoutPct !== null) throw new Error('Missing payout field should be null');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: invalid or impossible percentage rejection', () => {
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 145, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'GBP/JPY', payoutPct: -10, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'AUD/USD', payoutPct: 0, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'USD/CHF', payoutPct: 49.9, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'NZD/USD', payoutPct: 100.01, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'AUD/JPY', payoutPct: NaN, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'EUR/GBP', payoutPct: Infinity, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'GBP/USD', payoutPct: 'eighty', availability: 'AVAILABLE', evidence: 'HIGH' },
+      ],
+    });
+    for (const inst of status.instruments) {
+      if (inst.payoutPct !== null) {
+        throw new Error(`Invalid payout ${inst.payoutPct} for ${inst.pair} should have been rejected`);
+      }
+    }
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: disabled/unavailable instrument detection', () => {
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'GBP/JPY', payoutPct: 85, availability: 'UNAVAILABLE', evidence: 'HIGH' },
+        { pair: 'AUD/USD', payoutPct: 88, availability: 'UNKNOWN', evidence: 'HIGH' },
+        { pair: 'USD/CHF', payoutPct: 82, availability: 'INVALID_STATE', evidence: 'HIGH' },
+      ],
+    });
+    const eur = status.instruments.find(r => r.pair === 'EUR/USD');
+    const gbp = status.instruments.find(r => r.pair === 'GBP/JPY');
+    const aud = status.instruments.find(r => r.pair === 'AUD/USD');
+    const usd = status.instruments.find(r => r.pair === 'USD/CHF');
+    if (eur?.availability !== 'AVAILABLE') throw new Error('AVAILABLE not preserved');
+    if (gbp?.availability !== 'UNAVAILABLE') throw new Error('UNAVAILABLE not preserved');
+    if (aud?.availability !== 'UNKNOWN') throw new Error('UNKNOWN not preserved');
+    if (usd?.availability !== 'UNKNOWN') throw new Error('Invalid state should become UNKNOWN');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: stale snapshot rejection', () => {
+    const staleTime = new Date(Date.now() - 120_000).toISOString(); // 2 minutes old
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: staleTime, ageMs: 120_000,
+      instruments: [{ pair: 'EUR/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH' }],
+    });
+    if (status.connected) throw new Error('Stale snapshot (120s) should not be reported as connected');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: session expiration detection', () => {
+    const statusLogin = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: false, sessionState: 'LOGIN_REQUIRED',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [],
+    });
+    if (statusLogin.connected) throw new Error('LOGIN_REQUIRED should not be connected');
+    if (statusLogin.sessionState !== 'LOGIN_REQUIRED') throw new Error('LOGIN_REQUIRED state not preserved');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: automatic recovery after login', () => {
+    // First check LOGIN_REQUIRED
+    const before = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: false, sessionState: 'LOGIN_REQUIRED',
+      capturedAt: new Date().toISOString(), ageMs: 500, instruments: [],
+    });
+    if (before.connected) throw new Error('Should not be connected during login');
+
+    // Then check that READY with instruments reconnects
+    const after = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [{ pair: 'EUR/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH' }],
+    });
+    if (!after.connected) throw new Error('Should reconnect after login with fresh READY data');
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: invalid message origin rejection', () => {
+    // Null/undefined inputs
+    const s1 = sanitizeOlympTradeBridgeStatus(null);
+    const s2 = sanitizeOlympTradeBridgeStatus(undefined);
+    const s3 = sanitizeOlympTradeBridgeStatus('not an object');
+    const s4 = sanitizeOlympTradeBridgeStatus(42);
+    for (const s of [s1, s2, s3, s4]) {
+      if (s.connected || s.extensionInstalled || s.instruments.length > 0) {
+        throw new Error('Invalid input should return empty disconnected status');
+      }
+    }
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: no credential-like data in sanitized snapshots', () => {
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [{ pair: 'EUR/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH' }],
+      password: 'secret123', token: 'bearer_xyz', cookie: 'session=abc',
+      email: 'user@example.com', balance: 5000, accountId: '12345',
+    });
+    const json = JSON.stringify(status);
+    if (json.includes('secret123') || json.includes('bearer_xyz') || json.includes('session=abc') ||
+        json.includes('user@example.com') || json.includes('12345')) {
+      throw new Error('Credential-like data leaked through sanitization');
+    }
+    // Verify only expected keys exist at top level
+    const allowedKeys = new Set(['extensionInstalled', 'extensionVersion', 'platformTabOpen',
+      'connected', 'sessionState', 'capturedAt', 'ageMs', 'instruments']);
+    for (const key of Object.keys(status)) {
+      if (!allowedKeys.has(key)) throw new Error(`Unexpected key "${key}" in sanitized status`);
+    }
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: 29-pair universe is not modified by bridge status', () => {
+    // Verify that the bridge status contains instruments but doesn't affect FOREX_PAIRS
+    const pairsBeforeCount = FOREX_PAIRS.length;
+    sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 90, availability: 'AVAILABLE', evidence: 'HIGH' },
+        { pair: 'BTC/USD', payoutPct: 95, availability: 'AVAILABLE', evidence: 'HIGH' },
+      ],
+    });
+    if (FOREX_PAIRS.length !== pairsBeforeCount || FOREX_PAIRS.length !== 29) {
+      throw new Error('Bridge processing must not modify the configured 29-pair universe');
+    }
+    if (FOREX_PAIRS.includes('BTC/USD' as any)) {
+      throw new Error('Non-forex pair should not appear in FOREX_PAIRS');
+    }
+  });
+
+  await runTest('DATA', 'Olymp Trade bridge: empty instrument list with READY session is not connected', () => {
+    const status = sanitizeOlympTradeBridgeStatus({
+      extensionInstalled: true, extensionVersion: '1.0.0', platformTabOpen: true,
+      connected: true, sessionState: 'READY',
+      capturedAt: new Date().toISOString(), ageMs: 500,
+      instruments: [],
+    });
+    if (status.connected) throw new Error('READY with no instruments should not be connected');
   });
 
   await runTest('ML', 'Legacy 20-pair shadow learner weights migrate into the 29-pair layout', () => {

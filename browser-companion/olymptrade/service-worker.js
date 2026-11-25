@@ -12,6 +12,7 @@ function isSignalForgeUrl(value) {
   const host = hostnameOf(value);
   return host === 'signalforge-ml.ai.studio' || host === 'localhost' || host === '127.0.0.1';
 }
+
 function cleanSnapshot(value, tabId) {
   if (!value || typeof value !== 'object' || !Array.isArray(value.instruments)) return null;
   const instruments = [];
@@ -20,6 +21,9 @@ function cleanSnapshot(value, tabId) {
     if (!row || typeof row.pair !== 'string') continue;
     const pair = row.pair.trim().toUpperCase();
     if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(pair) || seen.has(pair)) continue;
+    // Reject same-currency pairs like USD/USD
+    const [base, quote] = pair.split('/');
+    if (base === quote) continue;
     seen.add(pair);
     const payoutPct = typeof row.payoutPct === 'number' && Number.isFinite(row.payoutPct) && row.payoutPct >= 50 && row.payoutPct <= 100
       ? Math.round(row.payoutPct * 100) / 100 : null;
@@ -31,6 +35,7 @@ function cleanSnapshot(value, tabId) {
     ? value.sessionState : 'WAITING_FOR_MARKET_DATA';
   return { tabId, capturedAt: new Date().toISOString(), sessionState, instruments };
 }
+
 async function makeStatus() {
   const [platformTabs, stored] = await Promise.all([
     chrome.tabs.query({ url: ['https://olymptrade.com/*', 'https://*.olymptrade.com/*'] }),
@@ -42,24 +47,43 @@ async function makeStatus() {
   const capturedAtMs = snapshot && snapshot.capturedAt ? Date.parse(snapshot.capturedAt) : NaN;
   const ageMs = Number.isFinite(capturedAtMs) ? Math.max(0, Date.now() - capturedAtMs) : null;
   const fresh = snapshotTabOpen && ageMs !== null && ageMs <= MAX_AGE_MS;
+
   let sessionState = 'NO_PLATFORM_TAB';
   if (tabIsOpen && !snapshotTabOpen) sessionState = 'WAITING_FOR_MARKET_DATA';
   else if (snapshotTabOpen && !fresh) sessionState = 'STALE';
   else if (fresh) sessionState = snapshot.sessionState;
+
+  // Clear stale snapshot data when OT tab is closed
+  const instruments = (fresh && snapshot) ? snapshot.instruments : [];
+  const capturedAt = (fresh && snapshot) ? snapshot.capturedAt : null;
+
   return {
     extensionInstalled: true,
     extensionVersion: chrome.runtime.getManifest().version,
     platformTabOpen: tabIsOpen,
-    connected: fresh && sessionState === 'READY' && snapshot.instruments.length > 0,
+    connected: fresh && sessionState === 'READY' && instruments.length > 0,
     sessionState,
-    capturedAt: snapshot ? snapshot.capturedAt : null,
-    ageMs,
-    instruments: snapshot ? snapshot.instruments : [],
+    capturedAt,
+    ageMs: fresh ? ageMs : null,
+    instruments,
   };
 }
 
+/* ───────── Clean up stored snapshot when OT tabs are closed ───────── */
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  try {
+    const stored = await chrome.storage.local.get(STORAGE_KEY);
+    const snapshot = stored[STORAGE_KEY];
+    if (snapshot && snapshot.tabId === tabId) {
+      await chrome.storage.local.remove(STORAGE_KEY);
+    }
+  } catch {}
+});
+
+/* ───────── Message handler ───────── */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
+
   if (message.type === 'OLYMP_SNAPSHOT') {
     const sourceUrl = sender.tab && sender.tab.url ? sender.tab.url : (sender.url || '');
     if (!isOlympTradeUrl(sourceUrl) || !sender.tab || !sender.tab.id) {
@@ -86,6 +110,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await Promise.all(tabs.map(tab => tab.id
           ? chrome.tabs.sendMessage(tab.id, { type: 'OLYMP_SCAN_NOW' }).catch(() => undefined)
           : Promise.resolve()));
+        // Small delay to let content script publish before we read
+        await new Promise(r => setTimeout(r, 600));
         sendResponse(await makeStatus());
       }).catch(async () => sendResponse(await makeStatus()));
       return true;
