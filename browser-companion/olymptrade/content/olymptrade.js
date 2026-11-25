@@ -161,10 +161,18 @@
         rowEl.getAttribute('aria-disabled') === 'true' ||
         /\b(disabled|unavailable|closed|suspended|locked)\b/i.test(classText) ||
         /\b(disabled|unavailable|closed|suspended|locked)\b/i.test(text);
+      const hasPointer = el => {
+        let cur = el;
+        for (let i = 0; i < 4 && cur && cur !== document.body; i++) {
+          if (window.getComputedStyle(cur).cursor === 'pointer') return true;
+          cur = cur.parentElement;
+        }
+        return false;
+      };
       const isInteractive = rowEl.matches('button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"],li,tr') ||
         Boolean(rowEl.closest('button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"]')) ||
         Boolean(rowEl.querySelector('button,[role="button"]')) ||
-        window.getComputedStyle(rowEl).cursor === 'pointer';
+        hasPointer(rowEl);
       const availability = isDisabled ? 'UNAVAILABLE' : isInteractive ? 'AVAILABLE' : 'UNKNOWN';
 
       const payout = findPayout(text, pair);
