@@ -35,7 +35,7 @@ interface HeaderProps {
   isRefreshing: boolean;
   activeSignalsCount: number;
   onToggleSidebar: () => void;
-  brokerStatus?: { mode: string; liveCount: number; reason?: string } | null;
+  brokerStatus?: { mode: string; liveCount: number; activeCount?: number; discoveredCount?: number; reason?: string } | null;
   onOpenCommandPalette?: () => void;
 }
 
@@ -144,7 +144,9 @@ export const Header: React.FC<HeaderProps> = ({
             />
             <span>
               {brokerStatus?.mode === 'OLYMP_ACTIVE'
-                ? `OLYMP · ${brokerStatus.liveCount}`
+                ? `OLYMP · ${brokerStatus.liveCount}/${brokerStatus.activeCount ?? brokerStatus.liveCount}`
+                : brokerStatus?.activeCount
+                ? `OLYMP · 0/${brokerStatus.activeCount}`
                 : 'OLYMP · WAIT'}
             </span>
           </button>

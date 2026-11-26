@@ -30,7 +30,7 @@ import {
   ResearchSignal,
 } from './types/index.ts';
 import { useFirebase } from './contexts/FirebaseContext.tsx';
-import { requestOlympTradeBridgeStatus } from './services/olympTradeBridge.ts';
+import { ActiveTradingUniverse, requestOlympTradeBridgeStatus } from './services/olympTradeBridge.ts';
 import { mergeServerAndCloudSignals, sortSignalsDeterministically } from './utils/signalMerge.ts';
 
 export default function App() {
@@ -53,7 +53,7 @@ export default function App() {
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isCommandOpen, setIsCommandOpen] = useState(false);
-  const [brokerStatus, setBrokerStatus] = useState<{ mode: string; liveCount: number; pairs?: string[]; reason?: string } | null>(null);
+  const [brokerStatus, setBrokerStatus] = useState<ActiveTradingUniverse | null>(null);
 
   // Purge legacy localStorage signal snapshots on boot so stale win/loss numbers never flash on refresh
   useEffect(() => {

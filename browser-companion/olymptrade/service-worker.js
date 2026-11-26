@@ -1,5 +1,5 @@
 const STORAGE_KEY = 'signalforgeOlympTradeSnapshot';
-const MAX_AGE_MS = 35_000;
+const MAX_AGE_MS = 45_000;
 const SIGNALFORGE_PROD_SNAPSHOT_URL = 'https://signalforge-ml.ai.studio/api/broker/olymptrade/snapshot';
 const PUSH_MIN_INTERVAL_MS = 12_000;
 const ALARM_NAME = 'signalforgeOlympKeepalive';
@@ -77,7 +77,7 @@ function instrumentScore(row) {
 function cleanSnapshot(value, tabId) {
   if (!value || typeof value !== 'object' || !Array.isArray(value.instruments)) return null;
   const byPair = new Map();
-  for (const row of value.instruments.slice(0, 300)) {
+  for (const row of value.instruments) {
     if (!row || typeof row.pair !== 'string') continue;
     const pair = row.pair.trim().toUpperCase();
     if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(pair)) continue;

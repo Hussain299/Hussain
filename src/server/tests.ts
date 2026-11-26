@@ -2761,6 +2761,367 @@ export async function runAllVerificationTests(): Promise<{
     }
   });
 
+  await runTest('DATA', 'Olymp Trade 25+ active pair discovery: API, deduplication, refresh, eligibility gate & UI rendering', async () => {
+    const expressMod = await import('express');
+    const httpMod = await import('http');
+    const React = await import('react');
+    const ReactDOMServer = await import('react-dom/server');
+    const { apiRouter } = await import('./api.js');
+    const { autonomousScheduler } = await import('./scheduler.js');
+    const { BrokerConnectionView } = await import('../components/views/BrokerConnectionView.js');
+    const { OverviewView } = await import('../components/views/OverviewView.js');
+
+    const nowMs = Date.now();
+    const capturedAt = new Date(nowMs - 1_500).toISOString();
+
+    // 26 unique active pairs (including 7 eligible in 29-pair universe, low-payout <80% pairs,
+    // medium-evidence pairs, and outside-29 pairs) + 3 duplicates + 3 unavailable pairs = 32 raw rows.
+    const rawInstruments = [
+      // 7 eligible pairs (>=80%, HIGH evidence, AVAILABLE, in FOREX_PAIRS)
+      { pair: 'EUR/USD', payoutPct: 85, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'eur/usd', payoutPct: 80, availability: 'UNKNOWN', evidence: 'MEDIUM', sourceType: 'TAB' }, // duplicate lower-score
+      { pair: 'GBP/USD', payoutPct: 84, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/JPY', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'AUD/USD', payoutPct: 81, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/CAD', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'EUR/JPY', payoutPct: 83, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'GBP/JPY', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      // 11 active pairs in FOREX_PAIRS that are <80% payout or MEDIUM/NONE evidence (must display, must NOT pass eligibility)
+      { pair: 'EUR/GBP', payoutPct: 79.99, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: '  eur / gbp  ', payoutPct: 75, availability: 'AVAILABLE', evidence: 'NONE', sourceType: 'TAB' }, // duplicate lower-score
+      { pair: 'AUD/CAD', payoutPct: 76, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'EUR/AUD', payoutPct: 72, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/CHF', payoutPct: 74, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'NZD/USD', payoutPct: 78, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'AUD/JPY', payoutPct: 75, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'AUD/CHF', payoutPct: 73, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'EUR/CAD', payoutPct: 77, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'EUR/CHF', payoutPct: 71, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'NZD/JPY', payoutPct: 84, availability: 'AVAILABLE', evidence: 'MEDIUM', sourceType: 'MARKET_LIST' },
+      { pair: 'CHF/JPY', payoutPct: null, availability: 'AVAILABLE', evidence: 'NONE', sourceType: 'MARKET_LIST' },
+      // 8 active pairs outside the 29-pair research universe (must display in active list, must NOT enter signal eligibility)
+      { pair: 'USD/NOK', payoutPct: 86, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/SEK', payoutPct: 85, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/SGD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/ZAR', payoutPct: 81, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/TRY', payoutPct: 80, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'EUR/NOK', payoutPct: 79, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'EUR/SEK', payoutPct: 83, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'USD/HKD', payoutPct: 75, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'usd/hkd', payoutPct: 70, availability: 'AVAILABLE', evidence: 'MEDIUM', sourceType: 'TAB' }, // duplicate lower-score
+      // 3 explicitly UNAVAILABLE pairs (must be distinguished from active pairs)
+      { pair: 'CAD/JPY', payoutPct: 82, availability: 'UNAVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'GBP/AUD', payoutPct: 80, availability: 'UNAVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      { pair: 'NZD/CAD', payoutPct: 85, availability: 'UNAVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+    ];
+
+    const expectedActivePairs = [
+      'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD', 'EUR/JPY', 'GBP/JPY',
+      'EUR/GBP', 'AUD/CAD', 'EUR/AUD', 'USD/CHF', 'NZD/USD', 'AUD/JPY', 'AUD/CHF',
+      'EUR/CAD', 'EUR/CHF', 'NZD/JPY', 'CHF/JPY', 'USD/NOK', 'USD/SEK', 'USD/SGD',
+      'USD/ZAR', 'USD/TRY', 'EUR/NOK', 'EUR/SEK', 'USD/HKD',
+    ];
+    const expectedUnavailablePairs = ['CAD/JPY', 'GBP/AUD', 'NZD/CAD'];
+
+    const app = expressMod.default();
+    app.use(expressMod.default.json());
+    app.use('/api', apiRouter);
+
+    const server = httpMod.createServer(app);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const addr = server.address() as { port: number };
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+      const postRes = await fetch(`${baseUrl}/api/broker/olymptrade/snapshot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          extensionInstalled: true,
+          extensionVersion: '1.3.1',
+          platformTabOpen: true,
+          connected: true,
+          sessionState: 'READY',
+          capturedAt,
+          ageMs: 1_500,
+          instruments: rawInstruments,
+        }),
+      });
+      if (!postRes.ok) throw new Error(`POST /api/broker/olymptrade/snapshot failed: ${postRes.status}`);
+
+      const statusRes = await fetch(`${baseUrl}/api/broker/olymptrade/status`);
+      if (!statusRes.ok) throw new Error(`GET /api/broker/olymptrade/status failed: ${statusRes.status}`);
+      const apiStatus = await statusRes.json();
+
+      // 1. All 26 unique active pairs + 3 unavailable pairs appear in API response, duplicates removed
+      if (apiStatus.activeCount !== 26 || apiStatus.activePairs.length !== 26) {
+        throw new Error(`Expected 26 unique activePairs in API response, got ${apiStatus.activeCount} (${apiStatus.activePairs?.length})`);
+      }
+      if (apiStatus.unavailableCount !== 3 || apiStatus.unavailablePairs.length !== 3) {
+        throw new Error(`Expected 3 unavailablePairs in API response, got ${apiStatus.unavailableCount}`);
+      }
+      if (apiStatus.discoveredCount !== 29 || apiStatus.instruments.length !== 29) {
+        throw new Error(`Expected 29 deduplicated instruments in API response, got ${apiStatus.instruments?.length}`);
+      }
+      for (const pair of expectedActivePairs) {
+        if (!apiStatus.activePairs.includes(pair)) {
+          throw new Error(`Active pair ${pair} missing from API activePairs`);
+        }
+      }
+      for (const pair of expectedUnavailablePairs) {
+        if (apiStatus.activePairs.includes(pair) || !apiStatus.unavailablePairs.includes(pair)) {
+          throw new Error(`Unavailable pair ${pair} was not cleanly separated from activePairs`);
+        }
+      }
+
+      // 2. Permanent 80% payout floor & eligibility gate remain intact:
+      // Only the 7 pairs that are AVAILABLE + >=80% + HIGH + in 29-pair universe may pass eligibility.
+      if (apiStatus.liveCount !== 7 || apiStatus.pairs.length !== 7) {
+        throw new Error(`Expected exactly 7 eligible pairs (>=80%, HIGH, in 29-pair universe), got ${apiStatus.liveCount}: ${JSON.stringify(apiStatus.pairs)}`);
+      }
+      if (apiStatus.pairs.includes('EUR/GBP') || apiStatus.pairs.includes('USD/NOK') || apiStatus.pairs.includes('NZD/JPY') || apiStatus.pairs.includes('CAD/JPY')) {
+        throw new Error(`Ineligible pair leaked into trade-eligible universe: ${JSON.stringify(apiStatus.pairs)}`);
+      }
+
+      // Verify backend signal authorization blocks <80% and unavailable pairs even though they are displayed
+      const lowPayoutAuth = authorizeSignalWithBrokerSnapshot(
+        'EUR/GBP',
+        sanitizeOlympTradeBridgeStatus({
+          extensionInstalled: true, extensionVersion: '1.3.1', platformTabOpen: true,
+          connected: true, sessionState: 'READY', capturedAt, ageMs: 1_500, instruments: rawInstruments,
+        }),
+        nowMs
+      );
+      if (lowPayoutAuth.authorized) {
+        throw new Error('Pair with 79.99% payout must never be authorized for signal execution');
+      }
+
+      // 3. Render both BrokerConnectionView and OverviewView and verify all 26 active pairs + 3 unavailable pairs appear in UI
+      const brokerHtml = ReactDOMServer.renderToStaticMarkup(
+        React.createElement(BrokerConnectionView, { initialUniverse: apiStatus })
+      );
+      const overviewHtml = ReactDOMServer.renderToStaticMarkup(
+        React.createElement(OverviewView, {
+          signals: [],
+          latestPrices: {},
+          marketSessions: [],
+          providers: [],
+          brokerStatus: apiStatus,
+          onNavigateTab: () => {},
+          onEvaluateSignals: () => {},
+          isEvaluating: false,
+        })
+      );
+      for (const pair of expectedActivePairs) {
+        if (!brokerHtml.includes(pair)) {
+          throw new Error(`Active pair ${pair} missing from BrokerConnectionView rendered HTML`);
+        }
+        if (!overviewHtml.includes(pair)) {
+          throw new Error(`Active pair ${pair} missing from OverviewView rendered HTML`);
+        }
+      }
+      for (const pair of expectedUnavailablePairs) {
+        if (!brokerHtml.includes(pair)) {
+          throw new Error(`Unavailable pair ${pair} missing from BrokerConnectionView rendered HTML`);
+        }
+      }
+      if (!brokerHtml.includes('Blocked: payout &lt; 80%') && !brokerHtml.includes('Blocked: payout < 80%')) {
+        throw new Error('Expected <80% payout pairs to display explicit blocked eligibility label in UI');
+      }
+
+      // 4. Newly discovered pairs appear after next discovery refresh (26 -> 29 active pairs)
+      const refreshedInstruments = [
+        ...rawInstruments,
+        { pair: 'AUD/NZD', payoutPct: 82, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'GBP/CHF', payoutPct: 76, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+        { pair: 'USD/INR', payoutPct: 84, availability: 'AVAILABLE', evidence: 'HIGH', sourceType: 'MARKET_LIST' },
+      ];
+      await fetch(`${baseUrl}/api/broker/olymptrade/snapshot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          extensionInstalled: true,
+          extensionVersion: '1.3.1',
+          platformTabOpen: true,
+          connected: true,
+          sessionState: 'READY',
+          capturedAt: new Date().toISOString(),
+          ageMs: 500,
+          instruments: refreshedInstruments,
+        }),
+      });
+      const refreshedRes = await fetch(`${baseUrl}/api/broker/olymptrade/status`);
+      const refreshedStatus = await refreshedRes.json();
+      if (
+        refreshedStatus.activeCount !== 29 ||
+        !refreshedStatus.activePairs.includes('AUD/NZD') ||
+        !refreshedStatus.activePairs.includes('GBP/CHF') ||
+        !refreshedStatus.activePairs.includes('USD/INR') ||
+        refreshedStatus.liveCount !== 8 // AUD/NZD joined eligible 29-pair >=80% set; GBP/CHF (<80%) and USD/INR (outside 29) did not
+      ) {
+        throw new Error(`Refresh discovery failed to reflect new pairs accurately: ${JSON.stringify({
+          activeCount: refreshedStatus.activeCount,
+          liveCount: refreshedStatus.liveCount,
+        })}`);
+      }
+    } finally {
+      autonomousScheduler.clearOlympTradeSnapshot();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  await runTest('ML', 'Restored baseline regime thresholds and PID 0.72 target remain enforced', async () => {
+    const { AgiSelfLearningEngine } = await import('./agiEngine.js');
+    const agi = new AgiSelfLearningEngine();
+    const baseMs = Date.now() - 80 * 60_000;
+
+    // 1. Intermediate Hurst (0.44 < H < 0.56) classifies as RANDOM_WALK_CHOP under restored baseline thresholds
+    const lowEntropyCandles: Candle[] = Array.from({ length: 64 }, (_, i) => {
+      const prevClose = 1.1000 + i * 0.0001;
+      const step = i === 63 ? 0.0025 : 0.0001;
+      const close = prevClose + step;
+      return {
+        symbol: 'EUR/USD',
+        timestamp: new Date(baseMs + i * 60_000).toISOString(),
+        timestampMs: baseMs + i * 60_000,
+        open: prevClose,
+        high: close + 0.00005,
+        low: prevClose - 0.00005,
+        close,
+        volume: 100,
+        source: 'test_fixture',
+      };
+    });
+    const regime = agi.classifyMarketRegime('EUR/USD', lowEntropyCandles, false);
+    if (regime.hurstExponent > 0.44 && regime.hurstExponent < 0.56 && regime.regimeType !== 'RANDOM_WALK_CHOP') {
+      throw new Error(`Expected restored baseline to classify intermediate Hurst as RANDOM_WALK_CHOP: ${JSON.stringify(regime)}`);
+    }
+
+    // 2. High-entropy oscillating candles classify as RANDOM_WALK_CHOP
+    const chopSteps = [
+      0.0006, 0.0004, -0.0005, 0.0002, -0.0008, -0.0003, 0.0007, 0.0001,
+      -0.0004, -0.0006, 0.0005, 0.0008, -0.0002, -0.0007, 0.0003, 0.0004,
+      -0.0008, 0.0006, 0.0002, -0.0005, 0.0007, -0.0001, -0.0006, 0.0003,
+      0.0008, -0.0003, -0.0004, 0.0005, -0.0007, 0.0001, 0.0006, -0.0002,
+    ];
+    let price = 1.1000;
+    const noisyCandles: Candle[] = Array.from({ length: 64 }, (_, i) => {
+      const open = price;
+      price = Number((open + chopSteps[i % chopSteps.length]).toFixed(5));
+      return {
+        symbol: 'EUR/USD',
+        timestamp: new Date(baseMs + i * 60_000).toISOString(),
+        timestampMs: baseMs + i * 60_000,
+        open,
+        high: Math.max(open, price) + 0.0001,
+        low: Math.min(open, price) - 0.0001,
+        close: price,
+        volume: 100,
+        source: 'test_fixture',
+      };
+    });
+    const chopRegime = agi.classifyMarketRegime('EUR/USD', noisyCandles, false);
+    if (chopRegime.regimeType !== 'RANDOM_WALK_CHOP') {
+      throw new Error(`High-entropy oscillating candles should classify as RANDOM_WALK_CHOP: ${JSON.stringify(chopRegime)}`);
+    }
+
+    // 3. Restored PID target 0.72: 65% WR (13W-7L) produces negative error on WIN and positive delta vs 0.60 target
+    const agiPid = new AgiSelfLearningEngine();
+    (agiPid as any).trailingErrors = [];
+    (agiPid as any).adaptiveThresholdDelta = 0;
+    for (let i = 0; i < 20; i++) {
+      (agiPid as any).updatePidController(i < 13 ? 'WIN' : 'LOSS');
+    }
+    const avgErr = ((agiPid as any).trailingErrors as number[]).reduce((a, b) => a + b, 0) / 20;
+    if (Math.abs(avgErr - (0.72 - 13 / 20)) > 1e-6) {
+      throw new Error(`Expected PID TARGET_ACCURACY=0.72 (avgErr=${0.72 - 13 / 20}), got ${avgErr}`);
+    }
+  });
+
+  await runTest('SYSTEM', 'Pipeline counters, companion v1.3.1 contract, and Telegram non-blocking diagnostics', async () => {
+    const fsMod = await import('fs');
+    const pathMod = await import('path');
+    const expressMod = await import('express');
+    const httpMod = await import('http');
+    const { apiRouter } = await import('./api.js');
+    const { autonomousScheduler } = await import('./scheduler.js');
+    const { hasFreshRealProviderCandles, getFreshRealCandleWindow } = await import('./dataFeeds.js');
+
+    // 1. Verify companion v1.3.1 manifest, pair format support, and drawer/tab retention logic
+    const manifest = JSON.parse(fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/manifest.json'), 'utf-8'));
+    if (manifest.version !== '1.3.1') {
+      throw new Error(`Expected companion manifest version 1.3.1, got ${manifest.version}`);
+    }
+    const companionSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/content/olymptrade.js'), 'utf-8');
+    if (
+      !companionSrc.includes('MARKET_DISCOVERY_RETENTION_MS') ||
+      !companionSrc.includes('[/⁄\\-_]') ||
+      !companionSrc.includes('if (!force && document.hidden) return;')
+    ) {
+      throw new Error('Companion script missing drawer retention, multi-separator normalization, or tab-switch guard');
+    }
+
+    // 2. Verify synthetic fallback candles never pass real-market freshness checks
+    const nowMs = Date.now();
+    const synthCandles = dataFeedEngine.generateRealisticHistoricalCandles('EUR/USD', 50);
+    if (hasFreshRealProviderCandles(synthCandles, 'EUR/USD', nowMs) || getFreshRealCandleWindow(synthCandles, 'EUR/USD', nowMs).length !== 0) {
+      throw new Error('Synthetic fallback candles must never qualify as fresh real-market evidence');
+    }
+
+    // 3. Verify scheduler pipelineCounters increment & are exposed on /api/autopilot/status, /api/scheduler/heartbeat, /api/system/health
+    const beforeCounters = autonomousScheduler.getPipelineCounters();
+    autonomousScheduler.clearOlympTradeSnapshot();
+    await autonomousScheduler.executeAutopilotPulse('MANUAL_TRIGGER');
+    const afterCounters = autonomousScheduler.getPipelineCounters();
+    if (afterCounters.schedulerPulses <= beforeCounters.schedulerPulses || afterCounters.successfulExecutions <= beforeCounters.successfulExecutions) {
+      throw new Error(`Expected schedulerPulses & successfulExecutions to increment: ${JSON.stringify({ beforeCounters, afterCounters })}`);
+    }
+
+    const app = expressMod.default();
+    app.use('/api', apiRouter);
+    const server = httpMod.createServer(app);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const addr = server.address() as { port: number };
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+      const [autoRes, hbRes, healthRes, tgRes] = await Promise.all([
+        fetch(`${baseUrl}/api/autopilot/status`).then(r => r.json()),
+        fetch(`${baseUrl}/api/scheduler/heartbeat`).then(r => r.json()),
+        fetch(`${baseUrl}/api/system/health`).then(r => r.json()),
+        fetch(`${baseUrl}/api/telegram/status`).then(r => r.json()),
+      ]);
+      for (const payload of [autoRes, hbRes, healthRes]) {
+        if (!payload?.pipelineCounters || typeof payload.pipelineCounters.schedulerPulses !== 'number' || typeof payload.pipelineCounters.knnRejections !== 'number') {
+          throw new Error(`API endpoint missing structured pipelineCounters: ${JSON.stringify(payload)}`);
+        }
+      }
+      if (typeof tgRes.tokenFormatValid !== 'boolean') {
+        throw new Error(`Expected /api/telegram/status to expose boolean tokenFormatValid, got ${JSON.stringify(tgRes)}`);
+      }
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+
+    // 4. Verify Telegram diagnostic flags placeholder/malformed token safely without leaking secrets
+    const prevEnvToken = process.env.TELEGRAM_BOT_TOKEN;
+    const prevCfg = db.getTelegramConfig();
+    try {
+      db.saveTelegramConfig({ botToken: 'MY_TELEGRAM_BOT_TOKEN' });
+      const placeholderInfo = await telegramService.getBotInfo(true);
+      if (placeholderInfo.ok || !String(placeholderInfo.error || '').includes('placeholder')) {
+        throw new Error(`Expected placeholder Telegram token rejection, got ${JSON.stringify(placeholderInfo)}`);
+      }
+      if (JSON.stringify(placeholderInfo).includes('MY_TELEGRAM_BOT_TOKEN')) {
+        throw new Error('Telegram diagnostic must never echo raw token text');
+      }
+    } finally {
+      if (prevEnvToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+      else process.env.TELEGRAM_BOT_TOKEN = prevEnvToken;
+      db.saveTelegramConfig({ botToken: prevCfg.botToken });
+    }
+  });
+
   // Purge test signals so they never appear on the user's trading terminal
   db.purgeTestSignals();
 

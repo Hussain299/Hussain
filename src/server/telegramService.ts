@@ -105,6 +105,16 @@ export class TelegramService {
     return (config.botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
   }
 
+  public getDiagnostics(): { tokenConfigured: boolean; tokenFormatValid: boolean } {
+    const token = this.getBotToken();
+    const isPlaceholder = !token || token === 'MY_TELEGRAM_BOT_TOKEN' || token.startsWith('MY_');
+    const tokenFormatValid = !isPlaceholder && /^\d+:[A-Za-z0-9_-]{20,}$/.test(token);
+    return {
+      tokenConfigured: !isPlaceholder,
+      tokenFormatValid,
+    };
+  }
+
   private getApiUrl(method: string): string {
     const token = this.getBotToken();
     return `https://api.telegram.org/bot${token}/${method}`;
@@ -211,6 +221,20 @@ export class TelegramService {
       return { ok: true, bot: this.cachedBotInfo };
     }
 
+    const diag = this.getDiagnostics();
+    if (!diag.tokenConfigured) {
+      return {
+        ok: false,
+        error: 'TELEGRAM_BOT_TOKEN is missing or still set to placeholder text.',
+      };
+    }
+    if (!diag.tokenFormatValid) {
+      return {
+        ok: false,
+        error: 'TELEGRAM_BOT_TOKEN format is invalid (expected numeric <bot_id>:<secret> without "bot" prefix).',
+      };
+    }
+
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 7000);
@@ -236,7 +260,13 @@ export class TelegramService {
 
         return { ok: true, bot: this.cachedBotInfo };
       }
-      return { ok: false, error: data.description || 'Failed to authenticate Telegram bot token' };
+      const rawErr = data.description || 'Failed to authenticate Telegram bot token';
+      return {
+        ok: false,
+        error: rawErr === 'Not Found'
+          ? 'Not Found (Telegram Bot API 404: TELEGRAM_BOT_TOKEN in environment/secrets is revoked, deleted, or incorrect)'
+          : rawErr,
+      };
     } catch (err: any) {
       return { ok: false, error: err.name === 'AbortError' ? 'Telegram API request timed out' : err.message };
     }

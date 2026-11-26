@@ -54,10 +54,17 @@ function getEligibilityNote(inst: OlympTradeInstrument, tracked: boolean, dataIs
   return { eligible: true, label: 'ELIGIBLE FOR SIGNALS' };
 }
 
-export const BrokerConnectionView: React.FC = () => {
+type InstrumentFilter = 'ALL' | 'ACTIVE' | 'ELIGIBLE' | 'INELIGIBLE' | 'UNAVAILABLE';
+
+interface BrokerConnectionViewProps {
+  initialUniverse?: ActiveTradingUniverse | null;
+}
+
+export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ initialUniverse = null }) => {
   const [status, setStatus] = useState<OlympTradeBridgeStatus>(EMPTY_STATUS);
   const [checking, setChecking] = useState(false);
-  const [serverUniverse, setServerUniverse] = useState<ActiveTradingUniverse | null>(null);
+  const [serverUniverse, setServerUniverse] = useState<ActiveTradingUniverse | null>(initialUniverse);
+  const [filterMode, setFilterMode] = useState<InstrumentFilter>('ALL');
 
   const refresh = useCallback(async (forceScan = false) => {
     setChecking(true);
@@ -67,14 +74,18 @@ export const BrokerConnectionView: React.FC = () => {
       if (result.extensionInstalled) {
         const res = await fetch('/api/broker/olymptrade/snapshot', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
           body: JSON.stringify(result),
         }).catch(() => null);
         if (res && res.ok) {
           setServerUniverse(await res.json());
         }
       } else {
-        const res = await fetch('/api/broker/olymptrade/status').catch(() => null);
+        const res = await fetch('/api/broker/olymptrade/status', {
+          cache: 'no-store',
+          headers: { 'Cache-Control': 'no-cache' },
+        }).catch(() => null);
         if (res && res.ok) {
           setServerUniverse(await res.json());
         }
@@ -90,21 +101,57 @@ export const BrokerConnectionView: React.FC = () => {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const configuredPairs = useMemo(() => new Set<string>(FOREX_PAIRS), []);
-  const localUniverse = useMemo(() => resolveActiveTradingPairs(status), [status]);
-  const activeUniverse = serverUniverse ?? localUniverse;
-  const counts = localUniverse.counts;
-  const dataIsFresh = status.connected && status.ageMs !== null && status.ageMs <= SNAPSHOT_FRESHNESS_MS;
+  const effectiveStatus = useMemo<OlympTradeBridgeStatus>(() => {
+    if (status.extensionInstalled && (status.instruments.length > 0 || !serverUniverse?.instruments?.length)) {
+      return status;
+    }
+    if (serverUniverse && (serverUniverse.instruments.length > 0 || serverUniverse.extensionInstalled)) {
+      return {
+        extensionInstalled: Boolean(serverUniverse.extensionInstalled),
+        extensionVersion: serverUniverse.extensionVersion ?? null,
+        platformTabOpen: Boolean(serverUniverse.platformTabOpen),
+        connected: Boolean(serverUniverse.connected),
+        sessionState: serverUniverse.sessionState ?? 'UNKNOWN',
+        capturedAt: serverUniverse.capturedAt,
+        ageMs: serverUniverse.ageMs,
+        instruments: serverUniverse.instruments || [],
+      };
+    }
+    return status;
+  }, [status, serverUniverse]);
 
-  const stateLabel = !status.extensionInstalled
+  const configuredPairs = useMemo(() => new Set<string>(FOREX_PAIRS), []);
+  const localUniverse = useMemo(() => resolveActiveTradingPairs(effectiveStatus), [effectiveStatus]);
+  const activeUniverse = serverUniverse ?? localUniverse;
+  const counts = activeUniverse.counts;
+  const dataIsFresh = Boolean(
+    effectiveStatus.connected &&
+    effectiveStatus.ageMs !== null &&
+    effectiveStatus.ageMs <= SNAPSHOT_FRESHNESS_MS
+  );
+
+  const filteredInstruments = useMemo(() => {
+    const list = effectiveStatus.instruments;
+    if (filterMode === 'ACTIVE') return list.filter(i => i.availability === 'AVAILABLE');
+    if (filterMode === 'UNAVAILABLE') return list.filter(i => i.availability === 'UNAVAILABLE');
+    if (filterMode === 'ELIGIBLE') {
+      return list.filter(i => getEligibilityNote(i, configuredPairs.has(i.pair), dataIsFresh).eligible);
+    }
+    if (filterMode === 'INELIGIBLE') {
+      return list.filter(i => !getEligibilityNote(i, configuredPairs.has(i.pair), dataIsFresh).eligible);
+    }
+    return list;
+  }, [effectiveStatus.instruments, filterMode, configuredPairs, dataIsFresh]);
+
+  const stateLabel = !effectiveStatus.extensionInstalled
     ? 'COMPANION NOT INSTALLED'
-    : !status.platformTabOpen
+    : !effectiveStatus.platformTabOpen
     ? 'OLYMP TRADE TAB NOT OPEN'
-    : status.sessionState === 'LOGIN_REQUIRED'
+    : effectiveStatus.sessionState === 'LOGIN_REQUIRED'
     ? 'LOGIN REQUIRED'
-    : status.sessionState === 'WAITING_FOR_MARKET_DATA'
+    : effectiveStatus.sessionState === 'WAITING_FOR_MARKET_DATA'
     ? 'WAITING FOR INSTRUMENT DATA'
-    : status.sessionState === 'STALE'
+    : effectiveStatus.sessionState === 'STALE'
     ? 'DATA STALE — SIGNALING PAUSED'
     : dataIsFresh
     ? 'READ-ONLY CONNECTED'
@@ -112,7 +159,7 @@ export const BrokerConnectionView: React.FC = () => {
 
   const stateClass = dataIsFresh
     ? 'bg-[#72A98B]/15 border-[#72A98B]/40 text-[#72A98B]'
-    : status.sessionState === 'LOGIN_REQUIRED'
+    : effectiveStatus.sessionState === 'LOGIN_REQUIRED'
     ? 'bg-[#C67D83]/15 border-[#C67D83]/40 text-[#C67D83]'
     : 'bg-[#C5A36A]/10 border-[#C5A36A]/35 text-[#C5A36A]';
 
@@ -175,38 +222,46 @@ export const BrokerConnectionView: React.FC = () => {
           <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="rounded-lg border border-[#2B3949] bg-[#121820] p-3">
               <div className="text-[10px] text-[#82909D] font-mono uppercase">Extension</div>
-              <div className="mt-1 text-sm font-bold">{status.extensionInstalled ? 'Installed · v' + (status.extensionVersion || 'unknown') : 'Not detected'}</div>
+              <div className="mt-1 text-sm font-bold">{effectiveStatus.extensionInstalled ? 'Installed · v' + (effectiveStatus.extensionVersion || 'unknown') : 'Not detected'}</div>
             </div>
             <div className="rounded-lg border border-[#2B3949] bg-[#121820] p-3">
               <div className="text-[10px] text-[#82909D] font-mono uppercase">Olymp Trade session</div>
               <div className="mt-1 text-sm font-bold">
-                {status.platformTabOpen ? (status.sessionState === 'LOGIN_REQUIRED' ? 'Login screen detected' : 'Platform tab detected') : 'Open Olymp Trade in Chrome'}
+                {effectiveStatus.platformTabOpen ? (effectiveStatus.sessionState === 'LOGIN_REQUIRED' ? 'Login screen detected' : 'Platform tab detected') : 'Open Olymp Trade in Chrome'}
               </div>
             </div>
             <div className="rounded-lg border border-[#2B3949] bg-[#121820] p-3">
               <div className="text-[10px] text-[#82909D] font-mono uppercase">Last captured</div>
-              <div className="mt-1 text-sm font-bold tabular-nums">{formatCaptureTime(activeUniverse.capturedAt || status.capturedAt)}</div>
+              <div className="mt-1 text-sm font-bold tabular-nums">{formatCaptureTime(activeUniverse.capturedAt || effectiveStatus.capturedAt)}</div>
             </div>
             <div className="rounded-lg border border-[#2B3949] bg-[#121820] p-3">
               <div className="text-[10px] text-[#82909D] font-mono uppercase">Snapshot age</div>
-              <div className="mt-1 text-sm font-bold tabular-nums">{formatAge(activeUniverse.ageMs ?? status.ageMs)}</div>
+              <div className="mt-1 text-sm font-bold tabular-nums">{formatAge(activeUniverse.ageMs ?? effectiveStatus.ageMs)}</div>
             </div>
           </div>
 
-          <div className="mt-3 rounded-lg border border-[#2B3949] bg-[#121820] px-3 py-2 text-xs text-[#C3CDD6] flex flex-wrap items-center justify-between gap-2">
-            <span>
-              <strong className="font-mono text-[#E8E5DE]">Backend Gate:</strong> {activeUniverse.reason}
-            </span>
-            {activeUniverse.pairs.length > 0 && (
-              <span className="font-mono text-[11px] text-[#72A98B]">
-                Actionable ({activeUniverse.pairs.length}): {activeUniverse.pairs.join(', ')}
+          <div className="mt-3 rounded-lg border border-[#2B3949] bg-[#121820] px-3 py-2 text-xs text-[#C3CDD6] space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span>
+                <strong className="font-mono text-[#E8E5DE]">Backend Gate:</strong> {activeUniverse.reason}
               </span>
+              {activeUniverse.pairs.length > 0 && (
+                <span className="font-mono text-[11px] text-[#72A98B]">
+                  Signal-Eligible ({activeUniverse.pairs.length}): {activeUniverse.pairs.join(', ')}
+                </span>
+              )}
+            </div>
+            {activeUniverse.activePairs.length > 0 && (
+              <div className="font-mono text-[11px] text-[#AAB4BF] break-words">
+                <strong className="text-[#E8E5DE]">Active Olymp Trade Markets ({activeUniverse.activeCount}):</strong>{' '}
+                {activeUniverse.activePairs.join(', ')}
+              </div>
             )}
           </div>
         </section>
 
         {/* ───── Troubleshooting Guidance ───── */}
-        {!status.extensionInstalled && (
+        {!effectiveStatus.extensionInstalled && (
           <section className="rounded-xl border border-[#C5A36A]/35 bg-[#1B2633] p-4 sm:p-5">
             <div className="flex items-start gap-3">
               <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-[#C5A36A]" />
@@ -227,13 +282,13 @@ export const BrokerConnectionView: React.FC = () => {
           </section>
         )}
 
-        {status.extensionInstalled && !status.platformTabOpen && (
+        {effectiveStatus.extensionInstalled && !effectiveStatus.platformTabOpen && (
           <section className="rounded-xl border border-[#C5A36A]/35 bg-[#1B2633] p-4 text-sm text-[#C3CDD6]">
             Open <b>olymptrade.com</b> in another tab in this same Chrome profile and log in normally. Signal generation remains paused until a live snapshot is received.
           </section>
         )}
 
-        {status.platformTabOpen && status.sessionState === 'LOGIN_REQUIRED' && (
+        {effectiveStatus.platformTabOpen && effectiveStatus.sessionState === 'LOGIN_REQUIRED' && (
           <section className="rounded-xl border border-[#C67D83]/35 bg-[#1B2633] p-4 sm:p-5">
             <div className="flex items-start gap-3">
               <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-[#C67D83]" />
@@ -245,13 +300,13 @@ export const BrokerConnectionView: React.FC = () => {
           </section>
         )}
 
-        {status.platformTabOpen && status.sessionState === 'WAITING_FOR_MARKET_DATA' && (
+        {effectiveStatus.platformTabOpen && effectiveStatus.sessionState === 'WAITING_FOR_MARKET_DATA' && (
           <section className="rounded-xl border border-[#C5A36A]/35 bg-[#1B2633] p-4 text-sm text-[#C3CDD6]">
             The platform tab is open, but no instrument list has been detected yet. Open the instrument selector or market list in Olymp Trade and press Refresh snapshot.
           </section>
         )}
 
-        {status.sessionState === 'STALE' && (
+        {effectiveStatus.sessionState === 'STALE' && (
           <section className="rounded-xl border border-[#C5A36A]/35 bg-[#1B2633] p-4 sm:p-5">
             <div className="flex items-start gap-3">
               <Clock className="mt-0.5 h-5 w-5 shrink-0 text-[#C5A36A]" />
@@ -284,24 +339,48 @@ export const BrokerConnectionView: React.FC = () => {
 
         {/* ───── Live Instrument Snapshot Table ───── */}
         <section className="overflow-hidden rounded-xl border border-[#354251] bg-[#161F2B]">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#2B3949] px-4 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#2B3949] px-4 py-4">
             <div>
-              <h2 className="font-bold">Live instrument snapshot</h2>
-              <p className="mt-1 text-xs text-[#82909D]">Only explicitly AVAILABLE pairs in SignalForge&apos;s 29-pair universe with ≥{MIN_ELIGIBLE_PAYOUT_PCT}% HIGH-confidence payout can generate signals.</p>
+              <h2 className="font-bold">
+                Live instrument snapshot ({filteredInstruments.length} of {effectiveStatus.instruments.length} discovered)
+              </h2>
+              <p className="mt-1 text-xs text-[#82909D]">
+                Displays every unique broker-discovered pair dynamically. Only explicitly AVAILABLE pairs in SignalForge&apos;s 29-pair universe with ≥{MIN_ELIGIBLE_PAYOUT_PCT}% HIGH-confidence payout can generate signals.
+              </p>
             </div>
-            <div className="flex items-center gap-3">
-              {!dataIsFresh && status.instruments.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2">
+              {([
+                { id: 'ALL', label: `All (${effectiveStatus.instruments.length})` },
+                { id: 'ACTIVE', label: `Active (${counts.available})` },
+                { id: 'ELIGIBLE', label: `Eligible ≥${MIN_ELIGIBLE_PAYOUT_PCT}% (${counts.eligibleInUniverse})` },
+                { id: 'INELIGIBLE', label: `Blocked (${Math.max(0, effectiveStatus.instruments.length - counts.eligibleInUniverse)})` },
+                { id: 'UNAVAILABLE', label: `Unavailable (${counts.unavailable})` },
+              ] as Array<{ id: InstrumentFilter; label: string }>).map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => setFilterMode(tab.id)}
+                  className={
+                    'rounded-md border px-2.5 py-1 text-[10px] font-mono font-bold transition-colors cursor-pointer ' +
+                    (filterMode === tab.id
+                      ? 'border-[#72A98B]/50 bg-[#72A98B]/15 text-[#72A98B]'
+                      : 'border-[#2B3949] bg-[#121820] text-[#AAB4BF] hover:text-[#E8E5DE]')
+                  }
+                >
+                  {tab.label}
+                </button>
+              ))}
+              {!dataIsFresh && effectiveStatus.instruments.length > 0 && (
                 <span className="flex items-center gap-1.5 text-[10px] font-mono text-[#C5A36A]">
                   <AlertTriangle className="h-3.5 w-3.5" /> STALE — values do not authorize signals
                 </span>
               )}
               <div className="flex items-center gap-1.5 text-[10px] font-mono text-[#82909D]">
                 <Activity className="h-3.5 w-3.5" />
-                {status.ageMs === null ? 'NO SNAPSHOT' : 'AGE ' + Math.max(0, Math.floor(status.ageMs / 1000)) + 's'}
+                {effectiveStatus.ageMs === null ? 'NO SNAPSHOT' : 'AGE ' + Math.max(0, Math.floor(effectiveStatus.ageMs / 1000)) + 's'}
               </div>
             </div>
           </div>
-          {status.instruments.length === 0 ? (
+          {effectiveStatus.instruments.length === 0 ? (
             <div className="p-8 text-center">
               <CircleHelp className="mx-auto h-7 w-7 text-[#82909D]" />
               <p className="mt-3 text-sm font-semibold">No instrument data received</p>
@@ -322,7 +401,7 @@ export const BrokerConnectionView: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {status.instruments.map(instrument => {
+                  {filteredInstruments.map(instrument => {
                     const tracked = configuredPairs.has(instrument.pair);
                     const gate = getEligibilityNote(instrument, tracked, dataIsFresh);
                     return (

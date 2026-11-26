@@ -6,11 +6,11 @@
   const CURRENCIES = new Set([
     'USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'MXN', 'NOK', 'SEK', 'SGD',
     'ZAR', 'TRY', 'PLN', 'HKD', 'CNY', 'CNH', 'INR', 'BRL', 'CZK', 'HUF', 'DKK', 'ILS',
-    'AED', 'SAR', 'THB', 'IDR', 'MYR', 'PHP', 'KRW',
+    'AED', 'SAR', 'THB', 'IDR', 'MYR', 'PHP', 'KRW', 'RUB', 'TWD', 'KZT',
   ]);
 
   /* ───────── regex patterns ───────── */
-  const PAIR_REGEX = /\b([A-Z]{3})\s*[/⁄]\s*([A-Z]{3})\b/g;
+  const PAIR_REGEX = /\b([A-Z]{3})(?:\s*[/⁄\-_]\s*|\s+)([A-Z]{3})\b/g;
   const PAIR_NO_SLASH_REGEX = /\b([A-Z]{3})([A-Z]{3})\b/g;
   const PAYOUT_LABEL_REGEX = /(?:payout|profit|return|income|yield)[^0-9]{0,32}(\d{2,3}(?:\.\d{1,2})?)\s*%/i;
   const PERCENT_REGEX = /(?:^|[\s+•|·(])([5-9]\d(?:\.\d{1,2})?|100(?:\.0{1,2})?)\s*%/g;
@@ -24,8 +24,11 @@
   ].join(',');
   const INTERACTIVE_SELECTOR = 'button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"],[tabindex],li,tr';
 
-  const VIRTUAL_CACHE_TTL_MS = 25_000;
+  const VIRTUAL_CACHE_TTL_MS = 45_000;
+  const MARKET_DISCOVERY_RETENTION_MS = 15 * 60_000;
   const virtualMarketListCache = new Map();
+  let lastRichSnapshotAt = 0;
+  let lastRichInstrumentCount = 0;
 
   /* ───────── visibility check ───────── */
   function isVisible(element) {
@@ -40,17 +43,20 @@
   }
 
   /* ───────── text extraction from a single element ───────── */
-  function readText(element) {
+  function readText(element, maxLen = 400) {
     if (!(element instanceof HTMLElement)) return '';
-    return [
+    const combined = [
       element.innerText || element.textContent || '',
       element.getAttribute('aria-label') || '',
       element.getAttribute('title') || '',
       element.getAttribute('data-asset') || '',
       element.getAttribute('data-symbol') || '',
+      element.getAttribute('data-pair') || '',
+      element.getAttribute('data-instrument') || '',
       element.getAttribute('data-test') || '',
       element.getAttribute('alt') || '',
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 400);
+    ].join(' ').replace(/\s+/g, ' ').trim();
+    return Number.isFinite(maxLen) ? combined.slice(0, maxLen) : combined;
   }
 
   /* ───────── extract normalised currency pairs from text ───────── */
@@ -64,11 +70,9 @@
       }
     }
 
-    if (pairs.size === 0) {
-      for (const match of upper.matchAll(PAIR_NO_SLASH_REGEX)) {
-        if (CURRENCIES.has(match[1]) && CURRENCIES.has(match[2]) && match[1] !== match[2]) {
-          pairs.add(match[1] + '/' + match[2]);
-        }
+    for (const match of upper.matchAll(PAIR_NO_SLASH_REGEX)) {
+      if (CURRENCIES.has(match[1]) && CURRENCIES.has(match[2]) && match[1] !== match[2]) {
+        pairs.add(match[1] + '/' + match[2]);
       }
     }
 
@@ -100,9 +104,11 @@
       return { payoutPct: null, evidence: 'NONE' };
     }
 
-    const pairIndex = text.toUpperCase().indexOf(pair);
-    if (pairIndex >= 0) {
-      const afterPair = text.slice(pairIndex + pair.length, pairIndex + pair.length + 56);
+    const [base, quote] = pair.split('/');
+    const pairPattern = new RegExp(`\\b${base}(?:\\s*[/⁄\\-_]?\\s*)${quote}\\b`, 'i');
+    const pairMatch = pairPattern.exec(text);
+    if (pairMatch) {
+      const afterPair = text.slice(pairMatch.index + pairMatch[0].length, pairMatch.index + pairMatch[0].length + 56);
       const adjacent = afterPair.match(/^[^0-9]{0,28}(\d{2,3}(?:\.\d{1,2})?)\s*%/);
       if (adjacent) {
         const value = Number(adjacent[1]);
@@ -127,8 +133,8 @@
         const rect = current.getBoundingClientRect();
         if (rect.height > 180 || rect.width > 1400) break;
       }
-      const text = readText(current);
-      if (!text || text.length > 360) break;
+      const text = readText(current, 520);
+      if (!text || text.length > 500) break;
       const pairs = findPairs(text);
       if (pairs.length !== 1 || pairs[0] !== pair) break;
       best = current;
@@ -187,7 +193,7 @@
         const cls = typeof cur.className === 'string' ? cur.className : '';
         if (/\b(disabled|unavailable|closed|suspended|locked|inactive)\b/i.test(cls)) return true;
         const opacity = Number(window.getComputedStyle(cur).opacity || 1);
-        if (Number.isFinite(opacity) && opacity < 0.6) return true;
+        if (Number.isFinite(opacity) && opacity < 0.55) return true;
       }
       cur = cur.parentElement;
     }
@@ -213,12 +219,12 @@
   }
 
   function hasOpenMarketListContainer() {
-    const candidates = document.querySelectorAll('[role="dialog"],[role="listbox"],[role="menu"],[class*="asset" i],[class*="market" i],[class*="modal" i],[class*="drawer" i],[class*="dropdown" i],[class*="popover" i]');
-    for (let i = 0; i < candidates.length && i < 120; i++) {
+    const candidates = document.querySelectorAll(MARKET_CONTAINER_SELECTOR);
+    for (let i = 0; i < candidates.length; i++) {
       const el = candidates[i];
       if (!isVisible(el)) continue;
       const rect = el.getBoundingClientRect();
-      if (rect.height >= 160 && rect.width >= 200 && findPairs(readText(el)).length >= 2) {
+      if (rect.height >= 120 && rect.width >= 160 && findPairs(readText(el, 16000)).length >= 2) {
         return true;
       }
     }
@@ -234,10 +240,10 @@
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
       let visited = 0;
-      while ((node = walker.nextNode()) && visited < 40000) {
+      while ((node = walker.nextNode()) && visited < 200000) {
         visited++;
         const raw = node.nodeValue ? node.nodeValue.trim() : '';
-        if (!raw || raw.length < 3 || raw.length > 80) continue;
+        if (!raw || raw.length < 3 || raw.length > 120) continue;
         if (!/[A-Z]{3}/i.test(raw)) continue;
         const parent = node.parentElement;
         if (!parent || !isVisible(parent)) continue;
@@ -252,22 +258,24 @@
       }
     }
 
-    const attrNodes = document.querySelectorAll('[aria-label],[data-asset],[data-symbol],[title]');
-    for (let i = 0; i < attrNodes.length && i < 2000; i++) {
+    const attrNodes = document.querySelectorAll(
+      '[aria-label],[data-asset],[data-symbol],[data-pair],[data-instrument],[data-currency],[data-test],[data-testid],[title]'
+    );
+    for (let i = 0; i < attrNodes.length && i < 20000; i++) {
       const el = attrNodes[i];
       if (isVisible(el)) candidateLeaves.add(el);
     }
 
     for (const leaf of candidateLeaves) {
-      const leafPairs = findPairs(readText(leaf));
+      const leafPairs = findPairs(readText(leaf, 520));
       if (leafPairs.length !== 1) continue;
       const pair = leafPairs[0];
 
       const rowEl = findRowContainer(leaf, pair);
       if (!isVisible(rowEl)) continue;
 
-      const text = readText(rowEl);
-      if (!text || text.length > 360) continue;
+      const text = readText(rowEl, 520);
+      if (!text || text.length > 500) continue;
       // Never conflate OTC instruments with live FX currency pairs
       if (/\bOTC\b/i.test(text)) continue;
 
@@ -298,9 +306,30 @@
     }
 
     const nowMs = Date.now();
+    if (hasVisibleLoginForm()) {
+      virtualMarketListCache.clear();
+      lastRichInstrumentCount = 0;
+      lastRichSnapshotAt = 0;
+      return [];
+    }
     const marketOpen = hasOpenMarketListContainer();
     if (!marketOpen) {
-      virtualMarketListCache.clear();
+      // Retain discovered market-list pairs across drawer close and tab switches so the full
+      // list is never replaced by the ~7 pinned chart tabs; degrade unverified payout evidence
+      // from HIGH to MEDIUM after 45s until the drawer or chart tab re-observes the payout.
+      for (const [pair, entry] of virtualMarketListCache.entries()) {
+        const age = nowMs - entry.seenAt;
+        if (age > MARKET_DISCOVERY_RETENTION_MS) {
+          virtualMarketListCache.delete(pair);
+        } else if (!found.has(pair)) {
+          found.set(
+            pair,
+            age > VIRTUAL_CACHE_TTL_MS && entry.row.evidence === 'HIGH'
+              ? { ...entry.row, evidence: 'MEDIUM' }
+              : entry.row
+          );
+        }
+      }
     } else {
       for (const [pair, row] of found.entries()) {
         if (row.sourceType === 'MARKET_LIST') {
@@ -318,7 +347,6 @@
 
     return Array.from(found.values())
       .sort((a, b) => a.pair.localeCompare(b.pair))
-      .slice(0, 200)
       .map(row => ({
         pair: row.pair,
         payoutPct: row.payoutPct,
@@ -359,12 +387,26 @@
     document.removeEventListener('scroll', schedulePublish, true);
   }
 
-  function publishSnapshot() {
+  function publishSnapshot(force = false) {
     if (!chrome.runtime?.id) {
       stopObserver();
       return;
     }
+    if (!force && document.hidden) return;
     const instruments = readInstruments();
+    const nowMs = Date.now();
+    if (
+      document.hidden &&
+      !hasOpenMarketListContainer() &&
+      instruments.length < lastRichInstrumentCount &&
+      nowMs - lastRichSnapshotAt < VIRTUAL_CACHE_TTL_MS
+    ) {
+      return;
+    }
+    if (instruments.length >= lastRichInstrumentCount || !document.hidden) {
+      lastRichInstrumentCount = instruments.length;
+      lastRichSnapshotAt = nowMs;
+    }
     let sessionState;
 
     if (hasVisibleLoginForm()) {
@@ -391,7 +433,7 @@
     scheduled = true;
     window.setTimeout(() => {
       scheduled = false;
-      publishSnapshot();
+      publishSnapshot(false);
     }, 350);
   }
 
@@ -403,7 +445,7 @@
       characterData: true,
       attributes: true,
       attributeFilter: [
-        'aria-label', 'aria-disabled', 'data-asset', 'data-symbol',
+        'aria-label', 'aria-disabled', 'data-asset', 'data-symbol', 'data-pair', 'data-instrument',
         'data-test', 'data-testid', 'data-disabled', 'data-locked', 'class', 'disabled', 'title',
       ],
     });
@@ -412,9 +454,9 @@
   document.addEventListener('scroll', schedulePublish, { capture: true, passive: true });
 
   chrome.runtime.onMessage.addListener(message => {
-    if (message && message.type === 'OLYMP_SCAN_NOW') publishSnapshot();
+    if (message && message.type === 'OLYMP_SCAN_NOW') publishSnapshot(true);
   });
 
-  publishSnapshot();
-  intervalId = window.setInterval(publishSnapshot, 5000);
+  publishSnapshot(true);
+  intervalId = window.setInterval(() => publishSnapshot(false), 5000);
 })();

@@ -41,7 +41,7 @@ interface OverviewViewProps {
   latestPrices: Record<string, number>;
   marketSessions: MarketSessionInfo[];
   providers: ProviderHealth[];
-  brokerStatus?: { mode: string; liveCount: number; pairs?: string[]; reason?: string } | null;
+  brokerStatus?: { mode: string; liveCount: number; activeCount?: number; discoveredCount?: number; pairs?: string[]; activePairs?: string[]; reason?: string } | null;
   onNavigateTab: (tab: any, filterParams?: any) => void;
   onEvaluateSignals: () => void;
   isEvaluating: boolean;
@@ -273,28 +273,38 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
       <div className="max-w-7xl mx-auto px-4 lg:px-8 py-6 space-y-8">
         {/* Live Olymp Trade Gate & Multi-Agent Council Strip */}
         <div className="sf-panel rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
-          <div className="flex flex-wrap items-center gap-3">
-            <span
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-bold border ${
-                brokerStatus?.mode === 'OLYMP_ACTIVE'
-                  ? 'bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/40'
-                  : 'bg-[#C5A36A]/15 text-[#C5A36A] border-[#C5A36A]/40'
-              }`}
-            >
+          <div className="flex flex-col gap-1.5 min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-3">
               <span
-                className={`w-1.5 h-1.5 rounded-full ${
-                  brokerStatus?.mode === 'OLYMP_ACTIVE' ? 'bg-[#72A98B] animate-pulse' : 'bg-[#C5A36A]'
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-bold border ${
+                  brokerStatus?.mode === 'OLYMP_ACTIVE'
+                    ? 'bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/40'
+                    : 'bg-[#C5A36A]/15 text-[#C5A36A] border-[#C5A36A]/40'
                 }`}
-              />
-              {brokerStatus?.mode === 'OLYMP_ACTIVE'
-                ? `OLYMP ACTIVE · ${brokerStatus.liveCount} ELIGIBLE PAIRS`
-                : `FAIL-CLOSED · ${brokerStatus?.mode || 'WAITING FOR OLYMP SNAPSHOT'}`}
-            </span>
-            <span className="text-[#AAB4BF] text-[11px]">
-              {brokerStatus?.mode === 'OLYMP_ACTIVE' && brokerStatus.pairs && brokerStatus.pairs.length > 0
-                ? `Scanning: ${brokerStatus.pairs.slice(0, 6).join(', ')}${brokerStatus.pairs.length > 6 ? ` +${brokerStatus.pairs.length - 6} more` : ''}`
-                : brokerStatus?.reason || 'Open Olymp Trade in Chrome with companion v1.3+ to unlock live discovery.'}
-            </span>
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    brokerStatus?.mode === 'OLYMP_ACTIVE' ? 'bg-[#72A98B] animate-pulse' : 'bg-[#C5A36A]'
+                  }`}
+                />
+                {brokerStatus?.mode === 'OLYMP_ACTIVE'
+                  ? `OLYMP ACTIVE · ${brokerStatus.liveCount} ELIGIBLE · ${brokerStatus.activeCount ?? brokerStatus.liveCount} ACTIVE`
+                  : `FAIL-CLOSED · ${brokerStatus?.mode || 'WAITING FOR OLYMP SNAPSHOT'}`}
+              </span>
+              <span className="text-[#AAB4BF] text-[11px]">
+                {brokerStatus?.mode === 'OLYMP_ACTIVE' && brokerStatus.pairs && brokerStatus.pairs.length > 0
+                  ? `Eligible ≥80% (${brokerStatus.pairs.length}): ${brokerStatus.pairs.join(', ')}`
+                  : brokerStatus?.reason || 'Open Olymp Trade in Chrome with companion v1.3.1+ to unlock live discovery.'}
+              </span>
+            </div>
+            {brokerStatus?.activePairs && brokerStatus.activePairs.length > 0 && (
+              <div className="text-[#82909D] text-[11px] leading-relaxed break-words">
+                <span className="text-[#AAB4BF] font-semibold">
+                  All Active Olymp Markets ({brokerStatus.activePairs.length}):
+                </span>{' '}
+                {brokerStatus.activePairs.join(', ')}
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
@@ -506,8 +516,14 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 Spread Gate: <strong className="text-[#72A98B]">{controls?.bot?.dynamicSpreadGate ? `ACTIVE (≤ ${controls?.bot?.maxSpreadPips || 2.5}p)` : 'OFF'}</strong>
               </span>
               <span>
-                Active Pairs: <strong className="text-[#E8E5DE]">{controls?.bot?.allowedPairs?.length ?? 20}/20</strong>
+                Research Pairs: <strong className="text-[#E8E5DE]">{controls?.bot?.allowedPairs?.length ?? FOREX_PAIRS.length}/{FOREX_PAIRS.length}</strong>
               </span>
+              {brokerStatus && (
+                <span>
+                  Olymp Active: <strong className="text-[#72A98B]">{brokerStatus.activeCount ?? 0}</strong>{' '}
+                  <span className="text-[#82909D]">({brokerStatus.liveCount ?? 0} eligible ≥80%)</span>
+                </span>
+              )}
               <span>
                 Telegram: <strong className="text-[#6C9D91]">{controls?.telegramBroadcast ? 'BROADCASTING' : 'MUTED'}</strong>
               </span>

@@ -102,6 +102,27 @@ export function isWithinStrictSignalDiscoveryWindow(timestampMs: number): boolea
   return msUntilNextOpen <= 210_000 && msUntilNextOpen >= 145_000;
 }
 
+export interface PipelineTelemetryCounters {
+  schedulerPulses: number;
+  successfulExecutions: number;
+  freshMarketPairsLastPulse: number;
+  freshMarketPairsTotal: number;
+  rawOpportunities: number;
+  banditRejections: number;
+  regimeRejections: number;
+  agiKnnRejections: number;
+  policyKnnRejections: number;
+  knnRejections: number;
+  mlpRejections: number;
+  pidRejections: number;
+  behaviouralRejections: number;
+  brokerEligibilityRejections: number;
+  successfulSignalCreations: number;
+  persistenceFailures: number;
+  telegramDeliveryFailures: number;
+  lastPulseAtUtc: string | null;
+}
+
 export class AutonomousScheduler {
   private static readonly CYCLE_STALL_TIMEOUT_MS = 75_000;
   private static readonly SYMBOL_FETCH_TIMEOUT_MS = 9_500;
@@ -118,6 +139,30 @@ export class AutonomousScheduler {
   private hasBootstrappedOnlineModel = false;
   private latestOlympTradeStatus: OlympTradeBridgeStatus | null = null;
   private lastBlockedLogMs = 0;
+  private pipelineCounters: PipelineTelemetryCounters = {
+    schedulerPulses: 0,
+    successfulExecutions: 0,
+    freshMarketPairsLastPulse: 0,
+    freshMarketPairsTotal: 0,
+    rawOpportunities: 0,
+    banditRejections: 0,
+    regimeRejections: 0,
+    agiKnnRejections: 0,
+    policyKnnRejections: 0,
+    knnRejections: 0,
+    mlpRejections: 0,
+    pidRejections: 0,
+    behaviouralRejections: 0,
+    brokerEligibilityRejections: 0,
+    successfulSignalCreations: 0,
+    persistenceFailures: 0,
+    telegramDeliveryFailures: 0,
+    lastPulseAtUtc: null,
+  };
+
+  public getPipelineCounters(): PipelineTelemetryCounters {
+    return { ...this.pipelineCounters };
+  }
 
   public updateOlympTradeSnapshot(rawStatus: unknown): ActiveTradingUniverse {
     const sanitized = sanitizeOlympTradeBridgeStatus(rawStatus);
@@ -474,6 +519,8 @@ export class AutonomousScheduler {
     const startTime = Date.now();
     this.currentCycleStartedAtMs = startTime;
     this.cycleCount++;
+    this.pipelineCounters.schedulerPulses++;
+    this.pipelineCounters.lastPulseAtUtc = new Date(startTime).toISOString();
 
     try {
       // 0. Weekend Market Closure Guard
@@ -573,6 +620,8 @@ export class AutonomousScheduler {
         ) {
           await db.flushAsync();
         }
+        this.pipelineCounters.freshMarketPairsLastPulse = 0;
+        this.pipelineCounters.successfulExecutions++;
         return {
           durationMs: idleDurationMs,
           pairsProcessed: 0,
@@ -773,6 +822,7 @@ export class AutonomousScheduler {
       if (shouldScanForSignals && inFlightTrades.length < 6) {
         const universe = this.getActiveTradingUniverse();
         if (universe.mode !== 'OLYMP_ACTIVE' || universe.pairs.length === 0) {
+          this.pipelineCounters.brokerEligibilityRejections++;
           const nowMs = Date.now();
           if (nowMs - this.lastBlockedLogMs >= 60_000) {
             this.lastBlockedLogMs = nowMs;
@@ -791,6 +841,9 @@ export class AutonomousScheduler {
             quantMicrostructure.updateCurrencyStrength(candlesMap);
           }
         }
+        const freshPairCount = Object.values(candlesMap).filter(arr => Array.isArray(arr) && arr.length >= 35).length;
+        this.pipelineCounters.freshMarketPairsLastPulse = freshPairCount;
+        this.pipelineCounters.freshMarketPairsTotal += freshPairCount;
         for (const symbol of universe.pairs) {
           // Strict Pair Isolation: If this pair already has an active in-flight trade, NEVER create another!
           if (inFlightSymbols.has(symbol)) {
@@ -872,12 +925,14 @@ export class AutonomousScheduler {
           }
 
           if (novelGeneCandidate) {
+            this.pipelineCounters.rawOpportunities++;
             const gene = novelGeneCandidate.gene;
             const agiState = agiSelfLearningEngine.getSelfLearningState();
             const arm = agiState.banditArms[gene.id];
 
             // A. Bandit Arm Throttle Gate (Auto-pause strategies whose trailing posterior EV is negative)
             if (arm && arm.status === 'THROTTLED') {
+              this.pipelineCounters.banditRejections++;
               this.logMind(
                 'AUDITOR',
                 `🛑 [MAB BANDIT THROTTLE]: Strategy ${gene.name} temporarily throttled (trailing posterior win rate: ${arm.currentWinRate}% < 55.6% break-even floor). Setup bypassed.`,
@@ -889,6 +944,7 @@ export class AutonomousScheduler {
             // B. Market Regime Gate (Hurst exponent & entropy)
             const regime = agiSelfLearningEngine.classifyMarketRegime(symbol, candles);
             if (regime.regimeType === 'RANDOM_WALK_CHOP' && novelGeneCandidate.conviction < 0.88) {
+              this.pipelineCounters.regimeRejections++;
               this.logMind(
                 'AUDITOR',
                 `🛑 [REGIME GATE STAND-DOWN]: ${symbol} is in high-entropy Random Walk Chop (Hurst: ${regime.hurstExponent}, Entropy: ${regime.shannonEntropy}). Conviction ${novelGeneCandidate.conviction} < 0.88 required for chop. Setup bypassed.`,
@@ -902,6 +958,8 @@ export class AutonomousScheduler {
             const netEval = onlinePolicyNetwork.forward(featureVec);
             const knn = onlinePolicyNetwork.queryEpisodicKNN(featureVec, symbol, novelGeneCandidate.direction);
             if (knn.shouldVeto) {
+              this.pipelineCounters.policyKnnRejections++;
+              this.pipelineCounters.knnRejections++;
               this.logMind(
                 'AUDITOR',
                 `[KNN_VETO]: ${knn.explanation}`,
@@ -921,12 +979,14 @@ export class AutonomousScheduler {
                 symbol
               );
               if (finalConviction < 0.72) {
+                this.pipelineCounters.pidRejections++;
                 continue; // Suppressed below actionable threshold
               }
             }
 
             const authNow = authorizeSignalWithBrokerSnapshot(symbol, this.latestOlympTradeStatus, Date.now());
             if (!authNow.authorized) {
+              this.pipelineCounters.brokerEligibilityRejections++;
               this.logMind(
                 'AUDITOR',
                 `[OLYMP TRADE GATE REJECTED] Blocked ${symbol} novel signal at creation time: ${authNow.reason}`,
@@ -935,44 +995,56 @@ export class AutonomousScheduler {
               continue;
             }
 
-            const signal = entryExitEngine.createResearchSignal({
-              symbol,
-              direction: novelGeneCandidate.direction,
-              signalCandle: c,
-              ruleFamily: 'volatility_squeeze',
-              expiryMinutes: gene.optimalHorizonMinutes,
-              confidence: finalConviction,
-              payoutPct: authNow.eligibility.payoutPct,
-              payoutSource: 'BROKER_OBSERVED',
-              brokerEligibility: authNow.eligibility,
-              modelVersion: `OnlinePolicy-MLP19-16-1+LinUCB`,
-              strategyName: gene.name,
-              strategyId: gene.id,
-              strategyWinRate: gene.verifiedAccuracy,
-              strategyHistoricalSampleSize: gene.sampleCount,
-              strategyEvidenceStatus: gene.accuracyStatus,
-              confluenceStrategies: [gene.name, ...gene.parents, `${gene.nonLinearOperator} Activation`],
-              confluenceScore: gene.parents.length + 1,
-              isStackedStrategy: true,
-              isNovelAiSynthesized: true,
-              synthesizedGeneId: gene.id,
-              mathematicalFormula: gene.mathematicalFormula,
-              whyHumansMissThis: gene.whyHumansMissThis,
-              paperOnly: gene.status !== 'PROMOTED_ACTIVE',
-              notes: gene.status !== 'PROMOTED_ACTIVE'
-                ? `[PAPER ONLY — NOT APPROVED FOR ACTIONABLE TRADING] Forward validation sample. ${gene.mathematicalFormula}`
-                : `[APPROVED AFTER 300 HISTORICAL + 300 FORWARD OUTCOMES]: ${gene.mathematicalFormula} | Edge: ${gene.whyHumansMissThis}`,
-            });
+            let signal;
+            try {
+              signal = entryExitEngine.createResearchSignal({
+                symbol,
+                direction: novelGeneCandidate.direction,
+                signalCandle: c,
+                ruleFamily: 'volatility_squeeze',
+                expiryMinutes: gene.optimalHorizonMinutes,
+                confidence: finalConviction,
+                payoutPct: authNow.eligibility.payoutPct,
+                payoutSource: 'BROKER_OBSERVED',
+                brokerEligibility: authNow.eligibility,
+                modelVersion: `OnlinePolicy-MLP19-16-1+LinUCB`,
+                strategyName: gene.name,
+                strategyId: gene.id,
+                strategyWinRate: gene.verifiedAccuracy,
+                strategyHistoricalSampleSize: gene.sampleCount,
+                strategyEvidenceStatus: gene.accuracyStatus,
+                confluenceStrategies: [gene.name, ...gene.parents, `${gene.nonLinearOperator} Activation`],
+                confluenceScore: gene.parents.length + 1,
+                isStackedStrategy: true,
+                isNovelAiSynthesized: true,
+                synthesizedGeneId: gene.id,
+                mathematicalFormula: gene.mathematicalFormula,
+                whyHumansMissThis: gene.whyHumansMissThis,
+                paperOnly: gene.status !== 'PROMOTED_ACTIVE',
+                notes: gene.status !== 'PROMOTED_ACTIVE'
+                  ? `[PAPER ONLY — NOT APPROVED FOR ACTIONABLE TRADING] Forward validation sample. ${gene.mathematicalFormula}`
+                  : `[APPROVED AFTER 300 HISTORICAL + 300 FORWARD OUTCOMES]: ${gene.mathematicalFormula} | Edge: ${gene.whyHumansMissThis}`,
+              });
+            } catch {
+              this.pipelineCounters.persistenceFailures++;
+              continue;
+            }
 
+            this.pipelineCounters.successfulSignalCreations++;
             createdSignals.push(signal);
             this.recordBehavioralValidation(signal, candles);
             inFlightSymbols.add(symbol);
 
             // Dispatch instant signal notification to Telegram subscribers (awaited before pulse returns)
             pendingTelegramDispatches.push(
-              telegramService.sendSignalAlert(signal).catch(err => {
-                console.error('[Scheduler] Telegram novel signal dispatch error:', err.message);
-              })
+              telegramService.sendSignalAlert(signal)
+                .then(results => {
+                  if (results.some(r => !r.success)) this.pipelineCounters.telegramDeliveryFailures++;
+                })
+                .catch(err => {
+                  this.pipelineCounters.telegramDeliveryFailures++;
+                  console.error('[Scheduler] Telegram novel signal dispatch error:', err.message);
+                })
             );
 
             this.logMind(
@@ -1060,6 +1132,7 @@ export class AutonomousScheduler {
           }
 
           if (candidate) {
+            this.pipelineCounters.rawOpportunities++;
             // Dynamically assign optimal expiry across 5m, 10m, 15m, 20m, 25m, 30m
             let dynamicExpiry: 5 | 10 | 15 | 20 | 25 | 30 = 15;
             let ruleFamily = 'mean_reversion_20';
@@ -1114,6 +1187,7 @@ export class AutonomousScheduler {
             // GATE 1: Thompson Sampling Bandit / Empirical Break-Even Throttle (<55.6% WR @ n>=8)
             const throttleCheck = agiSelfLearningEngine.isStrategyThrottled(strategyId);
             if (throttleCheck.throttled) {
+              this.pipelineCounters.banditRejections++;
               this.logMind(
                 'AUDITOR',
                 `[ADAPTIVE BANDIT THROTTLE] Blocked ${symbol} ${candidate.direction} (${strategyId}): ${throttleCheck.reason}`,
@@ -1125,6 +1199,7 @@ export class AutonomousScheduler {
             // GATE 2: Hurst Exponent & Shannon Entropy Regime Chop Filter
             const regime = agiSelfLearningEngine.classifyMarketRegime(symbol, candles);
             if (regime.regimeType === 'RANDOM_WALK_CHOP' && candidate.confluenceScore < 3) {
+              this.pipelineCounters.regimeRejections++;
               this.logMind(
                 'AUDITOR',
                 `[REGIME CHOP GATE] Blocked low-confluence ${symbol} ${candidate.direction} (${candidate.confluenceScore} signals) during RANDOM_WALK_CHOP (H=${regime.hurstExponent}, Entropy=${regime.shannonEntropy}).`,
@@ -1138,6 +1213,9 @@ export class AutonomousScheduler {
             const agiKnn = agiSelfLearningEngine.evaluateEpisodicVeto(symbol, candidate.direction, featureVec);
             const policyKnn = onlinePolicyNetwork.queryEpisodicKNN(featureVec, symbol, candidate.direction);
             if (agiKnn.shouldVeto || policyKnn.shouldVeto) {
+              if (agiKnn.shouldVeto) this.pipelineCounters.agiKnnRejections++;
+              if (policyKnn.shouldVeto) this.pipelineCounters.policyKnnRejections++;
+              this.pipelineCounters.knnRejections++;
               this.logMind(
                 'AUDITOR',
                 `[EPISODIC k-NN VETO] Blocked ${symbol} ${candidate.direction}: ${agiKnn.shouldVeto ? agiKnn.reason : policyKnn.explanation}`,
@@ -1152,6 +1230,7 @@ export class AutonomousScheduler {
             const mlpDirProb = candidate.direction === 'BUY' ? netEval.probabilityUp : 1.0 - netEval.probabilityUp;
 
             if (policyTelemetry.stepCount >= 10 && mlpDirProb < 0.35) {
+              this.pipelineCounters.mlpRejections++;
               this.logMind(
                 'AUDITOR',
                 `[NEURAL POLICY VETO] Blocked ${symbol} ${candidate.direction}: Trained MLP (step=${policyTelemetry.stepCount}) assigns only ${(mlpDirProb * 100).toFixed(1)}% probability to ${candidate.direction} (LinUCB=${netEval.linUcbScore}).`,
@@ -1183,6 +1262,7 @@ export class AutonomousScheduler {
             adaptedConfidence = Number(Math.max(0.50, Math.min(0.95, adaptedConfidence)).toFixed(2));
 
             if (adaptedConfidence < pidMinFloor) {
+              this.pipelineCounters.pidRejections++;
               this.logMind(
                 'AUDITOR',
                 `[PID + IMMUNE GATE] Blocked ${symbol} ${candidate.direction} (${strategyId}): Adapted conviction ${(adaptedConfidence * 100).toFixed(1)}% < PID floor ${(pidMinFloor * 100).toFixed(1)}% (delta=${agiState.adaptiveThresholdDelta >= 0 ? '+' : ''}${agiState.adaptiveThresholdDelta}${immune.resistanceApplied ? `, Immune: ${immune.antidoteName}` : ''}).`,
@@ -1213,6 +1293,7 @@ export class AutonomousScheduler {
               preBehavioral.recommendation === 'REJECT_INSUFFICIENT_EVIDENCE' &&
               severeTrapCatalysts.length > 0
             ) {
+              this.pipelineCounters.behaviouralRejections++;
               this.logMind(
                 'AUDITOR',
                 `[BEHAVIOURAL TRAP VETO] Blocked ${symbol} ${candidate.direction}: ${severeTrapCatalysts.map(h => h.type).join(', ')} (${preBehavioral.decisionRationale})`,
@@ -1223,6 +1304,7 @@ export class AutonomousScheduler {
 
             const authNow = authorizeSignalWithBrokerSnapshot(symbol, this.latestOlympTradeStatus, Date.now());
             if (!authNow.authorized) {
+              this.pipelineCounters.brokerEligibilityRejections++;
               this.logMind(
                 'AUDITOR',
                 `[OLYMP TRADE GATE REJECTED] Blocked ${symbol} stacked signal at creation time: ${authNow.reason}`,
@@ -1231,35 +1313,47 @@ export class AutonomousScheduler {
               continue;
             }
 
-            const signal = entryExitEngine.createResearchSignal({
-              symbol,
-              direction: candidate.direction,
-              signalCandle: c,
-              ruleFamily,
-              expiryMinutes: dynamicExpiry,
-              confidence: adaptedConfidence,
-              payoutPct: authNow.eligibility.payoutPct,
-              payoutSource: 'BROKER_OBSERVED',
-              brokerEligibility: authNow.eligibility,
-              modelVersion: `v3.0-adaptive-online-ml`,
-              strategyName,
-              strategyId,
-              confluenceStrategies: candidate.confluence,
-              confluenceScore: candidate.confluenceScore,
-              isStackedStrategy: true,
-              paperOnly: true,
-              notes: `[ADAPTIVE ONLINE ML · PAPER] Confluence: [${candidate.confluence.join(' · ')}] | Regime: ${regime.regimeType} (H=${regime.hurstExponent}) | MLP(${policyTelemetry.stepCount} steps): ${(mlpDirProb * 100).toFixed(1)}% | PID Floor: ${(pidMinFloor * 100).toFixed(1)}%${immune.resistanceApplied ? ` | Immune Damped (${immune.antidoteName})` : ''}. Enters strictly on 5M open (${activeSession.name}).`,
-            });
+            let signal;
+            try {
+              signal = entryExitEngine.createResearchSignal({
+                symbol,
+                direction: candidate.direction,
+                signalCandle: c,
+                ruleFamily,
+                expiryMinutes: dynamicExpiry,
+                confidence: adaptedConfidence,
+                payoutPct: authNow.eligibility.payoutPct,
+                payoutSource: 'BROKER_OBSERVED',
+                brokerEligibility: authNow.eligibility,
+                modelVersion: `v3.0-adaptive-online-ml`,
+                strategyName,
+                strategyId,
+                confluenceStrategies: candidate.confluence,
+                confluenceScore: candidate.confluenceScore,
+                isStackedStrategy: true,
+                paperOnly: true,
+                notes: `[ADAPTIVE ONLINE ML · PAPER] Confluence: [${candidate.confluence.join(' · ')}] | Regime: ${regime.regimeType} (H=${regime.hurstExponent}) | MLP(${policyTelemetry.stepCount} steps): ${(mlpDirProb * 100).toFixed(1)}% | PID Floor: ${(pidMinFloor * 100).toFixed(1)}%${immune.resistanceApplied ? ` | Immune Damped (${immune.antidoteName})` : ''}. Enters strictly on 5M open (${activeSession.name}).`,
+              });
+            } catch {
+              this.pipelineCounters.persistenceFailures++;
+              continue;
+            }
 
+            this.pipelineCounters.successfulSignalCreations++;
             createdSignals.push(signal);
             this.recordBehavioralValidation(signal, candles);
             inFlightSymbols.add(symbol);
 
             // Dispatch instant signal notification to Telegram subscribers (awaited before pulse returns)
             pendingTelegramDispatches.push(
-              telegramService.sendSignalAlert(signal).catch(err => {
-                console.error('[Scheduler] Telegram stacked signal dispatch error:', err.message);
-              })
+              telegramService.sendSignalAlert(signal)
+                .then(results => {
+                  if (results.some(r => !r.success)) this.pipelineCounters.telegramDeliveryFailures++;
+                })
+                .catch(err => {
+                  this.pipelineCounters.telegramDeliveryFailures++;
+                  console.error('[Scheduler] Telegram stacked signal dispatch error:', err.message);
+                })
             );
 
             this.logMind(
@@ -1382,6 +1476,7 @@ export class AutonomousScheduler {
         await db.flushAsync();
       }
 
+      this.pipelineCounters.successfulExecutions++;
       return {
         durationMs,
         pairsProcessed: Object.keys(candlesMap).length,

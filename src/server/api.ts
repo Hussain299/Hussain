@@ -630,6 +630,7 @@ apiRouter.get('/system/health', (_req: Request, res: Response) => {
     providers: db.getFeedHealthList(),
     sessions: dataFeedEngine.getMarketSessions(),
     uptimeTelemetry: autonomousScheduler.getUptimeTelemetry(),
+    pipelineCounters: autonomousScheduler.getPipelineCounters(),
     selfHealing: selfHealingSupervisor.getReport(),
   });
 });
@@ -676,6 +677,7 @@ apiRouter.get('/scheduler/heartbeat', (_req: Request, res: Response) => {
     version: '2.4.0',
     backgroundSyncSupported: true,
     uptimeTelemetry: autonomousScheduler.getUptimeTelemetry(),
+    pipelineCounters: autonomousScheduler.getPipelineCounters(),
   });
 });
 
@@ -895,6 +897,7 @@ apiRouter.get('/autopilot/status', (_req: Request, res: Response) => {
     totalCandles: db.getTotalCandlesCount(),
     pairsMonitored: FOREX_PAIRS.length,
     intervalSeconds: 20,
+    pipelineCounters: autonomousScheduler.getPipelineCounters(),
     timestamp: new Date().toISOString(),
   });
 });
@@ -1067,10 +1070,12 @@ apiRouter.get('/behavioural/shadow-comparison', (_req: Request, res: Response) =
 apiRouter.get('/telegram/status', async (_req: Request, res: Response) => {
   try {
     const config = db.getTelegramConfig();
+    const diag = telegramService.getDiagnostics();
     const botInfo = await telegramService.getBotInfo();
 
     res.json({
-      configured: Boolean(config.botToken),
+      configured: diag.tokenConfigured,
+      tokenFormatValid: diag.tokenFormatValid,
       enabled: config.enabled,
       bot: botInfo.bot || {
         id: 8386549882,

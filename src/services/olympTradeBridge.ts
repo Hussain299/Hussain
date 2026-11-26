@@ -38,6 +38,19 @@ export interface ActiveTradingUniverse {
   reason: string;
   counts: OlympTradeDiagnosticCounts;
   eligibleDetails: Partial<Record<ForexSymbol, EligiblePairDetail>>;
+  extensionInstalled: boolean;
+  extensionVersion: string | null;
+  platformTabOpen: boolean;
+  connected: boolean;
+  sessionState: OlympTradeSessionState;
+  discoveredPairs: string[];
+  activePairs: string[];
+  unavailablePairs: string[];
+  unknownPairs: string[];
+  discoveredCount: number;
+  activeCount: number;
+  unavailableCount: number;
+  instruments: OlympTradeInstrument[];
 }
 
 export interface OlympTradeInstrument {
@@ -144,7 +157,7 @@ export function sanitizeOlympTradeBridgeStatus(value: unknown): OlympTradeBridge
   const unique = new Map<string, OlympTradeInstrument>();
 
   if (Array.isArray(raw.instruments)) {
-    for (const item of raw.instruments.slice(0, 300)) {
+    for (const item of raw.instruments) {
       if (!item || typeof item !== 'object') continue;
       const instrument = item as Record<string, unknown>;
       const pair = normalizePair(instrument.pair);
@@ -255,6 +268,8 @@ export function computeDiagnosticCounts(instruments: readonly OlympTradeInstrume
  * Authoritative FAIL-CLOSED resolver for actionable Olymp Trade signal generation.
  * Never falls back to the 29-pair research universe when the broker snapshot is
  * missing, disconnected, login-required, stale (>45s), or lacks verified >=80% pairs.
+ * Separately exposes ALL deduplicated broker-discovered instruments & active markets
+ * so UI surfaces can display every active Olymp Trade pair without weakening eligibility.
  */
 export function resolveActiveTradingPairs(
   status: OlympTradeBridgeStatus | null | undefined,
@@ -270,10 +285,59 @@ export function resolveActiveTradingPairs(
       reason: 'Waiting for authenticated Olymp Trade browser companion snapshot. Signal generation paused.',
       counts: emptyCounts(),
       eligibleDetails: {},
+      extensionInstalled: Boolean(status?.extensionInstalled),
+      extensionVersion: status?.extensionVersion ?? null,
+      platformTabOpen: Boolean(status?.platformTabOpen),
+      connected: false,
+      sessionState: status?.sessionState ?? 'UNKNOWN',
+      discoveredPairs: [],
+      activePairs: [],
+      unavailablePairs: [],
+      unknownPairs: [],
+      discoveredCount: 0,
+      activeCount: 0,
+      unavailableCount: 0,
+      instruments: [],
     };
   }
 
-  const rawCounts = computeDiagnosticCounts(status.instruments);
+  const byPair = new Map<string, OlympTradeInstrument>();
+  for (const inst of status.instruments) {
+    const pair = normalizePair(inst.pair);
+    if (!pair) continue;
+    const normalizedInst: OlympTradeInstrument = { ...inst, pair };
+    const prev = byPair.get(pair);
+    if (!prev || instrumentScore(normalizedInst) > instrumentScore(prev)) {
+      byPair.set(pair, normalizedInst);
+    }
+  }
+  const deduplicatedInstruments = Array.from(byPair.values()).sort((a, b) => a.pair.localeCompare(b.pair));
+  const discoveredPairs = deduplicatedInstruments.map(inst => inst.pair);
+  const activePairs = deduplicatedInstruments
+    .filter(inst => inst.availability === 'AVAILABLE')
+    .map(inst => inst.pair);
+  const unavailablePairs = deduplicatedInstruments
+    .filter(inst => inst.availability === 'UNAVAILABLE')
+    .map(inst => inst.pair);
+  const unknownPairs = deduplicatedInstruments
+    .filter(inst => inst.availability === 'UNKNOWN')
+    .map(inst => inst.pair);
+
+  const rawCounts = computeDiagnosticCounts(deduplicatedInstruments);
+  const baseDiscoveryFields = {
+    extensionInstalled: status.extensionInstalled,
+    extensionVersion: status.extensionVersion,
+    platformTabOpen: status.platformTabOpen,
+    sessionState: status.sessionState,
+    discoveredPairs,
+    activePairs,
+    unavailablePairs,
+    unknownPairs,
+    discoveredCount: discoveredPairs.length,
+    activeCount: activePairs.length,
+    unavailableCount: unavailablePairs.length,
+    instruments: deduplicatedInstruments,
+  };
 
   if (status.sessionState === 'LOGIN_REQUIRED') {
     return {
@@ -285,6 +349,8 @@ export function resolveActiveTradingPairs(
       reason: 'Olymp Trade requires login. Signal generation paused until authenticated.',
       counts: { ...rawCounts, eligibleInUniverse: 0 },
       eligibleDetails: {},
+      connected: false,
+      ...baseDiscoveryFields,
     };
   }
 
@@ -298,6 +364,8 @@ export function resolveActiveTradingPairs(
       reason: 'Olymp Trade browser snapshot is stale. Signal generation paused.',
       counts: { ...rawCounts, eligibleInUniverse: 0 },
       eligibleDetails: {},
+      connected: false,
+      ...baseDiscoveryFields,
     };
   }
 
@@ -311,6 +379,8 @@ export function resolveActiveTradingPairs(
       reason: 'Olymp Trade market snapshot not ready or disconnected. Signal generation paused.',
       counts: { ...rawCounts, eligibleInUniverse: 0 },
       eligibleDetails: {},
+      connected: false,
+      ...baseDiscoveryFields,
     };
   }
 
@@ -328,15 +398,10 @@ export function resolveActiveTradingPairs(
       reason: 'Olymp Trade snapshot exceeded 45s freshness limit. Signal generation paused.',
       counts: { ...rawCounts, eligibleInUniverse: 0 },
       eligibleDetails: {},
+      connected: false,
+      ...baseDiscoveryFields,
+      sessionState: 'STALE',
     };
-  }
-
-  const byPair = new Map<string, OlympTradeInstrument>();
-  for (const inst of status.instruments) {
-    const prev = byPair.get(inst.pair);
-    if (!prev || instrumentScore(inst) > instrumentScore(prev)) {
-      byPair.set(inst.pair, inst);
-    }
   }
 
   const eligibleDetails: Partial<Record<ForexSymbol, EligiblePairDetail>> = {};
@@ -364,6 +429,8 @@ export function resolveActiveTradingPairs(
       reason: 'No configured 29-pair instrument is explicitly AVAILABLE with >=80% HIGH-confidence payout on Olymp Trade.',
       counts: { ...rawCounts, eligibleInUniverse: 0 },
       eligibleDetails: {},
+      connected: status.connected,
+      ...baseDiscoveryFields,
     };
   }
 
@@ -373,9 +440,11 @@ export function resolveActiveTradingPairs(
     liveCount: pairs.length,
     capturedAt: status.capturedAt,
     ageMs: effectiveAgeMs,
-    reason: `Olymp Trade eligibility gate active across ${pairs.length} verified pair(s) paying >=80%.`,
+    reason: `Olymp Trade eligibility gate active across ${pairs.length} verified pair(s) paying >=80% (${activePairs.length} total active market(s) discovered).`,
     counts: { ...rawCounts, eligibleInUniverse: pairs.length },
     eligibleDetails,
+    connected: true,
+    ...baseDiscoveryFields,
   };
 }
 

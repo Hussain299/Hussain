@@ -23,7 +23,7 @@ interface CommandPaletteProps {
   onClose: () => void;
   onSelectTab: (tab: ViewTab) => void;
   signals: ResearchSignal[];
-  brokerStatus?: { mode: string; liveCount: number } | null;
+  brokerStatus?: { mode: string; liveCount: number; activeCount?: number } | null;
 }
 
 interface CommandItem {
@@ -74,7 +74,11 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         description: `Browser companion status (${brokerStatus?.mode || 'CONNECTING'}) & active pairs`,
         category: 'VIEW',
         tab: 'broker',
-        badge: brokerStatus?.mode === 'OLYMP_ACTIVE' ? `${brokerStatus.liveCount} ACTIVE` : 'GATE',
+        badge: brokerStatus?.mode === 'OLYMP_ACTIVE'
+          ? `${brokerStatus.liveCount} ELIG · ${brokerStatus.activeCount ?? brokerStatus.liveCount} ACT`
+          : brokerStatus?.activeCount
+          ? `0 ELIG · ${brokerStatus.activeCount} ACT`
+          : 'GATE',
         icon: Link2,
       },
       {

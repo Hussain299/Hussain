@@ -173,7 +173,7 @@ export class DataFeedEngine {
       const yahooUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?range=2d&interval=1m`;
       const res = await fetch(yahooUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-        signal: AbortSignal.timeout(3000),
+        signal: AbortSignal.timeout(4500),
       });
 
       if (res.ok) {
