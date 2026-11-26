@@ -243,7 +243,10 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </span>
             <span className="text-[#354251]">/</span>
             <span className="text-[#AAB4BF]">
-              Autonomous Quantitative Engine · {FOREX_PAIRS.length} Ranked Pairs (Olymp-Gated)
+              Autonomous Quantitative Engine ·{' '}
+              {brokerStatus?.mode === 'MANUAL_ACTIVE'
+                ? `${brokerStatus.liveCount} Manual Pairs (AI Studio Preview)`
+                : `${FOREX_PAIRS.length} Ranked Pairs (Olymp-Gated)`}
             </span>
           </div>
 
@@ -277,22 +280,28 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div className="flex flex-wrap items-center gap-3">
               <span
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-bold border ${
-                  brokerStatus?.mode === 'OLYMP_ACTIVE'
+                  brokerStatus?.mode === 'OLYMP_ACTIVE' || brokerStatus?.mode === 'MANUAL_ACTIVE'
                     ? 'bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/40'
                     : 'bg-[#C5A36A]/15 text-[#C5A36A] border-[#C5A36A]/40'
                 }`}
               >
                 <span
                   className={`w-1.5 h-1.5 rounded-full ${
-                    brokerStatus?.mode === 'OLYMP_ACTIVE' ? 'bg-[#72A98B] animate-pulse' : 'bg-[#C5A36A]'
+                    brokerStatus?.mode === 'OLYMP_ACTIVE' || brokerStatus?.mode === 'MANUAL_ACTIVE'
+                      ? 'bg-[#72A98B] animate-pulse'
+                      : 'bg-[#C5A36A]'
                   }`}
                 />
-                {brokerStatus?.mode === 'OLYMP_ACTIVE'
+                {brokerStatus?.mode === 'MANUAL_ACTIVE'
+                  ? `AI STUDIO · MANUAL PAIRS (${brokerStatus.liveCount} ACTIVE)`
+                  : brokerStatus?.mode === 'OLYMP_ACTIVE'
                   ? `OLYMP ACTIVE · ${brokerStatus.liveCount} ELIGIBLE · ${brokerStatus.activeCount ?? brokerStatus.liveCount} ACTIVE`
                   : `FAIL-CLOSED · ${brokerStatus?.mode || 'WAITING FOR OLYMP SNAPSHOT'}`}
               </span>
               <span className="text-[#AAB4BF] text-[11px]">
-                {brokerStatus?.mode === 'OLYMP_ACTIVE' && brokerStatus.pairs && brokerStatus.pairs.length > 0
+                {brokerStatus?.mode === 'MANUAL_ACTIVE' && brokerStatus.pairs && brokerStatus.pairs.length > 0
+                  ? `Manual Universe (${brokerStatus.pairs.length}): ${brokerStatus.pairs.join(', ')}`
+                  : brokerStatus?.mode === 'OLYMP_ACTIVE' && brokerStatus.pairs && brokerStatus.pairs.length > 0
                   ? `Eligible ≥80% (${brokerStatus.pairs.length}): ${brokerStatus.pairs.join(', ')}`
                   : brokerStatus?.reason || 'Open Olymp Trade in Chrome with companion v1.3.1+ to unlock live discovery.'}
               </span>

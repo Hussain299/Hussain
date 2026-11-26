@@ -164,7 +164,9 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
     : 'bg-[#C5A36A]/10 border-[#C5A36A]/35 text-[#C5A36A]';
 
   const schedulerBadgeText =
-    activeUniverse.mode === 'OLYMP_ACTIVE'
+    activeUniverse.mode === 'MANUAL_ACTIVE'
+      ? `SCHEDULER: AI STUDIO MANUAL PAIRS (${activeUniverse.pairs.length} ACTIVE)`
+      : activeUniverse.mode === 'OLYMP_ACTIVE'
       ? `SCHEDULER: OLYMP ACTIVE (${activeUniverse.pairs.length} ELIGIBLE ≥${MIN_ELIGIBLE_PAYOUT_PCT}%)`
       : activeUniverse.mode === 'OLYMP_NO_ELIGIBLE_PAIRS'
       ? 'SCHEDULER: PAUSED (0 ELIGIBLE PAIRS)'
@@ -175,7 +177,7 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
       : 'SCHEDULER: PAUSED (WAITING FOR SNAPSHOT)';
 
   const schedulerBadgeClass =
-    activeUniverse.mode === 'OLYMP_ACTIVE'
+    activeUniverse.mode === 'OLYMP_ACTIVE' || activeUniverse.mode === 'MANUAL_ACTIVE'
       ? 'bg-[#72A98B]/15 border-[#72A98B]/40 text-[#72A98B]'
       : 'bg-[#C67D83]/15 border-[#C67D83]/40 text-[#C67D83]';
 

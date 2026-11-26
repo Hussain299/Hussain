@@ -3122,6 +3122,131 @@ export async function runAllVerificationTests(): Promise<{
     }
   });
 
+  await runTest('SYSTEM', 'AI Studio preview trades manual pairs while published app strictly enforces Olymp Trade pairs', async () => {
+    const expressMod = await import('express');
+    const httpMod = await import('http');
+    const { apiRouter } = await import('./api.js');
+    const { autonomousScheduler, resolvePulseFetchPlan } = await import('./scheduler.js');
+    const { resolveRuntimeTradingMode } = await import('../services/olympTradeBridge.js');
+
+    // 1. Verify runtime detection split
+    if (resolveRuntimeTradingMode({ K_SERVICE: 'ais-dev-preview-1', NODE_ENV: 'development' }) !== 'MANUAL_PAIRS') {
+      throw new Error('Expected AI Studio ais-dev-* preview to select MANUAL_PAIRS trading mode');
+    }
+    if (resolveRuntimeTradingMode({ K_SERVICE: 'ais-pre-prod-1', NODE_ENV: 'production' }) !== 'OLYMP_TRADE') {
+      throw new Error('Expected Published Cloud Run ais-pre-* production to enforce OLYMP_TRADE mode');
+    }
+    if (resolveRuntimeTradingMode({ NODE_ENV: 'production' }) !== 'OLYMP_TRADE') {
+      throw new Error('Expected NODE_ENV=production without ais-dev- to enforce OLYMP_TRADE mode');
+    }
+
+    const prevMode = process.env.SIGNALFORGE_TRADING_MODE;
+    const prevManual = db.getManualPairs();
+    const nowMs = Date.now();
+    const candle: Candle = {
+      symbol: 'EUR/USD',
+      timestamp: new Date(nowMs).toISOString(),
+      timestampMs: nowMs,
+      open: 1.08,
+      high: 1.081,
+      low: 1.079,
+      close: 1.0805,
+      volume: 100,
+      source: 'yahoo',
+    };
+
+    try {
+      // 2. AI Studio preview mode (MANUAL_PAIRS) works without Olymp Trade extension and honors manual pair selections
+      process.env.SIGNALFORGE_TRADING_MODE = 'MANUAL_PAIRS';
+      autonomousScheduler.clearOlympTradeSnapshot();
+
+      const app = expressMod.default();
+      app.use(expressMod.default.json());
+      app.use('/api', apiRouter);
+      const server = httpMod.createServer(app);
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const addr = server.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+        const postPairs = await fetch(`${baseUrl}/api/bot-controls/pairs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ allowedPairs: ['EUR/USD', 'GBP/USD', 'INVALID/PAIR'] }),
+        });
+        const postJson = await postPairs.json();
+        if (!postJson.ok || postJson.tradingMode !== 'MANUAL_PAIRS' || postJson.pairs.length !== 2) {
+          throw new Error(`Expected manual pairs update in MANUAL_PAIRS mode, got ${JSON.stringify(postJson)}`);
+        }
+
+        const statusJson = await fetch(`${baseUrl}/api/broker/olymptrade/status`).then(r => r.json());
+        if (statusJson.mode !== 'MANUAL_ACTIVE' || statusJson.liveCount !== 2 || !statusJson.pairs.includes('EUR/USD')) {
+          throw new Error(`Expected MANUAL_ACTIVE universe with 2 pairs, got ${JSON.stringify(statusJson)}`);
+        }
+
+        const manualPlan = resolvePulseFetchPlan(statusJson, [], [], nowMs);
+        if (!manualPlan.shouldFetch || !manualPlan.shouldDiscover || manualPlan.symbolsToFetch.length !== 2) {
+          throw new Error(`Expected resolvePulseFetchPlan to scan manual pairs in preview mode: ${JSON.stringify(manualPlan)}`);
+        }
+
+        const manualSig = entryExitEngine.createResearchSignal({
+          symbol: 'EUR/USD',
+          direction: 'BUY',
+          signalCandle: candle,
+          ruleFamily: 'momentum_5',
+          expiryMinutes: 5,
+          confidence: 0.78,
+          payoutPct: 82,
+          payoutSource: 'ASSUMED_MINIMUM',
+          manualPairAuthorization: {
+            mode: 'MANUAL_ACTIVE',
+            pair: 'EUR/USD',
+            verifiedAtUtc: new Date(nowMs).toISOString(),
+          },
+          modelVersion: 'vTest',
+        });
+        if (!manualSig?.id || manualSig.symbol !== 'EUR/USD') {
+          throw new Error('Expected manual pair signal creation in MANUAL_PAIRS preview mode');
+        }
+      } finally {
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+
+      // 3. Switching to Published Production (OLYMP_TRADE) immediately restores strict Olymp Trade fail-closed gating
+      process.env.SIGNALFORGE_TRADING_MODE = 'OLYMP_TRADE';
+      const prodUniverse = autonomousScheduler.getActiveTradingUniverse(nowMs);
+      if (prodUniverse.mode !== 'OLYMP_WAITING_FOR_SNAPSHOT' || prodUniverse.liveCount !== 0) {
+        throw new Error(`Expected OLYMP_TRADE production mode to fail closed without companion snapshot, got ${JSON.stringify(prodUniverse)}`);
+      }
+      let blockedManualInProd = false;
+      try {
+        entryExitEngine.createResearchSignal({
+          symbol: 'EUR/USD',
+          direction: 'BUY',
+          signalCandle: candle,
+          ruleFamily: 'momentum_5',
+          expiryMinutes: 5,
+          confidence: 0.78,
+          manualPairAuthorization: {
+            mode: 'MANUAL_ACTIVE',
+            pair: 'EUR/USD',
+            verifiedAtUtc: new Date(nowMs).toISOString(),
+          },
+          modelVersion: 'vTest',
+        });
+      } catch (e: any) {
+        blockedManualInProd = String(e.message).includes('BROKER_ELIGIBILITY_BLOCKED');
+      }
+      if (!blockedManualInProd) {
+        throw new Error('Published OLYMP_TRADE mode must never accept manualPairAuthorization');
+      }
+    } finally {
+      if (prevMode === undefined) delete process.env.SIGNALFORGE_TRADING_MODE;
+      else process.env.SIGNALFORGE_TRADING_MODE = prevMode;
+      db.saveManualPairs(prevManual);
+    }
+  });
+
   // Purge test signals so they never appear on the user's trading terminal
   db.purgeTestSignals();
 

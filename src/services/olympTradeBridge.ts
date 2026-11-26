@@ -1,11 +1,14 @@
 import { BrokerEligibilitySnapshot, FOREX_PAIRS, ForexSymbol } from '../types/index.js';
 
+export type RuntimeTradingMode = 'MANUAL_PAIRS' | 'OLYMP_TRADE';
+
 export type OlympTradeSessionState = 'READY' | 'LOGIN_REQUIRED' | 'WAITING_FOR_MARKET_DATA' | 'NO_PLATFORM_TAB' | 'STALE' | 'UNKNOWN';
 export type OlympTradeAvailability = 'AVAILABLE' | 'UNAVAILABLE' | 'UNKNOWN';
 export type OlympTradeEvidence = 'HIGH' | 'MEDIUM' | 'NONE';
 export type OlympTradeInstrumentSource = 'MARKET_LIST' | 'TAB' | 'UNKNOWN';
 export type OlympTradeUniverseMode =
   | 'OLYMP_ACTIVE'
+  | 'MANUAL_ACTIVE'
   | 'OLYMP_NO_ELIGIBLE_PAIRS'
   | 'OLYMP_WAITING_FOR_SNAPSHOT'
   | 'OLYMP_STALE'
@@ -31,6 +34,7 @@ export interface EligiblePairDetail {
 
 export interface ActiveTradingUniverse {
   mode: OlympTradeUniverseMode;
+  tradingMode?: RuntimeTradingMode;
   pairs: ForexSymbol[];
   liveCount: number;
   capturedAt: string | null;
@@ -504,4 +508,118 @@ export function isValidBrokerEligibilitySnapshot(
   if (!Number.isFinite(capturedMs)) return false;
   const ageMs = nowMs - capturedMs;
   return ageMs >= -5_000 && ageMs <= SNAPSHOT_FRESHNESS_MS;
+}
+
+/**
+ * Determine whether the active runtime uses AI Studio manual-pair trading or strict Olymp Trade gating.
+ * Published production (`DEPLOYED_PRODUCTION`) always enforces `OLYMP_TRADE`; AI Studio preview (`ais-dev-*`
+ * or local Vite dev mode) defaults to `MANUAL_PAIRS`.
+ */
+export function resolveRuntimeTradingMode(
+  env: Record<string, string | undefined> | undefined = typeof process !== 'undefined' ? process.env : undefined
+): RuntimeTradingMode {
+  const explicit = env?.SIGNALFORGE_TRADING_MODE;
+  if (explicit === 'OLYMP_TRADE' || explicit === 'MANUAL_PAIRS') {
+    return explicit;
+  }
+  const kService = env?.K_SERVICE || '';
+  const isAiStudioDevPreview =
+    kService.startsWith('ais-dev-') ||
+    (env?.NODE_ENV !== 'production' && !kService.startsWith('ais-pre-'));
+  return isAiStudioDevPreview ? 'MANUAL_PAIRS' : 'OLYMP_TRADE';
+}
+
+/**
+ * Resolve an ActiveTradingUniverse payload from user-configured manual pairs for AI Studio preview mode.
+ * Never used in DEPLOYED_PRODUCTION where Olymp Trade fail-closed gating is mandatory.
+ */
+export function resolveManualTradingUniverse(
+  manualPairs: readonly ForexSymbol[],
+  nowMs: number = Date.now()
+): ActiveTradingUniverse {
+  const validSet = new Set<ForexSymbol>(FOREX_PAIRS);
+  const unique = new Set<ForexSymbol>();
+  for (const pair of manualPairs) {
+    if (validSet.has(pair)) unique.add(pair);
+  }
+  const active = Array.from(unique);
+  const capturedAt = new Date(nowMs).toISOString();
+  const instruments: OlympTradeInstrument[] = active.map(pair => ({
+    pair,
+    payoutPct: 82,
+    availability: 'AVAILABLE',
+    evidence: 'HIGH',
+    sourceType: 'MARKET_LIST',
+  }));
+  const eligibleDetails: Partial<Record<ForexSymbol, EligiblePairDetail>> = {};
+  for (const pair of active) {
+    eligibleDetails[pair] = {
+      payoutPct: 82,
+      availability: 'AVAILABLE',
+      evidence: 'HIGH',
+      sourceType: 'MARKET_LIST',
+    };
+  }
+  const counts: OlympTradeDiagnosticCounts = {
+    observed: active.length,
+    available: active.length,
+    unavailable: 0,
+    unknownAvailability: 0,
+    knownPayout: active.length,
+    payoutAtLeast80: active.length,
+    eligibleInUniverse: active.length,
+    outsideUniverse: 0,
+  };
+
+  if (active.length === 0) {
+    return {
+      mode: 'OLYMP_NO_ELIGIBLE_PAIRS',
+      tradingMode: 'MANUAL_PAIRS',
+      pairs: [],
+      liveCount: 0,
+      capturedAt,
+      ageMs: 0,
+      reason: 'AI Studio preview: no manual pairs enabled in Bot Controls. Enable at least 1 pair to resume discovery.',
+      counts,
+      eligibleDetails: {},
+      extensionInstalled: false,
+      extensionVersion: null,
+      platformTabOpen: false,
+      connected: true,
+      sessionState: 'READY',
+      discoveredPairs: [],
+      activePairs: [],
+      unavailablePairs: [],
+      unknownPairs: [],
+      discoveredCount: 0,
+      activeCount: 0,
+      unavailableCount: 0,
+      instruments: [],
+    };
+  }
+
+  return {
+    mode: 'MANUAL_ACTIVE',
+    tradingMode: 'MANUAL_PAIRS',
+    pairs: active,
+    liveCount: active.length,
+    capturedAt,
+    ageMs: 0,
+    reason: `AI Studio preview active: trading on ${active.length} manual pair(s) from Bot Controls (published app enforces live Olymp Trade).`,
+    counts,
+    eligibleDetails,
+    extensionInstalled: false,
+    extensionVersion: null,
+    platformTabOpen: false,
+    connected: true,
+    sessionState: 'READY',
+    discoveredPairs: active,
+    activePairs: active,
+    unavailablePairs: [],
+    unknownPairs: [],
+    discoveredCount: active.length,
+    activeCount: active.length,
+    unavailableCount: 0,
+    instruments,
+  };
 }

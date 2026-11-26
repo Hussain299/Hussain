@@ -6,6 +6,7 @@
 
 import {
   AutopilotLog,
+  BrokerEligibilitySnapshot,
   Candle,
   EvolutionGeneration,
   FOREX_PAIRS,
@@ -30,6 +31,9 @@ import {
   authorizeSignalWithBrokerSnapshot,
   OlympTradeBridgeStatus,
   resolveActiveTradingPairs,
+  resolveManualTradingUniverse,
+  resolveRuntimeTradingMode,
+  RuntimeTradingMode,
   sanitizeOlympTradeBridgeStatus,
 } from '../services/olympTradeBridge.js';
 
@@ -73,7 +77,9 @@ export function resolvePulseFetchPlan(
   }
 
   const combined = new Set<ForexSymbol>(settlementSet);
-  const shouldDiscover = universe.mode === 'OLYMP_ACTIVE' && universe.pairs.length > 0;
+  const shouldDiscover =
+    (universe.mode === 'OLYMP_ACTIVE' || universe.mode === 'MANUAL_ACTIVE') &&
+    universe.pairs.length > 0;
   const brokerPairsCount = shouldDiscover ? universe.pairs.length : 0;
   if (shouldDiscover) {
     for (const pair of universe.pairs) {
@@ -192,8 +198,62 @@ export class AutonomousScheduler {
     return false;
   }
 
+  public getTradingMode(): RuntimeTradingMode {
+    return resolveRuntimeTradingMode();
+  }
+
   public getActiveTradingUniverse(nowMs: number = Date.now()): ActiveTradingUniverse {
-    return resolveActiveTradingPairs(this.latestOlympTradeStatus, nowMs);
+    if (this.getTradingMode() === 'MANUAL_PAIRS') {
+      return resolveManualTradingUniverse(db.getManualPairs(), nowMs);
+    }
+    return {
+      ...resolveActiveTradingPairs(this.latestOlympTradeStatus, nowMs),
+      tradingMode: 'OLYMP_TRADE',
+    };
+  }
+
+  private authorizeCandidateForSignalCreation(
+    symbol: ForexSymbol,
+    nowMs: number = Date.now()
+  ):
+    | {
+        authorized: true;
+        payoutPct: number;
+        payoutSource: 'BROKER_OBSERVED' | 'ASSUMED_MINIMUM';
+        brokerEligibility?: BrokerEligibilitySnapshot;
+        manualPairAuthorization?: { mode: 'MANUAL_ACTIVE'; pair: ForexSymbol; verifiedAtUtc: string };
+      }
+    | { authorized: false; reason: string } {
+    if (this.getTradingMode() === 'MANUAL_PAIRS') {
+      const manualPairs = db.getManualPairs();
+      if (!manualPairs.includes(symbol)) {
+        return {
+          authorized: false,
+          reason: `${symbol} is disabled in AI Studio Manual Bot Controls.`,
+        };
+      }
+      return {
+        authorized: true,
+        payoutPct: 82,
+        payoutSource: 'ASSUMED_MINIMUM',
+        manualPairAuthorization: {
+          mode: 'MANUAL_ACTIVE',
+          pair: symbol,
+          verifiedAtUtc: new Date(nowMs).toISOString(),
+        },
+      };
+    }
+
+    const auth = authorizeSignalWithBrokerSnapshot(symbol, this.latestOlympTradeStatus, nowMs);
+    if (!auth.authorized) {
+      return { authorized: false, reason: auth.reason };
+    }
+    return {
+      authorized: true,
+      payoutPct: auth.eligibility.payoutPct,
+      payoutSource: 'BROKER_OBSERVED',
+      brokerEligibility: auth.eligibility,
+    };
   }
 
   private async fetchCandlesForSymbols(
@@ -603,9 +663,10 @@ export class AutonomousScheduler {
         const failNowMs = Date.now();
         if (failNowMs - this.lastBlockedLogMs >= 60_000) {
           this.lastBlockedLogMs = failNowMs;
+          const gateTag = prePulseUniverse.tradingMode === 'MANUAL_PAIRS' ? 'MANUAL PAIRS FAIL-CLOSED' : 'OLYMP TRADE FAIL-CLOSED';
           this.logMind(
             'AUDITOR',
-            `[OLYMP TRADE FAIL-CLOSED · ${prePulseUniverse.mode}] ${prePulseUniverse.reason}`
+            `[${gateTag} · ${prePulseUniverse.mode}] ${prePulseUniverse.reason}`
           );
         }
         const idleDurationMs = Date.now() - startTime;
@@ -821,14 +882,15 @@ export class AutonomousScheduler {
 
       if (shouldScanForSignals && inFlightTrades.length < 6) {
         const universe = this.getActiveTradingUniverse();
-        if (universe.mode !== 'OLYMP_ACTIVE' || universe.pairs.length === 0) {
+        if ((universe.mode !== 'OLYMP_ACTIVE' && universe.mode !== 'MANUAL_ACTIVE') || universe.pairs.length === 0) {
           this.pipelineCounters.brokerEligibilityRejections++;
           const nowMs = Date.now();
           if (nowMs - this.lastBlockedLogMs >= 60_000) {
             this.lastBlockedLogMs = nowMs;
+            const gateTag = universe.tradingMode === 'MANUAL_PAIRS' ? 'MANUAL PAIRS FAIL-CLOSED' : 'OLYMP TRADE FAIL-CLOSED';
             this.logMind(
               'AUDITOR',
-              `[OLYMP TRADE FAIL-CLOSED · ${universe.mode}] ${universe.reason}`
+              `[${gateTag} · ${universe.mode}] ${universe.reason}`
             );
           }
         } else {
@@ -984,12 +1046,12 @@ export class AutonomousScheduler {
               }
             }
 
-            const authNow = authorizeSignalWithBrokerSnapshot(symbol, this.latestOlympTradeStatus, Date.now());
+            const authNow = this.authorizeCandidateForSignalCreation(symbol, Date.now());
             if (!authNow.authorized) {
               this.pipelineCounters.brokerEligibilityRejections++;
               this.logMind(
                 'AUDITOR',
-                `[OLYMP TRADE GATE REJECTED] Blocked ${symbol} novel signal at creation time: ${authNow.reason}`,
+                `[GATE REJECTED] Blocked ${symbol} novel signal at creation time: ${authNow.reason}`,
                 symbol
               );
               continue;
@@ -1004,9 +1066,10 @@ export class AutonomousScheduler {
                 ruleFamily: 'volatility_squeeze',
                 expiryMinutes: gene.optimalHorizonMinutes,
                 confidence: finalConviction,
-                payoutPct: authNow.eligibility.payoutPct,
-                payoutSource: 'BROKER_OBSERVED',
-                brokerEligibility: authNow.eligibility,
+                payoutPct: authNow.payoutPct,
+                payoutSource: authNow.payoutSource,
+                brokerEligibility: authNow.brokerEligibility,
+                manualPairAuthorization: authNow.manualPairAuthorization,
                 modelVersion: `OnlinePolicy-MLP19-16-1+LinUCB`,
                 strategyName: gene.name,
                 strategyId: gene.id,
@@ -1302,12 +1365,12 @@ export class AutonomousScheduler {
               continue;
             }
 
-            const authNow = authorizeSignalWithBrokerSnapshot(symbol, this.latestOlympTradeStatus, Date.now());
+            const authNow = this.authorizeCandidateForSignalCreation(symbol, Date.now());
             if (!authNow.authorized) {
               this.pipelineCounters.brokerEligibilityRejections++;
               this.logMind(
                 'AUDITOR',
-                `[OLYMP TRADE GATE REJECTED] Blocked ${symbol} stacked signal at creation time: ${authNow.reason}`,
+                `[GATE REJECTED] Blocked ${symbol} stacked signal at creation time: ${authNow.reason}`,
                 symbol
               );
               continue;
@@ -1322,9 +1385,10 @@ export class AutonomousScheduler {
                 ruleFamily,
                 expiryMinutes: dynamicExpiry,
                 confidence: adaptedConfidence,
-                payoutPct: authNow.eligibility.payoutPct,
-                payoutSource: 'BROKER_OBSERVED',
-                brokerEligibility: authNow.eligibility,
+                payoutPct: authNow.payoutPct,
+                payoutSource: authNow.payoutSource,
+                brokerEligibility: authNow.brokerEligibility,
+                manualPairAuthorization: authNow.manualPairAuthorization,
                 modelVersion: `v3.0-adaptive-online-ml`,
                 strategyName,
                 strategyId,

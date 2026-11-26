@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Sliders,
   Shield,
@@ -37,33 +37,80 @@ export const ManualControlsView: React.FC<ManualControlsViewProps> = ({ onContro
   const [controls, setControls] = useState<ManualControlsState>(loadManualControls());
   const [savedFeedback, setSavedFeedback] = useState(false);
   const [resetFeedback, setResetFeedback] = useState(false);
+  const [serverTradingMode, setServerTradingMode] = useState<'MANUAL_PAIRS' | 'OLYMP_TRADE' | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    fetch('/api/bot-controls/pairs')
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (!active || !data) return;
+        if (data.tradingMode === 'MANUAL_PAIRS' || data.tradingMode === 'OLYMP_TRADE') {
+          setServerTradingMode(data.tradingMode);
+        }
+        if (data.tradingMode === 'MANUAL_PAIRS' && Array.isArray(data.pairs)) {
+          const validPairs = data.pairs.filter((p: unknown): p is ForexSymbol =>
+            typeof p === 'string' && FOREX_PAIRS.includes(p as ForexSymbol)
+          );
+          setControls(prev => {
+            const next: ManualControlsState = {
+              ...prev,
+              bot: {
+                ...prev.bot,
+                allowedPairs: validPairs,
+              },
+            };
+            saveManualControls(next);
+            return next;
+          });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const syncManualPairsToServer = async (allowedPairs: ForexSymbol[]) => {
+    try {
+      await fetch('/api/bot-controls/pairs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ allowedPairs }),
+      });
+    } catch (e) {
+      console.warn('Failed to sync manual pairs to backend:', e);
+    }
+  };
 
   const handleSave = async () => {
     saveManualControls(controls);
     setSavedFeedback(true);
     setTimeout(() => setSavedFeedback(false), 2500);
 
-    // Sync telegram threshold to backend
-    try {
-      await fetch('/api/telegram/settings', {
+    await Promise.all([
+      syncManualPairsToServer(controls.bot.allowedPairs),
+      // Sync telegram threshold to backend
+      fetch('/api/telegram/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           enabled: controls.telegramBroadcast,
           minConfidence: controls.telegramMinConfidence,
         }),
-      });
-    } catch (e) {
-      console.warn('Failed to sync telegram settings to backend:', e);
-    }
+      }).catch(e => {
+        console.warn('Failed to sync telegram settings to backend:', e);
+      }),
+    ]);
 
     if (onControlsUpdated) onControlsUpdated();
   };
 
-  const handleResetDefaults = () => {
+  const handleResetDefaults = async () => {
     const defaults = getDefaultManualControls();
     setControls(defaults);
     saveManualControls(defaults);
+    await syncManualPairsToServer(defaults.bot.allowedPairs);
     setResetFeedback(true);
     setTimeout(() => setResetFeedback(false), 2500);
     if (onControlsUpdated) onControlsUpdated();
@@ -583,7 +630,11 @@ export const ManualControlsView: React.FC<ManualControlsViewProps> = ({ onContro
                   Permitted Currency Pairs Matrix ({botConfig.allowedPairs.length} / {FOREX_PAIRS.length})
                 </span>
                 <span className="text-[10px] text-[#AAB4BF]">
-                  The autonomous bot strictly scans, predicts, and executes on active pairs only.
+                  {serverTradingMode === 'MANUAL_PAIRS'
+                    ? 'AI Studio Preview is actively trading on these manual pairs. Click Save & Apply Filters to update.'
+                    : serverTradingMode === 'OLYMP_TRADE'
+                    ? 'Published Production enforces live Olymp Trade >=80% payout eligibility (manual list acts only as preview config).'
+                    : 'The autonomous bot strictly scans, predicts, and executes on active pairs only.'}
                 </span>
               </div>
 

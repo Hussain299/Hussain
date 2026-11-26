@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import {
   Candle,
+  FOREX_PAIRS,
   ForexSymbol,
   MarketSessionId,
   MarketSessionInfo,
@@ -67,6 +68,7 @@ interface DatabaseSchema {
   botHealthState?: BotSelfMonitoringState;
   shadowComparison?: ShadowModeComparison;
   telegramConfig?: TelegramConfig;
+  manualPairs?: ForexSymbol[];
   cronState: {
     lastRun: string | null;
     nextRun: string | null;
@@ -2317,6 +2319,33 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
     this.state.telegramConfig = config;
     this.scheduleSave('high');
     return config.subscribers.length < beforeCount;
+  }
+
+  public getManualPairs(): ForexSymbol[] {
+    if (!Array.isArray(this.state.manualPairs)) {
+      return [...FOREX_PAIRS];
+    }
+    const validSet = new Set<ForexSymbol>(FOREX_PAIRS);
+    const dedup = new Set<ForexSymbol>();
+    for (const pair of this.state.manualPairs) {
+      if (validSet.has(pair)) dedup.add(pair);
+    }
+    return Array.from(dedup);
+  }
+
+  public saveManualPairs(pairs: unknown[]): ForexSymbol[] {
+    const validSet = new Set<ForexSymbol>(FOREX_PAIRS);
+    const dedup = new Set<ForexSymbol>();
+    for (const item of pairs) {
+      if (typeof item === 'string') {
+        const upper = item.trim().toUpperCase() as ForexSymbol;
+        if (validSet.has(upper)) dedup.add(upper);
+      }
+    }
+    const sanitized = Array.from(dedup);
+    this.state.manualPairs = sanitized;
+    this.scheduleSave('high');
+    return [...sanitized];
   }
 }
 

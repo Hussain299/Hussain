@@ -1264,3 +1264,37 @@ apiRouter.get('/broker/olymptrade/status', (_req: Request, res: Response) => {
   res.json(autonomousScheduler.getActiveTradingUniverse());
 });
 
+// GET /api/bot-controls/pairs — Retrieve backend-persisted manual pair universe (used in AI Studio preview)
+apiRouter.get('/bot-controls/pairs', (_req: Request, res: Response) => {
+  const tradingMode = autonomousScheduler.getTradingMode();
+  res.json({
+    pairs: db.getManualPairs(),
+    tradingMode,
+    runtimeMode: autonomousScheduler.getUptimeTelemetry().runtimeMode,
+    universe: autonomousScheduler.getActiveTradingUniverse(),
+  });
+});
+
+// POST /api/bot-controls/pairs — Update backend-persisted manual pair selection
+apiRouter.post('/bot-controls/pairs', (req: Request, res: Response) => {
+  try {
+    const rawPairs = Array.isArray(req.body?.allowedPairs)
+      ? req.body.allowedPairs
+      : Array.isArray(req.body?.pairs)
+      ? req.body.pairs
+      : null;
+    if (!rawPairs) {
+      return res.status(400).json({ ok: false, error: 'Expected allowedPairs array.' });
+    }
+    const savedPairs = db.saveManualPairs(rawPairs);
+    return res.json({
+      ok: true,
+      pairs: savedPairs,
+      tradingMode: autonomousScheduler.getTradingMode(),
+      universe: autonomousScheduler.getActiveTradingUniverse(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+

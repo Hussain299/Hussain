@@ -127,23 +127,27 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           )}
 
-          {/* Live Olymp Trade Gate Pill */}
+          {/* Live Trading Universe Pill (Manual Pairs in AI Studio vs Olymp Trade in Production) */}
           <button
             onClick={() => onTabChange('broker')}
-            title={brokerStatus?.reason || 'Click to inspect Olymp Trade broker feed'}
+            title={brokerStatus?.reason || 'Click to inspect active trading universe'}
             className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-mono font-bold border transition-colors cursor-pointer shrink-0 ${
-              brokerStatus?.mode === 'OLYMP_ACTIVE'
+              brokerStatus?.mode === 'OLYMP_ACTIVE' || brokerStatus?.mode === 'MANUAL_ACTIVE'
                 ? 'bg-[#72A98B]/15 border-[#72A98B]/40 text-[#72A98B] hover:bg-[#72A98B]/25'
                 : 'bg-[#C5A36A]/10 border-[#C5A36A]/35 text-[#C5A36A] hover:bg-[#C5A36A]/20'
             }`}
           >
             <span
               className={`w-1.5 h-1.5 rounded-full ${
-                brokerStatus?.mode === 'OLYMP_ACTIVE' ? 'bg-[#72A98B] animate-pulse' : 'bg-[#C5A36A]'
+                brokerStatus?.mode === 'OLYMP_ACTIVE' || brokerStatus?.mode === 'MANUAL_ACTIVE'
+                  ? 'bg-[#72A98B] animate-pulse'
+                  : 'bg-[#C5A36A]'
               }`}
             />
             <span>
-              {brokerStatus?.mode === 'OLYMP_ACTIVE'
+              {brokerStatus?.mode === 'MANUAL_ACTIVE'
+                ? `MANUAL · ${brokerStatus.liveCount}`
+                : brokerStatus?.mode === 'OLYMP_ACTIVE'
                 ? `OLYMP · ${brokerStatus.liveCount}/${brokerStatus.activeCount ?? brokerStatus.liveCount}`
                 : brokerStatus?.activeCount
                 ? `OLYMP · 0/${brokerStatus.activeCount}`

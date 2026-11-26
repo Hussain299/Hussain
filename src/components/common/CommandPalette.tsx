@@ -74,7 +74,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         description: `Browser companion status (${brokerStatus?.mode || 'CONNECTING'}) & active pairs`,
         category: 'VIEW',
         tab: 'broker',
-        badge: brokerStatus?.mode === 'OLYMP_ACTIVE'
+        badge: brokerStatus?.mode === 'MANUAL_ACTIVE'
+          ? `MANUAL · ${brokerStatus.liveCount}`
+          : brokerStatus?.mode === 'OLYMP_ACTIVE'
           ? `${brokerStatus.liveCount} ELIG · ${brokerStatus.activeCount ?? brokerStatus.liveCount} ACT`
           : brokerStatus?.activeCount
           ? `0 ELIG · ${brokerStatus.activeCount} ACT`

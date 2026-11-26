@@ -20,7 +20,7 @@ import { calculateBinarySettlement, DEFAULT_BINARY_PAYOUT_PERCENT } from './bina
 import { getSessionFromTimestamp } from './dataFeeds.js';
 import { agiSelfLearningEngine } from './agiEngine.js';
 import { hasTrustedPredictionFeatures, onlinePolicyNetwork } from './onlinePolicyNetwork.js';
-import { isValidBrokerEligibilitySnapshot } from '../services/olympTradeBridge.js';
+import { isValidBrokerEligibilitySnapshot, resolveRuntimeTradingMode } from '../services/olympTradeBridge.js';
 import { evaluateShadowCandidate, PriorEpisodeRecord } from './shadowPredictor.js';
 import { multiAgentCouncil } from './multiAgentCouncil.js';
 import { evaluateInstitutionalSignalRisk } from './portfolioRiskEngine.js';
@@ -86,6 +86,11 @@ export interface SignalCreationParams {
   whyHumansMissThis?: string;
   paperOnly?: boolean;
   brokerEligibility?: BrokerEligibilitySnapshot;
+  manualPairAuthorization?: {
+    mode: 'MANUAL_ACTIVE';
+    pair: ForexSymbol;
+    verifiedAtUtc: string;
+  };
 }
 
 export class EntryExitEngine {
@@ -133,7 +138,12 @@ export class EntryExitEngine {
       if (!FOREX_PAIRS.includes(params.symbol)) {
         throw new Error(`BROKER_ELIGIBILITY_BLOCKED: ${params.symbol} is outside the configured 29-pair universe.`);
       }
-      if (!isValidBrokerEligibilitySnapshot(params.brokerEligibility, params.symbol)) {
+      const hasValidOlympSnapshot = isValidBrokerEligibilitySnapshot(params.brokerEligibility, params.symbol);
+      const hasValidManualPreviewAuth =
+        resolveRuntimeTradingMode() === 'MANUAL_PAIRS' &&
+        params.manualPairAuthorization?.mode === 'MANUAL_ACTIVE' &&
+        params.manualPairAuthorization.pair === params.symbol;
+      if (!hasValidOlympSnapshot && !hasValidManualPreviewAuth) {
         throw new Error(
           `BROKER_ELIGIBILITY_BLOCKED: Cannot create live signal for ${params.symbol} without a fresh, verified Olymp Trade AVAILABLE >=80% HIGH-evidence snapshot.`
         );

@@ -5,6 +5,8 @@ import path from 'path';
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'signalforge-verify-'));
 const isolatedDbPath = path.join(tempDir, 'signalforge.db.json');
 process.env.SIGNALFORGE_DB_PATH = isolatedDbPath;
+// Verify strict production Olymp Trade fail-closed gating by default; dedicated tests toggle MANUAL_PAIRS explicitly.
+process.env.SIGNALFORGE_TRADING_MODE = process.env.SIGNALFORGE_TRADING_MODE || 'OLYMP_TRADE';
 
 try {
   const { db } = await import('../src/server/db.js');

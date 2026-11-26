@@ -37,6 +37,8 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // Allow AI Studio preview proxy hostnames (*.hosted.app, *.scf.usercontent.goog, *.ai.studio) in Vite 8 dev mode.
+      allowedHosts: true as const,
     },
   };
 });
