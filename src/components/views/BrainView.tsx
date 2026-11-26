@@ -95,7 +95,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
   return (
     <div className="w-full bg-[#121820] text-[#E8E5DE] min-h-screen font-sans pb-24">
       {/* Header & Module Switcher */}
-      <div className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3.5 sticky top-16 z-20">
+      <div className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3.5 sticky top-24 z-20">
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4 text-xs font-mono">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-black tracking-wide text-[#E8E5DE] uppercase flex items-center gap-2">

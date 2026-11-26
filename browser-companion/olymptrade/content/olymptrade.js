@@ -25,7 +25,7 @@
   const INTERACTIVE_SELECTOR = 'button,a,[role="button"],[role="option"],[role="listitem"],[role="menuitem"],[role="tab"],[role="row"],[tabindex],li,tr';
 
   const VIRTUAL_CACHE_TTL_MS = 45_000;
-  const MARKET_DISCOVERY_RETENTION_MS = 15 * 60_000;
+  const MARKET_DISCOVERY_RETENTION_MS = 4 * 60 * 60_000;
   const virtualMarketListCache = new Map();
   let lastRichSnapshotAt = 0;
   let lastRichInstrumentCount = 0;
@@ -94,30 +94,37 @@
       return { payoutPct: null, evidence: 'NONE' };
     }
 
-    // Collect all plausible 50-100% values in this single-pair row
-    const percentages = Array.from(text.matchAll(PERCENT_REGEX))
-      .map(match => Number(match[1]))
-      .filter(value => Number.isFinite(value) && value >= 50 && value <= 100);
-
-    // Multiple distinct 50-100% numbers in the same row without an explicit label are ambiguous
-    if (percentages.length > 1) {
-      return { payoutPct: null, evidence: 'NONE' };
-    }
+    // Collect distinct plausible 50-100% values in this single-pair row (innerText + title/aria-label duplicates don't invalidate payout)
+    const uniquePercentages = Array.from(
+      new Set(
+        Array.from(text.matchAll(PERCENT_REGEX))
+          .map(match => Number(match[1]))
+          .filter(value => Number.isFinite(value) && value >= 50 && value <= 100)
+      )
+    );
 
     const [base, quote] = pair.split('/');
     const pairPattern = new RegExp(`\\b${base}(?:\\s*[/⁄\\-_]?\\s*)${quote}\\b`, 'i');
     const pairMatch = pairPattern.exec(text);
     if (pairMatch) {
-      const afterPair = text.slice(pairMatch.index + pairMatch[0].length, pairMatch.index + pairMatch[0].length + 56);
-      const adjacent = afterPair.match(/^[^0-9]{0,28}(\d{2,3}(?:\.\d{1,2})?)\s*%/);
-      if (adjacent) {
-        const value = Number(adjacent[1]);
+      const afterPair = text.slice(pairMatch.index + pairMatch[0].length, pairMatch.index + pairMatch[0].length + 64);
+      const adjacentStrict = afterPair.match(/^[^0-9]{0,28}(\d{2,3}(?:\.\d{1,2})?)\s*%/);
+      if (adjacentStrict) {
+        const value = Number(adjacentStrict[1]);
         if (value >= 50 && value <= 100) return { payoutPct: value, evidence: 'HIGH' };
+      }
+      if (uniquePercentages.length === 1) {
+        const nearbyMatch = afterPair.match(/(?:^|[\s+•|·(])([5-9]\d(?:\.\d{1,2})?|100(?:\.0{1,2})?)\s*%/);
+        if (nearbyMatch) {
+          const value = Number(nearbyMatch[1]);
+          if (value >= 50 && value <= 100) return { payoutPct: value, evidence: 'HIGH' };
+        }
       }
     }
 
-    if (percentages.length === 1) {
-      return { payoutPct: percentages[0], evidence: 'MEDIUM' };
+    // Multiple distinct 50-100% numbers in the same row without an explicit label are ambiguous
+    if (uniquePercentages.length === 1) {
+      return { payoutPct: uniquePercentages[0], evidence: 'MEDIUM' };
     }
 
     return { payoutPct: null, evidence: 'NONE' };
@@ -126,23 +133,28 @@
   /* ───────── find smallest enclosing row/card that contains only this pair ───────── */
   function findRowContainer(startElement, pair) {
     let best = startElement;
+    let bestWithPayout = findPayout(readText(startElement, 850), pair).payoutPct !== null ? startElement : null;
     let current = startElement.parentElement;
-    for (let depth = 0; depth < 7 && current && current !== document.body; depth++) {
+    for (let depth = 0; depth < 10 && current && current !== document.body; depth++) {
       const style = window.getComputedStyle(current);
       if (style.display !== 'contents') {
         const rect = current.getBoundingClientRect();
-        if (rect.height > 180 || rect.width > 1400) break;
+        if (rect.height > 240 || rect.width > 1400) break;
       }
-      const text = readText(current, 520);
-      if (!text || text.length > 500) break;
+      const text = readText(current, 850);
+      if (!text || text.length > 800) break;
       const pairs = findPairs(text);
       if (pairs.length !== 1 || pairs[0] !== pair) break;
+      const payoutNow = findPayout(text, pair);
+      if (payoutNow.payoutPct !== null) {
+        bestWithPayout = current;
+      }
       best = current;
-      // Continue climbing one more level if an immediate parent is the interactive button/row wrapper
-      if (/%/.test(text) && current.matches(INTERACTIVE_SELECTOR)) break;
+      // Stop climbing as soon as a single-pair element already includes its payout and interactive wrapper
+      if (payoutNow.payoutPct !== null && (current.matches(INTERACTIVE_SELECTOR) || depth >= 4)) break;
       current = current.parentElement;
     }
-    return best;
+    return bestWithPayout || best;
   }
 
   function hasInteractiveCue(rowEl, leaf) {
@@ -202,18 +214,28 @@
 
   function classifySourceType(rowEl) {
     if (rowEl.closest('[role="tablist"],[role="tab"]')) return 'TAB';
-    const rect = rowEl.getBoundingClientRect();
-    if (rect.top >= 0 && rect.top < 110 && rect.height > 0 && rect.height <= 76 && !rowEl.closest('[role="dialog"],[role="listbox"],[role="menu"]')) {
-      return 'TAB';
-    }
-    if (rowEl.closest(MARKET_CONTAINER_SELECTOR)) return 'MARKET_LIST';
+    const insideExplicitDrawer = Boolean(rowEl.closest('[role="dialog"],[role="listbox"],[role="menu"],[role="grid"]'));
+    let insideOverlayOrScroll = false;
     let cur = rowEl.parentElement;
-    for (let i = 0; i < 6 && cur && cur !== document.body; i++) {
+    for (let i = 0; i < 16 && cur && cur !== document.body; i++) {
       const style = window.getComputedStyle(cur);
-      if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && cur.scrollHeight > cur.clientHeight + 20) {
-        return 'MARKET_LIST';
+      if (
+        ((style.overflowY === 'auto' || style.overflowY === 'scroll') && cur.scrollHeight > cur.clientHeight + 10) ||
+        style.position === 'fixed' ||
+        (style.position === 'absolute' && cur.getBoundingClientRect().height >= 120)
+      ) {
+        insideOverlayOrScroll = true;
+        break;
       }
       cur = cur.parentElement;
+    }
+
+    const rect = rowEl.getBoundingClientRect();
+    if (rect.top >= 0 && rect.top < 110 && rect.height > 0 && rect.height <= 76 && !insideExplicitDrawer && !insideOverlayOrScroll) {
+      return 'TAB';
+    }
+    if (rowEl.closest(MARKET_CONTAINER_SELECTOR) || insideExplicitDrawer || insideOverlayOrScroll) {
+      return 'MARKET_LIST';
     }
     return 'UNKNOWN';
   }
@@ -224,7 +246,21 @@
       const el = candidates[i];
       if (!isVisible(el)) continue;
       const rect = el.getBoundingClientRect();
-      if (rect.height >= 120 && rect.width >= 160 && findPairs(readText(el, 16000)).length >= 2) {
+      if (rect.height >= 120 && rect.width >= 160 && findPairs(readText(el, 24000)).length >= 2) {
+        return true;
+      }
+    }
+    // Fallback for hashed CSS classes: detect any visible scroll/overlay container holding >= 2 currency pairs
+    const containers = document.querySelectorAll('div,section,aside,ul,table');
+    for (let i = 0; i < containers.length && i < 1500; i++) {
+      const el = containers[i];
+      if (!isVisible(el)) continue;
+      const style = window.getComputedStyle(el);
+      const isScrollable = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
+      const isOverlay = style.position === 'fixed' || style.position === 'absolute';
+      if (!isScrollable && !isOverlay) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.height >= 120 && rect.width >= 160 && findPairs(readText(el, 24000)).length >= 2) {
         return true;
       }
     }
@@ -267,15 +303,15 @@
     }
 
     for (const leaf of candidateLeaves) {
-      const leafPairs = findPairs(readText(leaf, 520));
+      const leafPairs = findPairs(readText(leaf, 600));
       if (leafPairs.length !== 1) continue;
       const pair = leafPairs[0];
 
       const rowEl = findRowContainer(leaf, pair);
       if (!isVisible(rowEl)) continue;
 
-      const text = readText(rowEl, 520);
-      if (!text || text.length > 500) continue;
+      const text = readText(rowEl, 850);
+      if (!text || text.length > 800) continue;
       // Never conflate OTC instruments with live FX currency pairs
       if (/\bOTC\b/i.test(text)) continue;
 
@@ -312,36 +348,24 @@
       lastRichSnapshotAt = 0;
       return [];
     }
-    const marketOpen = hasOpenMarketListContainer();
-    if (!marketOpen) {
-      // Retain discovered market-list pairs across drawer close and tab switches so the full
-      // list is never replaced by the ~7 pinned chart tabs; degrade unverified payout evidence
-      // from HIGH to MEDIUM after 45s until the drawer or chart tab re-observes the payout.
-      for (const [pair, entry] of virtualMarketListCache.entries()) {
-        const age = nowMs - entry.seenAt;
-        if (age > MARKET_DISCOVERY_RETENTION_MS) {
-          virtualMarketListCache.delete(pair);
-        } else if (!found.has(pair)) {
-          found.set(
-            pair,
-            age > VIRTUAL_CACHE_TTL_MS && entry.row.evidence === 'HIGH'
-              ? { ...entry.row, evidence: 'MEDIUM' }
-              : entry.row
-          );
-        }
-      }
-    } else {
+    const marketOpen = hasOpenMarketListContainer() || found.size > 10;
+    if (marketOpen) {
       for (const [pair, row] of found.entries()) {
-        if (row.sourceType === 'MARKET_LIST') {
-          virtualMarketListCache.set(pair, { row, seenAt: nowMs });
+        if (row.sourceType === 'MARKET_LIST' || (found.size > 10 && row.sourceType !== 'TAB')) {
+          virtualMarketListCache.set(pair, {
+            row: row.sourceType === 'UNKNOWN' ? { ...row, sourceType: 'MARKET_LIST' } : row,
+            seenAt: nowMs,
+          });
         }
       }
-      for (const [pair, entry] of virtualMarketListCache.entries()) {
-        if (nowMs - entry.seenAt > VIRTUAL_CACHE_TTL_MS) {
-          virtualMarketListCache.delete(pair);
-        } else if (!found.has(pair)) {
-          found.set(pair, entry.row);
-        }
+    }
+    // Retain discovered market-list pairs and their observed evidence across scrolling,
+    // drawer close, and tab switches so SignalForge does not collapse back to the ~7 pinned tabs.
+    for (const [pair, entry] of virtualMarketListCache.entries()) {
+      if (nowMs - entry.seenAt > MARKET_DISCOVERY_RETENTION_MS) {
+        virtualMarketListCache.delete(pair);
+      } else if (!found.has(pair)) {
+        found.set(pair, entry.row);
       }
     }
 

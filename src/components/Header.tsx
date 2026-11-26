@@ -35,7 +35,7 @@ interface HeaderProps {
   isRefreshing: boolean;
   activeSignalsCount: number;
   onToggleSidebar: () => void;
-  brokerStatus?: { mode: string; liveCount: number; activeCount?: number; discoveredCount?: number; reason?: string } | null;
+  brokerStatus?: { mode: string; liveCount: number; activeCount?: number; discoveredCount?: number; allowAllPairs?: boolean; reason?: string } | null;
   onOpenCommandPalette?: () => void;
 }
 
@@ -94,7 +94,7 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <div className="w-full sticky top-0 z-30 flex flex-col shadow-md">
-      <header className="h-16 border-b border-[#243040] bg-[#121820]/95 backdrop-blur-md px-3 sm:px-5 flex items-center justify-between gap-2 z-30 shrink-0 w-full font-sans overflow-hidden">
+      <header className="h-14 border-b border-[#243040] bg-[#121820]/95 backdrop-blur-md px-3 sm:px-5 flex items-center justify-between gap-2 z-30 shrink-0 w-full font-sans overflow-hidden">
         {/* Left: Brand Identity, Market Status & Live Broker Pill */}
         <div className="flex items-center gap-2 sm:gap-3 shrink-0 min-w-0">
           <button
@@ -116,12 +116,12 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Market Status Chip */}
           {isMarketOpen ? (
-            <span className="hidden 2xl:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#72A98B]/15 border border-[#72A98B]/35 text-[#72A98B] text-[10px] font-mono font-bold shrink-0">
+            <span className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#72A98B]/15 border border-[#72A98B]/35 text-[#72A98B] text-[10px] font-mono font-bold shrink-0">
               <span className="w-1.5 h-1.5 rounded-full bg-[#72A98B] animate-pulse" />
               FX LIVE
             </span>
           ) : (
-            <span className="hidden 2xl:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#C5A36A]/15 border border-[#C5A36A]/35 text-[#C5A36A] text-[10px] font-mono font-bold shrink-0">
+            <span className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#C5A36A]/15 border border-[#C5A36A]/35 text-[#C5A36A] text-[10px] font-mono font-bold shrink-0">
               <span className="w-1.5 h-1.5 rounded-full bg-[#C5A36A]" />
               WEEKEND PAUSE
             </span>
@@ -131,7 +131,7 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             onClick={() => onTabChange('broker')}
             title={brokerStatus?.reason || 'Click to inspect active trading universe'}
-            className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-mono font-bold border transition-colors cursor-pointer shrink-0 ${
+            className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-mono font-bold border transition-colors cursor-pointer shrink-0 ${
               brokerStatus?.mode === 'OLYMP_ACTIVE' || brokerStatus?.mode === 'MANUAL_ACTIVE'
                 ? 'bg-[#72A98B]/15 border-[#72A98B]/40 text-[#72A98B] hover:bg-[#72A98B]/25'
                 : 'bg-[#C5A36A]/10 border-[#C5A36A]/35 text-[#C5A36A] hover:bg-[#C5A36A]/20'
@@ -145,7 +145,9 @@ export const Header: React.FC<HeaderProps> = ({
               }`}
             />
             <span>
-              {brokerStatus?.mode === 'MANUAL_ACTIVE'
+              {brokerStatus?.allowAllPairs
+                ? `ALL · ${brokerStatus.liveCount}/29`
+                : brokerStatus?.mode === 'MANUAL_ACTIVE'
                 ? `MANUAL · ${brokerStatus.liveCount}`
                 : brokerStatus?.mode === 'OLYMP_ACTIVE'
                 ? `OLYMP · ${brokerStatus.liveCount}/${brokerStatus.activeCount ?? brokerStatus.liveCount}`
@@ -155,39 +157,6 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </button>
         </div>
-
-        {/* Center: Desktop Navigation Bar */}
-        <nav className="hidden lg:flex items-center bg-[#161F2B] border border-[#243040] p-1 rounded-xl gap-0.5 min-w-0 overflow-x-auto no-scrollbar">
-          {primaryTabs.map(tab => {
-            const Icon = tab.icon;
-            const isActive =
-              activeTab === tab.id ||
-              (tab.id === 'terminal' && activeTab === 'signals') ||
-              (tab.id === 'brain' && (activeTab === 'behaviour' || activeTab === 'modellab' || activeTab === 'strategy' || activeTab === 'evolution' || activeTab === 'agents')) ||
-              (tab.id === 'system' && (activeTab === 'health' || activeTab === 'config')) ||
-              (tab.id === 'controls' && activeTab === 'config');
-
-            return (
-              <button
-                key={tab.id}
-                onClick={() => onTabChange(tab.id)}
-                className={`flex items-center gap-1.5 px-2 xl:px-2.5 py-1.5 rounded-lg text-[11px] xl:text-xs font-semibold whitespace-nowrap shrink-0 transition-all cursor-pointer ${
-                  isActive
-                    ? 'bg-[#121820] text-[#E8E5DE] shadow-sm border border-[#243040]'
-                    : 'text-[#AAB4BF] hover:text-[#E8E5DE] hover:bg-[#121820]/40'
-                }`}
-              >
-                <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-[#72A98B]' : 'text-[#AAB4BF]'}`} />
-                <span>{tab.label}</span>
-                {tab.count !== undefined && tab.count > 0 && (
-                  <span className="px-1.5 py-0.2 rounded-full text-[9px] font-mono font-black bg-[#72A98B] text-[#121820]">
-                    {tab.count}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </nav>
 
         {/* Right: Actions, IST Clock & Menu Drawer Trigger */}
         <div className="flex items-center gap-1.5 sm:gap-2 text-xs shrink-0 font-mono">
@@ -280,8 +249,8 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
       </header>
 
-      {/* Mobile & Tablet Navigation Strip (Always visible, scrollable, and clickable on any screen size) */}
-      <div className="lg:hidden w-full bg-[#161F2B] border-b border-[#243040] px-3 py-1.5 flex items-center gap-1.5 overflow-x-auto no-scrollbar shrink-0 font-sans">
+      {/* Primary Navigation Bar (Full-width, unclipped across all desktop, laptop, and mobile screens) */}
+      <nav className="w-full h-10 bg-[#161F2B] border-b border-[#243040] px-3 sm:px-5 flex items-center gap-1.5 overflow-x-auto no-scrollbar shrink-0 font-sans">
         {primaryTabs.map(tab => {
           const Icon = tab.icon;
           const isActive =
@@ -311,7 +280,7 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           );
         })}
-      </div>
+      </nav>
     </div>
   );
 };

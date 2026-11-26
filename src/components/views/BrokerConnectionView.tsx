@@ -43,7 +43,18 @@ function formatAge(ageMs: number | null): string {
   return `${minutes}m ${seconds % 60}s ago`;
 }
 
-function getEligibilityNote(inst: OlympTradeInstrument, tracked: boolean, dataIsFresh: boolean): { eligible: boolean; label: string } {
+interface DisplayInstrument extends OlympTradeInstrument {
+  inSnapshot: boolean;
+}
+
+function getEligibilityNote(
+  inst: DisplayInstrument,
+  tracked: boolean,
+  dataIsFresh: boolean,
+  allowAllPairs: boolean
+): { eligible: boolean; label: string } {
+  if (allowAllPairs && tracked) return { eligible: true, label: 'ELIGIBLE (ALL 29 ENABLED)' };
+  if (!inst.inSnapshot) return { eligible: false, label: '29-pair universe (not in current Olymp tab bar)' };
   if (!dataIsFresh) return { eligible: false, label: 'Stale / disconnected' };
   if (!tracked) return { eligible: false, label: 'Outside configured 29' };
   if (inst.availability === 'UNAVAILABLE') return { eligible: false, label: 'Unavailable on Olymp' };
@@ -63,6 +74,7 @@ interface BrokerConnectionViewProps {
 export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ initialUniverse = null }) => {
   const [status, setStatus] = useState<OlympTradeBridgeStatus>(EMPTY_STATUS);
   const [checking, setChecking] = useState(false);
+  const [togglingPolicy, setTogglingPolicy] = useState(false);
   const [serverUniverse, setServerUniverse] = useState<ActiveTradingUniverse | null>(initialUniverse);
   const [filterMode, setFilterMode] = useState<InstrumentFilter>('ALL');
 
@@ -95,6 +107,22 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
     }
   }, []);
 
+  const toggleAllowAllPairs = useCallback(async (nextAllow: boolean) => {
+    setTogglingPolicy(true);
+    try {
+      const res = await fetch('/api/broker/olymptrade/policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ allowAllPairs: nextAllow }),
+      });
+      if (res.ok) {
+        setServerUniverse(await res.json());
+      }
+    } finally {
+      setTogglingPolicy(false);
+    }
+  }, []);
+
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
@@ -123,6 +151,7 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
   const configuredPairs = useMemo(() => new Set<string>(FOREX_PAIRS), []);
   const localUniverse = useMemo(() => resolveActiveTradingPairs(effectiveStatus), [effectiveStatus]);
   const activeUniverse = serverUniverse ?? localUniverse;
+  const allowAllPairsEnabled = Boolean(activeUniverse.allowAllPairs || activeUniverse.mode === 'MANUAL_ACTIVE');
   const counts = activeUniverse.counts;
   const dataIsFresh = Boolean(
     effectiveStatus.connected &&
@@ -130,18 +159,43 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
     effectiveStatus.ageMs <= SNAPSHOT_FRESHNESS_MS
   );
 
+  // Merge live broker-discovered instruments with the full 29-pair universe so all 29+ pairs are always visible.
+  const mergedInstruments = useMemo<DisplayInstrument[]>(() => {
+    const byPair = new Map<string, DisplayInstrument>();
+    for (const inst of effectiveStatus.instruments) {
+      byPair.set(inst.pair, { ...inst, inSnapshot: true });
+    }
+    for (const pair of FOREX_PAIRS) {
+      if (!byPair.has(pair)) {
+        byPair.set(pair, {
+          pair,
+          payoutPct: allowAllPairsEnabled ? 82 : null,
+          availability: allowAllPairsEnabled ? 'AVAILABLE' : 'UNKNOWN',
+          evidence: allowAllPairsEnabled ? 'HIGH' : 'NONE',
+          sourceType: 'UNKNOWN',
+          inSnapshot: false,
+        });
+      }
+    }
+    return Array.from(byPair.values()).sort((a, b) => a.pair.localeCompare(b.pair));
+  }, [effectiveStatus.instruments, allowAllPairsEnabled]);
+
   const filteredInstruments = useMemo(() => {
-    const list = effectiveStatus.instruments;
-    if (filterMode === 'ACTIVE') return list.filter(i => i.availability === 'AVAILABLE');
-    if (filterMode === 'UNAVAILABLE') return list.filter(i => i.availability === 'UNAVAILABLE');
+    if (filterMode === 'ACTIVE') return mergedInstruments.filter(i => i.availability === 'AVAILABLE');
+    if (filterMode === 'UNAVAILABLE') return mergedInstruments.filter(i => i.availability === 'UNAVAILABLE');
     if (filterMode === 'ELIGIBLE') {
-      return list.filter(i => getEligibilityNote(i, configuredPairs.has(i.pair), dataIsFresh).eligible);
+      return mergedInstruments.filter(i => getEligibilityNote(i, configuredPairs.has(i.pair), dataIsFresh, allowAllPairsEnabled).eligible);
     }
     if (filterMode === 'INELIGIBLE') {
-      return list.filter(i => !getEligibilityNote(i, configuredPairs.has(i.pair), dataIsFresh).eligible);
+      return mergedInstruments.filter(i => !getEligibilityNote(i, configuredPairs.has(i.pair), dataIsFresh, allowAllPairsEnabled).eligible);
     }
-    return list;
-  }, [effectiveStatus.instruments, filterMode, configuredPairs, dataIsFresh]);
+    return mergedInstruments;
+  }, [mergedInstruments, filterMode, configuredPairs, dataIsFresh, allowAllPairsEnabled]);
+
+  const eligibleRowCount = useMemo(
+    () => mergedInstruments.filter(i => getEligibilityNote(i, configuredPairs.has(i.pair), dataIsFresh, allowAllPairsEnabled).eligible).length,
+    [mergedInstruments, configuredPairs, dataIsFresh, allowAllPairsEnabled]
+  );
 
   const stateLabel = !effectiveStatus.extensionInstalled
     ? 'COMPANION NOT INSTALLED'
@@ -164,7 +218,9 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
     : 'bg-[#C5A36A]/10 border-[#C5A36A]/35 text-[#C5A36A]';
 
   const schedulerBadgeText =
-    activeUniverse.mode === 'MANUAL_ACTIVE'
+    activeUniverse.allowAllPairs
+      ? `SCHEDULER: ALL ${activeUniverse.pairs.length} PAIRS ENABLED`
+      : activeUniverse.mode === 'MANUAL_ACTIVE'
       ? `SCHEDULER: AI STUDIO MANUAL PAIRS (${activeUniverse.pairs.length} ACTIVE)`
       : activeUniverse.mode === 'OLYMP_ACTIVE'
       ? `SCHEDULER: OLYMP ACTIVE (${activeUniverse.pairs.length} ELIGIBLE ≥${MIN_ELIGIBLE_PAYOUT_PCT}%)`
@@ -187,21 +243,35 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
         <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#243040] pb-5">
           <div>
             <div className="flex items-center gap-2 text-[#72A98B] text-[10px] font-mono font-bold tracking-[0.18em] uppercase">
-              <Link2 className="w-4 h-4" /> Broker connection / fail-closed gate
+              <Link2 className="w-4 h-4" /> Broker connection / trading universe
             </div>
             <h1 className="mt-2 text-2xl sm:text-3xl font-black tracking-tight">Olymp Trade Feed</h1>
             <p className="mt-2 max-w-3xl text-sm text-[#AAB4BF] leading-relaxed">
               Reads visible Olymp Trade instruments and payouts from your authenticated browser session.
-              Actionable signal generation fails closed whenever the snapshot is missing, stale, unauthenticated, or lacks confirmed AVAILABLE pairs paying ≥{MIN_ELIGIBLE_PAYOUT_PCT}%.
+              Shows all {FOREX_PAIRS.length} SignalForge universe pairs alongside live Olymp Trade status, with a 1-click toggle to trade all {FOREX_PAIRS.length} pairs whenever Olymp Trade only shows 7 tabs.
             </p>
           </div>
-          <button
-            onClick={() => void refresh(true)}
-            disabled={checking}
-            className="inline-flex items-center gap-2 rounded-lg border border-[#354251] bg-[#1B2633] px-4 py-2.5 text-xs font-bold text-[#E8E5DE] hover:bg-[#243040] disabled:opacity-50"
-          >
-            <RefreshCw className={checking ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} /> Refresh snapshot
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => void toggleAllowAllPairs(!activeUniverse.allowAllPairs)}
+              disabled={togglingPolicy}
+              className={
+                'inline-flex items-center gap-2 rounded-lg border px-4 py-2.5 text-xs font-bold transition-colors cursor-pointer disabled:opacity-50 ' +
+                (activeUniverse.allowAllPairs
+                  ? 'border-[#C5A36A]/50 bg-[#C5A36A]/15 text-[#E6C78A] hover:bg-[#C5A36A]/25'
+                  : 'border-[#72A98B]/50 bg-[#72A98B] text-[#121820] hover:bg-[#72A98B]/90')
+              }
+            >
+              {activeUniverse.allowAllPairs ? 'Switch to Strict Olymp-Only Gate' : `Allow All ${FOREX_PAIRS.length} Pairs`}
+            </button>
+            <button
+              onClick={() => void refresh(true)}
+              disabled={checking}
+              className="inline-flex items-center gap-2 rounded-lg border border-[#354251] bg-[#1B2633] px-4 py-2.5 text-xs font-bold text-[#E8E5DE] hover:bg-[#243040] disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw className={checking ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} /> Refresh snapshot
+            </button>
+          </div>
         </div>
 
         {/* ───── Connection Status Banner ───── */}
@@ -259,6 +329,15 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
                 {activeUniverse.activePairs.join(', ')}
               </div>
             )}
+            {effectiveStatus.connected &&
+              activeUniverse.activeCount > 0 &&
+              activeUniverse.activeCount <= 10 &&
+              activeUniverse.instruments.every(i => i.sourceType === 'TAB') && (
+                <div className="mt-1.5 rounded border border-[#C5A36A]/40 bg-[#C5A36A]/10 px-2.5 py-1.5 font-mono text-[11px] text-[#E6C78A]">
+                  Only {activeUniverse.activeCount} pinned chart tab(s) are currently visible in the Olymp Trade DOM. Open the{' '}
+                  <strong>+ Asset Selector</strong> in Olymp Trade once (and scroll through the currency list) so the companion captures &amp; caches all 20+ active pairs.
+                </div>
+              )}
           </div>
         </section>
 
@@ -344,18 +423,18 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#2B3949] px-4 py-4">
             <div>
               <h2 className="font-bold">
-                Live instrument snapshot ({filteredInstruments.length} of {effectiveStatus.instruments.length} discovered)
+                All Trading &amp; Broker Pairs ({filteredInstruments.length} of {mergedInstruments.length} shown · {effectiveStatus.instruments.length} observed in Olymp)
               </h2>
               <p className="mt-1 text-xs text-[#82909D]">
-                Displays every unique broker-discovered pair dynamically. Only explicitly AVAILABLE pairs in SignalForge&apos;s 29-pair universe with ≥{MIN_ELIGIBLE_PAYOUT_PCT}% HIGH-confidence payout can generate signals.
+                Always displays all {FOREX_PAIRS.length} SignalForge pairs plus every unique Olymp-discovered instrument. Use <strong>Allow All {FOREX_PAIRS.length} Pairs</strong> above to trade all {FOREX_PAIRS.length} pairs immediately without waiting on the 7-tab bar.
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               {([
-                { id: 'ALL', label: `All (${effectiveStatus.instruments.length})` },
+                { id: 'ALL', label: `All (${mergedInstruments.length})` },
                 { id: 'ACTIVE', label: `Active (${counts.available})` },
-                { id: 'ELIGIBLE', label: `Eligible ≥${MIN_ELIGIBLE_PAYOUT_PCT}% (${counts.eligibleInUniverse})` },
-                { id: 'INELIGIBLE', label: `Blocked (${Math.max(0, effectiveStatus.instruments.length - counts.eligibleInUniverse)})` },
+                { id: 'ELIGIBLE', label: `Eligible ≥${MIN_ELIGIBLE_PAYOUT_PCT}% (${eligibleRowCount})` },
+                { id: 'INELIGIBLE', label: `Blocked (${Math.max(0, mergedInstruments.length - eligibleRowCount)})` },
                 { id: 'UNAVAILABLE', label: `Unavailable (${counts.unavailable})` },
               ] as Array<{ id: InstrumentFilter; label: string }>).map(tab => (
                 <button
@@ -371,7 +450,7 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
                   {tab.label}
                 </button>
               ))}
-              {!dataIsFresh && effectiveStatus.instruments.length > 0 && (
+              {!dataIsFresh && !allowAllPairsEnabled && effectiveStatus.instruments.length > 0 && (
                 <span className="flex items-center gap-1.5 text-[10px] font-mono text-[#C5A36A]">
                   <AlertTriangle className="h-3.5 w-3.5" /> STALE — values do not authorize signals
                 </span>
@@ -382,11 +461,11 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
               </div>
             </div>
           </div>
-          {effectiveStatus.instruments.length === 0 ? (
+          {filteredInstruments.length === 0 ? (
             <div className="p-8 text-center">
               <CircleHelp className="mx-auto h-7 w-7 text-[#82909D]" />
-              <p className="mt-3 text-sm font-semibold">No instrument data received</p>
-              <p className="mt-1 text-xs text-[#82909D]">Connect the extension and open the instrument list in Olymp Trade. Signal discovery stays paused.</p>
+              <p className="mt-3 text-sm font-semibold">No pairs match this filter</p>
+              <p className="mt-1 text-xs text-[#82909D]">Switch to All ({mergedInstruments.length}) to inspect all 29+ pairs.</p>
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -405,12 +484,18 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
                 <tbody>
                   {filteredInstruments.map(instrument => {
                     const tracked = configuredPairs.has(instrument.pair);
-                    const gate = getEligibilityNote(instrument, tracked, dataIsFresh);
+                    const gate = getEligibilityNote(instrument, tracked, dataIsFresh, allowAllPairsEnabled);
                     return (
-                      <tr key={instrument.pair} className={'border-t border-[#2B3949]' + (!dataIsFresh ? ' opacity-60' : '')}>
+                      <tr key={instrument.pair} className={'border-t border-[#2B3949]' + ((!dataIsFresh && !allowAllPairsEnabled) || (!instrument.inSnapshot && !allowAllPairsEnabled) ? ' opacity-75' : '')}>
                         <td className="px-4 py-3 font-mono font-bold text-[#E8E5DE]">{instrument.pair}</td>
                         <td className="px-4 py-3 text-[#AAB4BF]">
-                          {instrument.sourceType === 'MARKET_LIST' ? 'Market list' : instrument.sourceType === 'TAB' ? 'Chart tab' : 'Page UI'}
+                          {!instrument.inSnapshot
+                            ? (allowAllPairsEnabled ? 'All-29 Universe' : '29-Pair Research')
+                            : instrument.sourceType === 'MARKET_LIST'
+                            ? 'Market list'
+                            : instrument.sourceType === 'TAB'
+                            ? 'Chart tab'
+                            : 'Page UI'}
                         </td>
                         <td className="px-4 py-3">
                           {instrument.availability === 'AVAILABLE' ? (
@@ -418,7 +503,7 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
                           ) : instrument.availability === 'UNAVAILABLE' ? (
                             <span className="text-[#C67D83]">Unavailable</span>
                           ) : (
-                            <span className="text-[#82909D]">Not confirmed</span>
+                            <span className="text-[#82909D]">Not in tab bar</span>
                           )}
                         </td>
                         <td className="px-4 py-3 font-mono font-bold">
@@ -432,7 +517,7 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
                         </td>
                         <td className="px-4 py-3">
                           {instrument.evidence === 'HIGH' ? (
-                            <span className="inline-flex items-center gap-1"><Eye className="h-3 w-3 text-[#72A98B]" /> High · row payout</span>
+                            <span className="inline-flex items-center gap-1"><Eye className="h-3 w-3 text-[#72A98B]" /> {instrument.inSnapshot ? 'High · row payout' : 'Assumed · All 29'}</span>
                           ) : instrument.evidence === 'MEDIUM' ? (
                             <span className="text-[#C5A36A]">Medium · unverified</span>
                           ) : (

@@ -1264,6 +1264,18 @@ apiRouter.get('/broker/olymptrade/status', (_req: Request, res: Response) => {
   res.json(autonomousScheduler.getActiveTradingUniverse());
 });
 
+// POST /api/broker/olymptrade/policy — Allow trading all 29 configured pairs or strict Olymp Trade gating
+apiRouter.post('/broker/olymptrade/policy', (req: Request, res: Response) => {
+  try {
+    const allowAllPairs = Boolean(req.body?.allowAllPairs);
+    db.setAllowAllConfiguredPairs(allowAllPairs);
+    const universe = autonomousScheduler.getActiveTradingUniverse();
+    return res.json({ ok: true, allowAllPairs, ...universe });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // GET /api/bot-controls/pairs — Retrieve backend-persisted manual pair universe (used in AI Studio preview)
 apiRouter.get('/bot-controls/pairs', (_req: Request, res: Response) => {
   const tradingMode = autonomousScheduler.getTradingMode();

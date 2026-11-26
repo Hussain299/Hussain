@@ -202,13 +202,30 @@ export class AutonomousScheduler {
     return resolveRuntimeTradingMode();
   }
 
+  public isAllowAllPairsActive(): boolean {
+    return this.getTradingMode() === 'MANUAL_PAIRS' || db.getAllowAllConfiguredPairs();
+  }
+
   public getActiveTradingUniverse(nowMs: number = Date.now()): ActiveTradingUniverse {
+    const allowAllOverride = db.getAllowAllConfiguredPairs();
     if (this.getTradingMode() === 'MANUAL_PAIRS') {
-      return resolveManualTradingUniverse(db.getManualPairs(), nowMs);
+      return {
+        ...resolveManualTradingUniverse(db.getManualPairs(), nowMs),
+        allowAllPairs: allowAllOverride,
+      };
+    }
+    if (allowAllOverride) {
+      const manualUni = resolveManualTradingUniverse(FOREX_PAIRS, nowMs);
+      return {
+        ...manualUni,
+        allowAllPairs: true,
+        reason: `All-29 Pair Override active: scanning and trading all ${manualUni.liveCount} configured pairs.`,
+      };
     }
     return {
       ...resolveActiveTradingPairs(this.latestOlympTradeStatus, nowMs),
       tradingMode: 'OLYMP_TRADE',
+      allowAllPairs: false,
     };
   }
 
@@ -224,12 +241,12 @@ export class AutonomousScheduler {
         manualPairAuthorization?: { mode: 'MANUAL_ACTIVE'; pair: ForexSymbol; verifiedAtUtc: string };
       }
     | { authorized: false; reason: string } {
-    if (this.getTradingMode() === 'MANUAL_PAIRS') {
-      const manualPairs = db.getManualPairs();
-      if (!manualPairs.includes(symbol)) {
+    if (this.getTradingMode() === 'MANUAL_PAIRS' || db.getAllowAllConfiguredPairs()) {
+      const allowedList = this.getTradingMode() === 'MANUAL_PAIRS' ? db.getManualPairs() : FOREX_PAIRS;
+      if (!allowedList.includes(symbol)) {
         return {
           authorized: false,
-          reason: `${symbol} is disabled in AI Studio Manual Bot Controls.`,
+          reason: `${symbol} is disabled in Manual Bot Controls.`,
         };
       }
       return {

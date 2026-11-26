@@ -636,7 +636,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
       {/* ------------------------------------------------------------- */}
       {/* 1. TOP HEADER & 24/7 BACKGROUND STATUS BAR */}
       {/* ------------------------------------------------------------- */}
-      <header className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3 sticky top-16 z-20">
+      <header className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3 sticky top-24 z-20">
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
           {/* Left: Engine Identity & 24/7 Background Indicator */}
           <div className="flex flex-wrap items-center gap-2.5">

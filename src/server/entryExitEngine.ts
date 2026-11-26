@@ -139,8 +139,10 @@ export class EntryExitEngine {
         throw new Error(`BROKER_ELIGIBILITY_BLOCKED: ${params.symbol} is outside the configured 29-pair universe.`);
       }
       const hasValidOlympSnapshot = isValidBrokerEligibilitySnapshot(params.brokerEligibility, params.symbol);
+      const allowManualUniverse =
+        resolveRuntimeTradingMode() === 'MANUAL_PAIRS' || db.getAllowAllConfiguredPairs();
       const hasValidManualPreviewAuth =
-        resolveRuntimeTradingMode() === 'MANUAL_PAIRS' &&
+        allowManualUniverse &&
         params.manualPairAuthorization?.mode === 'MANUAL_ACTIVE' &&
         params.manualPairAuthorization.pair === params.symbol;
       if (!hasValidOlympSnapshot && !hasValidManualPreviewAuth) {

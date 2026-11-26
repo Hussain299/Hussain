@@ -200,7 +200,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
       {/* ------------------------------------------------------------- */}
       {/* HEADER & ISOLATED DATE LAYER SWITCHER */}
       {/* ------------------------------------------------------------- */}
-      <div className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3.5 sticky top-16 z-20">
+      <div className="border-b border-[#243040] bg-[#161F2B] px-4 lg:px-8 py-3.5 sticky top-24 z-20">
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4 text-xs font-mono">
           {/* Left: Section Title & Isolated Layer Tabs */}
           <div className="flex flex-wrap items-center gap-2">

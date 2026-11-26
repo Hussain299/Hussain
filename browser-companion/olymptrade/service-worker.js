@@ -1,5 +1,7 @@
 const STORAGE_KEY = 'signalforgeOlympTradeSnapshot';
+const CATALOG_STORAGE_KEY = 'signalforgeOlympMarketCatalog';
 const MAX_AGE_MS = 45_000;
+const CATALOG_RETENTION_MS = 4 * 60 * 60_000;
 const SIGNALFORGE_PROD_SNAPSHOT_URL = 'https://signalforge-ml.ai.studio/api/broker/olymptrade/snapshot';
 const PUSH_MIN_INTERVAL_MS = 12_000;
 const ALARM_NAME = 'signalforgeOlympKeepalive';
@@ -134,13 +136,71 @@ async function makeStatus() {
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   try {
-    const stored = await chrome.storage.local.get(STORAGE_KEY);
+    const stored = await chrome.storage.local.get([STORAGE_KEY, CATALOG_STORAGE_KEY]);
     const snapshot = stored[STORAGE_KEY];
     if (snapshot && snapshot.tabId === tabId) {
       await chrome.storage.local.remove(STORAGE_KEY);
     }
+    const catalog = stored[CATALOG_STORAGE_KEY];
+    if (catalog && catalog.tabId === tabId) {
+      await chrome.storage.local.remove(CATALOG_STORAGE_KEY);
+    }
   } catch {}
 });
+
+async function mergeWithPersistentCatalog(snapshot) {
+  const nowMs = Date.now();
+  if (snapshot.sessionState === 'LOGIN_REQUIRED') {
+    await chrome.storage.local.remove(CATALOG_STORAGE_KEY);
+    return snapshot;
+  }
+  if (snapshot.sessionState !== 'READY') {
+    return snapshot;
+  }
+
+  const stored = await chrome.storage.local.get(CATALOG_STORAGE_KEY);
+  const existing = stored[CATALOG_STORAGE_KEY];
+  const entries =
+    existing && existing.tabId === snapshot.tabId && existing.entries && typeof existing.entries === 'object'
+      ? { ...existing.entries }
+      : {};
+
+  for (const [pair, item] of Object.entries(entries)) {
+    if (!item || typeof item.seenAt !== 'number' || nowMs - item.seenAt > CATALOG_RETENTION_MS) {
+      delete entries[pair];
+    }
+  }
+
+  const hasMarketListScan =
+    snapshot.instruments.length > 10 ||
+    snapshot.instruments.some(row => row.sourceType === 'MARKET_LIST');
+
+  for (const row of snapshot.instruments) {
+    if (row.sourceType === 'MARKET_LIST' || (hasMarketListScan && row.sourceType !== 'TAB')) {
+      entries[row.pair] = { row, seenAt: nowMs };
+    } else if (entries[row.pair]) {
+      // Refresh status/payout if this pair is also pinned in a live chart tab
+      entries[row.pair] = { row: { ...entries[row.pair].row, ...row }, seenAt: nowMs };
+    }
+  }
+
+  await chrome.storage.local.set({
+    [CATALOG_STORAGE_KEY]: { tabId: snapshot.tabId, updatedAt: nowMs, entries },
+  });
+
+  const mergedByPair = new Map();
+  for (const row of snapshot.instruments) {
+    mergedByPair.set(row.pair, row);
+  }
+  for (const [pair, entry] of Object.entries(entries)) {
+    if (!mergedByPair.has(pair) && entry && entry.row) {
+      mergedByPair.set(pair, entry.row);
+    }
+  }
+
+  const mergedInstruments = Array.from(mergedByPair.values()).sort((a, b) => a.pair.localeCompare(b.pair));
+  return { ...snapshot, instruments: mergedInstruments };
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
@@ -151,15 +211,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'UNTRUSTED_SOURCE' });
       return false;
     }
-    const snapshot = cleanSnapshot(message.payload, sender.tab.id);
-    if (!snapshot) { sendResponse({ ok: false, error: 'INVALID_SNAPSHOT' }); return false; }
-    chrome.storage.local.set({ [STORAGE_KEY]: snapshot }).then(
-      () => {
-        void pushStatusToServer(snapshot.instruments.length > 0 && snapshot.sessionState === 'READY');
-        sendResponse({ ok: true });
-      },
-      () => sendResponse({ ok: false, error: 'STORAGE_FAILED' })
-    );
+    const rawSnapshot = cleanSnapshot(message.payload, sender.tab.id);
+    if (!rawSnapshot) { sendResponse({ ok: false, error: 'INVALID_SNAPSHOT' }); return false; }
+    mergeWithPersistentCatalog(rawSnapshot)
+      .then((snapshot) =>
+        chrome.storage.local.set({ [STORAGE_KEY]: snapshot }).then(() => snapshot)
+      )
+      .then(
+        (snapshot) => {
+          void pushStatusToServer(snapshot.instruments.length > 0 && snapshot.sessionState === 'READY');
+          sendResponse({ ok: true });
+        },
+        () => sendResponse({ ok: false, error: 'STORAGE_FAILED' })
+      );
     return true;
   }
 

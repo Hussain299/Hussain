@@ -3048,18 +3048,21 @@ export async function runAllVerificationTests(): Promise<{
     const { autonomousScheduler } = await import('./scheduler.js');
     const { hasFreshRealProviderCandles, getFreshRealCandleWindow } = await import('./dataFeeds.js');
 
-    // 1. Verify companion v1.3.1 manifest, pair format support, and drawer/tab retention logic
+    // 1. Verify companion v1.3.3 manifest, pair format support, and drawer/tab retention logic
     const manifest = JSON.parse(fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/manifest.json'), 'utf-8'));
-    if (manifest.version !== '1.3.1') {
-      throw new Error(`Expected companion manifest version 1.3.1, got ${manifest.version}`);
+    if (manifest.version !== '1.3.3') {
+      throw new Error(`Expected companion manifest version 1.3.3, got ${manifest.version}`);
     }
     const companionSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/content/olymptrade.js'), 'utf-8');
+    const swSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/service-worker.js'), 'utf-8');
     if (
       !companionSrc.includes('MARKET_DISCOVERY_RETENTION_MS') ||
       !companionSrc.includes('[/⁄\\-_]') ||
-      !companionSrc.includes('if (!force && document.hidden) return;')
+      !companionSrc.includes('if (!force && document.hidden) return;') ||
+      !companionSrc.includes('uniquePercentages') ||
+      !swSrc.includes('CATALOG_STORAGE_KEY')
     ) {
-      throw new Error('Companion script missing drawer retention, multi-separator normalization, or tab-switch guard');
+      throw new Error('Companion script missing drawer retention, multi-separator normalization, tab-switch guard, or persistent catalog');
     }
 
     // 2. Verify synthetic fallback candles never pass real-market freshness checks
@@ -3240,10 +3243,56 @@ export async function runAllVerificationTests(): Promise<{
       if (!blockedManualInProd) {
         throw new Error('Published OLYMP_TRADE mode must never accept manualPairAuthorization');
       }
+
+      // 4. Explicit Allow All 29 Pairs policy toggle in OLYMP_TRADE production enables all 29 pairs & restores fail-closed when disabled
+      const appPolicy = expressMod.default();
+      appPolicy.use(expressMod.default.json());
+      appPolicy.use('/api', apiRouter);
+      const serverPolicy = httpMod.createServer(appPolicy);
+      await new Promise<void>(resolve => serverPolicy.listen(0, '127.0.0.1', resolve));
+      try {
+        const addr = serverPolicy.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+        const enableRes = await fetch(`${baseUrl}/api/broker/olymptrade/policy`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ allowAllPairs: true }),
+        }).then(r => r.json());
+        if (!enableRes.ok || !enableRes.allowAllPairs || enableRes.mode !== 'MANUAL_ACTIVE' || enableRes.liveCount !== 29) {
+          throw new Error(`Expected allowAllPairs=true to unlock all 29 pairs: ${JSON.stringify(enableRes)}`);
+        }
+        const sigAll29 = entryExitEngine.createResearchSignal({
+          symbol: 'GBP/NZD',
+          direction: 'SELL',
+          signalCandle: { ...candle, symbol: 'GBP/NZD' },
+          ruleFamily: 'momentum_5',
+          expiryMinutes: 5,
+          confidence: 0.78,
+          manualPairAuthorization: {
+            mode: 'MANUAL_ACTIVE',
+            pair: 'GBP/NZD',
+            verifiedAtUtc: new Date(nowMs).toISOString(),
+          },
+          modelVersion: 'vTest',
+        });
+        if (!sigAll29?.id) throw new Error('Expected signal creation for 29th-universe pair when allowAllPairs=true');
+
+        const disableRes = await fetch(`${baseUrl}/api/broker/olymptrade/policy`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ allowAllPairs: false }),
+        }).then(r => r.json());
+        if (!disableRes.ok || disableRes.allowAllPairs || disableRes.mode !== 'OLYMP_WAITING_FOR_SNAPSHOT') {
+          throw new Error(`Expected allowAllPairs=false to restore OLYMP_WAITING_FOR_SNAPSHOT: ${JSON.stringify(disableRes)}`);
+        }
+      } finally {
+        await new Promise<void>(resolve => serverPolicy.close(() => resolve()));
+      }
     } finally {
       if (prevMode === undefined) delete process.env.SIGNALFORGE_TRADING_MODE;
       else process.env.SIGNALFORGE_TRADING_MODE = prevMode;
       db.saveManualPairs(prevManual);
+      db.setAllowAllConfiguredPairs(false);
     }
   });
 

@@ -35,6 +35,7 @@ export interface EligiblePairDetail {
 export interface ActiveTradingUniverse {
   mode: OlympTradeUniverseMode;
   tradingMode?: RuntimeTradingMode;
+  allowAllPairs?: boolean;
   pairs: ForexSymbol[];
   liveCount: number;
   capturedAt: string | null;

@@ -69,6 +69,7 @@ interface DatabaseSchema {
   shadowComparison?: ShadowModeComparison;
   telegramConfig?: TelegramConfig;
   manualPairs?: ForexSymbol[];
+  allowAllConfiguredPairs?: boolean;
   cronState: {
     lastRun: string | null;
     nextRun: string | null;
@@ -2346,6 +2347,16 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
     this.state.manualPairs = sanitized;
     this.scheduleSave('high');
     return [...sanitized];
+  }
+
+  public getAllowAllConfiguredPairs(): boolean {
+    return this.state.allowAllConfiguredPairs === true;
+  }
+
+  public setAllowAllConfiguredPairs(allow: boolean): boolean {
+    this.state.allowAllConfiguredPairs = Boolean(allow);
+    this.scheduleSave('high');
+    return this.state.allowAllConfiguredPairs;
   }
 }
 
