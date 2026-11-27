@@ -361,11 +361,20 @@
     }
     // Retain discovered market-list pairs and their observed evidence across scrolling,
     // drawer close, and tab switches so SignalForge does not collapse back to the ~7 pinned tabs.
+    const instrumentPriority = row =>
+      (row.sourceType === 'MARKET_LIST' ? 40 : row.sourceType === 'TAB' ? 10 : 0) +
+      (row.payoutPct !== null ? 100 : 0) +
+      (row.evidence === 'HIGH' ? 20 : row.evidence === 'MEDIUM' ? 10 : 0) +
+      (row.availability === 'AVAILABLE' ? 5 : 0);
+
     for (const [pair, entry] of virtualMarketListCache.entries()) {
       if (nowMs - entry.seenAt > MARKET_DISCOVERY_RETENTION_MS) {
         virtualMarketListCache.delete(pair);
-      } else if (!found.has(pair)) {
-        found.set(pair, entry.row);
+      } else {
+        const existing = found.get(pair);
+        if (!existing || instrumentPriority(entry.row) > instrumentPriority(existing)) {
+          found.set(pair, entry.row);
+        }
       }
     }
 
@@ -420,6 +429,7 @@
     const instruments = readInstruments();
     const nowMs = Date.now();
     if (
+      !force &&
       document.hidden &&
       !hasOpenMarketListContainer() &&
       instruments.length < lastRichInstrumentCount &&

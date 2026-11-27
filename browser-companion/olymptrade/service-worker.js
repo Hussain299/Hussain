@@ -179,8 +179,18 @@ async function mergeWithPersistentCatalog(snapshot) {
     if (row.sourceType === 'MARKET_LIST' || (hasMarketListScan && row.sourceType !== 'TAB')) {
       entries[row.pair] = { row, seenAt: nowMs };
     } else if (entries[row.pair]) {
-      // Refresh status/payout if this pair is also pinned in a live chart tab
-      entries[row.pair] = { row: { ...entries[row.pair].row, ...row }, seenAt: nowMs };
+      // Never let a bare TAB entry with null payout / lower score downgrade cached MARKET_LIST payout or evidence
+      const prevRow = entries[row.pair].row;
+      const mergedRow =
+        instrumentScore(row) >= instrumentScore(prevRow)
+          ? row
+          : {
+              ...prevRow,
+              availability: row.availability !== 'UNKNOWN' ? row.availability : prevRow.availability,
+              payoutPct: row.payoutPct !== null ? row.payoutPct : prevRow.payoutPct,
+              evidence: row.payoutPct !== null && row.evidence !== 'NONE' ? row.evidence : prevRow.evidence,
+            };
+      entries[row.pair] = { row: mergedRow, seenAt: nowMs };
     }
   }
 
@@ -193,7 +203,9 @@ async function mergeWithPersistentCatalog(snapshot) {
     mergedByPair.set(row.pair, row);
   }
   for (const [pair, entry] of Object.entries(entries)) {
-    if (!mergedByPair.has(pair) && entry && entry.row) {
+    if (!entry || !entry.row) continue;
+    const current = mergedByPair.get(pair);
+    if (!current || instrumentScore(entry.row) > instrumentScore(current)) {
       mergedByPair.set(pair, entry.row);
     }
   }
@@ -201,6 +213,8 @@ async function mergeWithPersistentCatalog(snapshot) {
   const mergedInstruments = Array.from(mergedByPair.values()).sort((a, b) => a.pair.localeCompare(b.pair));
   return { ...snapshot, instruments: mergedInstruments };
 }
+
+let snapshotWriteQueue = Promise.resolve();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
@@ -213,7 +227,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     const rawSnapshot = cleanSnapshot(message.payload, sender.tab.id);
     if (!rawSnapshot) { sendResponse({ ok: false, error: 'INVALID_SNAPSHOT' }); return false; }
-    mergeWithPersistentCatalog(rawSnapshot)
+    // Serialize storage read-modify-write ops to prevent interleaved observer/scroll bursts dropping pairs
+    snapshotWriteQueue = snapshotWriteQueue
+      .catch(() => undefined)
+      .then(() => mergeWithPersistentCatalog(rawSnapshot))
       .then((snapshot) =>
         chrome.storage.local.set({ [STORAGE_KEY]: snapshot }).then(() => snapshot)
       )

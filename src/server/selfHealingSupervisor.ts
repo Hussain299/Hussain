@@ -136,33 +136,48 @@ export class SelfHealingSupervisor {
       ) {
         const endMs = Date.parse(sig.entryWindowEndUtc);
         if (Number.isFinite(endMs) && nowMs - endMs > STALE_WAITING_GRACE_MS) {
-          sig.lifecycleState = 'EXPIRED';
-          sig.outcomeResult = 'CANCELLED';
-          sig.lifecycleHistory = Array.isArray(sig.lifecycleHistory) ? sig.lifecycleHistory : [];
-          sig.lifecycleHistory.push({
+          const prevState = sig.lifecycleState;
+          const nextHistory = Array.isArray(sig.lifecycleHistory) ? [...sig.lifecycleHistory] : [];
+          nextHistory.push({
             timestamp: new Date(nowMs).toISOString(),
-            fromState: 'WAITING_FOR_ENTRY',
+            fromState: prevState,
             toState: 'EXPIRED',
             reason: '[SelfHealer] Entry window elapsed without fill confirmation; marked EXPIRED unscored.',
           });
-          db.updateSignal(sig);
+          db.updateSignal({
+            ...sig,
+            lifecycleState: 'EXPIRED',
+            outcomeResult: 'CANCELLED',
+            lifecycleHistory: nextHistory,
+          });
           zombieCount += 1;
         }
       }
 
       // 2b. Closed WIN/LOSS trade missing binary netReturnUnits
+      const rawPayout = sig.payoutPct ?? DEFAULT_BINARY_PAYOUT_PERCENT;
+      const validPayout =
+        typeof rawPayout === 'number' && Number.isFinite(rawPayout) && rawPayout >= 50 && rawPayout <= 100
+          ? rawPayout
+          : DEFAULT_BINARY_PAYOUT_PERCENT;
       if (
         sig.lifecycleState === 'CLOSED' &&
         (sig.outcomeResult === 'WIN' || sig.outcomeResult === 'LOSS' || sig.outcomeResult === 'SCRATCH') &&
         (sig.netReturnUnits === null || sig.netReturnUnits === undefined || !Number.isFinite(sig.netReturnUnits)) &&
         typeof sig.actualEntryPrice === 'number' &&
-        typeof sig.actualExitPrice === 'number'
+        Number.isFinite(sig.actualEntryPrice) &&
+        sig.actualEntryPrice > 0 &&
+        typeof sig.actualExitPrice === 'number' &&
+        Number.isFinite(sig.actualExitPrice) &&
+        sig.actualExitPrice > 0
       ) {
-        const payout = sig.payoutPct ?? DEFAULT_BINARY_PAYOUT_PERCENT;
-        const settlement = calculateBinarySettlement(sig.direction, sig.actualEntryPrice, sig.actualExitPrice, payout);
-        sig.netReturnUnits = settlement.netReturnUnits;
-        sig.outcomeResult = settlement.outcome;
-        db.updateSignal(sig);
+        const settlement = calculateBinarySettlement(sig.direction, sig.actualEntryPrice, sig.actualExitPrice, validPayout);
+        db.updateSignal({
+          ...sig,
+          payoutPct: validPayout,
+          netReturnUnits: settlement.netReturnUnits,
+          outcomeResult: settlement.outcome,
+        });
         settlementRepairedCount += 1;
       }
     }
@@ -323,6 +338,8 @@ export class SelfHealingSupervisor {
     this.latestInvariants = invariants;
     const overallStatus: SelfHealCheckStatus = invariants.some((i) => i.status === 'REPAIRED')
       ? 'REPAIRED'
+      : invariants.some((i) => i.status === 'WARNING')
+      ? 'WARNING'
       : 'HEALTHY';
 
     return this.getReport(overallStatus);
@@ -331,7 +348,11 @@ export class SelfHealingSupervisor {
   public getReport(statusOverride?: SelfHealCheckStatus): SelfHealReport {
     const status =
       statusOverride ||
-      (this.latestInvariants.some((i) => i.status === 'REPAIRED') ? 'REPAIRED' : 'HEALTHY');
+      (this.latestInvariants.some((i) => i.status === 'REPAIRED')
+        ? 'REPAIRED'
+        : this.latestInvariants.some((i) => i.status === 'WARNING')
+        ? 'WARNING'
+        : 'HEALTHY');
     return {
       status,
       lastScanAtUtc: this.lastScanAtUtc || new Date().toISOString(),

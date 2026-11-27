@@ -341,13 +341,16 @@ export class DataFeedEngine {
         candles = this.generateRealisticHistoricalCandles(symbol, limit);
         activeSource = 'synthetic';
       }
+      candles = this.validateAndDeduplicate(candles);
     } else {
-      // Ensure returned API candles extend up to current live time
-      candles = this.bridgeToCurrentTime(symbol, candles, limit);
+      // Audit quality & sort chronologically BEFORE bridging up to live time
+      candles = this.validateAndDeduplicate(candles);
+      if (candles.length > 0) {
+        candles = this.validateAndDeduplicate(this.bridgeToCurrentTime(symbol, candles, limit));
+      }
     }
 
-    // Audit quality, sort chronologically, remove duplicates
-    const validated = this.validateAndDeduplicate(candles);
+    const validated = candles;
     const qualityScore = this.calculateQualityScore(validated);
 
     // Save ONLY real market candles to persistent database (never persist random synthetic continuity candles)
@@ -368,47 +371,67 @@ export class DataFeedEngine {
   }
 
   private normalizeBiquote(symbol: ForexSymbol, raw: any[]): Candle[] {
-    return raw
-      .map(item => {
-        const timeVal = item.time || item.timestamp || item.t;
-        const tsMs = typeof timeVal === 'number' ? (timeVal < 10000000000 ? timeVal * 1000 : timeVal) : Date.parse(timeVal);
-        return {
-          symbol,
-          timestamp: new Date(tsMs).toISOString(),
-          timestampMs: tsMs,
-          open: Number(item.open || item.o),
-          high: Number(item.high || item.h),
-          low: Number(item.low || item.l),
-          close: Number(item.close || item.c),
-          volume: Number(item.volume || item.v || 100),
-          source: 'biquote' as const,
-        };
-      })
-      .filter(c => !isNaN(c.timestampMs) && !isNaN(c.close) && c.high >= c.low);
+    const out: Candle[] = [];
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const timeVal = item.time ?? item.timestamp ?? item.t;
+      const tsMs = typeof timeVal === 'number' ? (timeVal < 10000000000 ? timeVal * 1000 : timeVal) : Date.parse(String(timeVal || ''));
+      if (!Number.isFinite(tsMs) || tsMs <= 0) continue;
+      const d = new Date(tsMs);
+      if (!Number.isFinite(d.getTime())) continue;
+      const open = Number(item.open ?? item.o);
+      const high = Number(item.high ?? item.h);
+      const low = Number(item.low ?? item.l);
+      const close = Number(item.close ?? item.c);
+      const volume = Number(item.volume ?? item.v ?? 100);
+      if (![open, high, low, close].every(v => Number.isFinite(v) && v > 0) || high < low) continue;
+      out.push({
+        symbol,
+        timestamp: d.toISOString(),
+        timestampMs: tsMs,
+        open,
+        high,
+        low,
+        close,
+        volume: Number.isFinite(volume) && volume >= 0 ? volume : 100,
+        source: 'biquote' as const,
+      });
+    }
+    return out;
   }
 
   private normalizeDukascopy(symbol: ForexSymbol, raw: any[]): Candle[] {
-    return raw
-      .map(item => {
-        const tsMs = typeof item.time === 'number' ? (item.time < 10000000000 ? item.time * 1000 : item.time) : Date.parse(item.time);
-        return {
-          symbol,
-          timestamp: new Date(tsMs).toISOString(),
-          timestampMs: tsMs,
-          open: Number(item.open),
-          high: Number(item.high),
-          low: Number(item.low),
-          close: Number(item.close),
-          volume: Number(item.volume || 100),
-          source: 'dukascopy' as const,
-        };
-      })
-      .filter(c => !isNaN(c.timestampMs) && !isNaN(c.close));
+    const out: Candle[] = [];
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const tsMs = typeof item.time === 'number' ? (item.time < 10000000000 ? item.time * 1000 : item.time) : Date.parse(String(item.time || ''));
+      if (!Number.isFinite(tsMs) || tsMs <= 0) continue;
+      const d = new Date(tsMs);
+      if (!Number.isFinite(d.getTime())) continue;
+      const open = Number(item.open);
+      const high = Number(item.high);
+      const low = Number(item.low);
+      const close = Number(item.close);
+      const volume = Number(item.volume ?? 100);
+      if (![open, high, low, close].every(v => Number.isFinite(v) && v > 0) || high < low) continue;
+      out.push({
+        symbol,
+        timestamp: d.toISOString(),
+        timestampMs: tsMs,
+        open,
+        high,
+        low,
+        close,
+        volume: Number.isFinite(volume) && volume >= 0 ? volume : 100,
+        source: 'dukascopy' as const,
+      });
+    }
+    return out;
   }
 
   private normalizeYahoo(symbol: ForexSymbol, chartResult: any): Candle[] {
-    const timestamps = chartResult.timestamp || [];
-    const quote = chartResult.indicators?.quote?.[0] || {};
+    const timestamps = chartResult?.timestamp || [];
+    const quote = chartResult?.indicators?.quote?.[0] || {};
     const opens = quote.open || [];
     const highs = quote.high || [];
     const lows = quote.low || [];
@@ -417,20 +440,30 @@ export class DataFeedEngine {
 
     const candles: Candle[] = [];
     for (let i = 0; i < timestamps.length; i++) {
-      if (closes[i] !== null && closes[i] !== undefined && !isNaN(closes[i])) {
-        const tsMs = timestamps[i] * 1000;
-        candles.push({
-          symbol,
-          timestamp: new Date(tsMs).toISOString(),
-          timestampMs: tsMs,
-          open: Number(opens[i] ?? closes[i]),
-          high: Number(highs[i] ?? closes[i]),
-          low: Number(lows[i] ?? closes[i]),
-          close: Number(closes[i]),
-          volume: Number(volumes[i] || 150),
-          source: 'yahoo' as const,
-        });
+      const tsSec = Number(timestamps[i]);
+      const closeVal = Number(closes[i]);
+      if (!Number.isFinite(tsSec) || tsSec <= 0 || closes[i] === null || closes[i] === undefined || !Number.isFinite(closeVal) || closeVal <= 0) {
+        continue;
       }
+      const tsMs = tsSec * 1000;
+      const d = new Date(tsMs);
+      if (!Number.isFinite(d.getTime())) continue;
+      const open = Number(opens[i] ?? closeVal);
+      const high = Number(highs[i] ?? closeVal);
+      const low = Number(lows[i] ?? closeVal);
+      if (![open, high, low].every(v => Number.isFinite(v) && v > 0)) continue;
+      const vol = Number(volumes[i] ?? 150);
+      candles.push({
+        symbol,
+        timestamp: d.toISOString(),
+        timestampMs: tsMs,
+        open,
+        high,
+        low,
+        close: closeVal,
+        volume: Number.isFinite(vol) && vol >= 0 ? vol : 150,
+        source: 'yahoo' as const,
+      });
     }
     return candles;
   }
@@ -439,11 +472,12 @@ export class DataFeedEngine {
     const map = new Map<number, Candle>();
     for (const c of candles) {
       if (
-        !isNaN(c.timestampMs) &&
-        !isNaN(c.open) &&
-        !isNaN(c.high) &&
-        !isNaN(c.low) &&
-        !isNaN(c.close) &&
+        Number.isFinite(c.timestampMs) &&
+        c.timestampMs > 0 &&
+        Number.isFinite(c.open) && c.open > 0 &&
+        Number.isFinite(c.high) && c.high > 0 &&
+        Number.isFinite(c.low) && c.low > 0 &&
+        Number.isFinite(c.close) && c.close > 0 &&
         c.high >= c.low &&
         c.high >= c.open &&
         c.high >= c.close &&
@@ -602,6 +636,12 @@ export function isForexMarketOpen(timestampUtc: string | Date | number = new Dat
   nextOpenIst?: string;
 } {
   const d = new Date(timestampUtc);
+  if (!Number.isFinite(d.getTime())) {
+    return {
+      isOpen: false,
+      statusText: 'Invalid timestamp; treating market as closed.',
+    };
+  }
   const day = d.getUTCDay(); // 0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat
   const hour = d.getUTCHours();
 

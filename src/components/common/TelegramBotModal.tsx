@@ -202,10 +202,12 @@ export const TelegramBotModal: React.FC<TelegramBotModalProps> = ({ isOpen, onCl
     if (!confirm('Remove this subscriber from receiving Telegram signals?')) return;
     try {
       const res = await fetch(`/api/telegram/subscribers/${id}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (data.success) {
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
         setStatusMessage({ text: 'Subscriber removed.', type: 'info' });
         await fetchStatus();
+      } else {
+        setStatusMessage({ text: data.error || `Failed to remove subscriber (${res.status}).`, type: 'error' });
       }
     } catch (err: any) {
       setStatusMessage({ text: err.message, type: 'error' });
@@ -226,10 +228,12 @@ export const TelegramBotModal: React.FC<TelegramBotModalProps> = ({ isOpen, onCl
           minConfidence,
         }),
       });
-      const data = await res.json();
-      if (data.success) {
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
         setStatusMessage({ text: 'Notification preferences updated.', type: 'success' });
         await fetchStatus();
+      } else {
+        setStatusMessage({ text: data.error || `Failed to update settings (${res.status}).`, type: 'error' });
       }
     } catch (err: any) {
       setStatusMessage({ text: err.message, type: 'error' });

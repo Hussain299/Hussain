@@ -15,7 +15,7 @@ class SoundNotificationService {
       }
     }
     if (this.audioCtx && this.audioCtx.state === 'suspended') {
-      this.audioCtx.resume();
+      void this.audioCtx.resume().catch(() => {});
     }
     return this.audioCtx;
   }
@@ -69,7 +69,7 @@ class SoundNotificationService {
   public requestPermission() {
     if (typeof window !== 'undefined' && 'Notification' in window) {
       if (Notification.permission === 'default') {
-        Notification.requestPermission();
+        void Notification.requestPermission().catch(() => {});
       }
     }
   }
@@ -83,7 +83,7 @@ class SoundNotificationService {
         try {
           new Notification(title, {
             body,
-            icon: '/favicon.ico',
+            icon: '/pwa-192x192.png',
           });
         } catch {
           // Ignore

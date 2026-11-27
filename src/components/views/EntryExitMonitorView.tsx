@@ -11,7 +11,9 @@ export const EntryExitMonitorView: React.FC<EntryExitMonitorViewProps> = ({ sign
     signals[0] || null
   );
 
-  const sig = selectedSignal || signals[0];
+  const sig =
+    (selectedSignal ? signals.find(s => s.id === selectedSignal.id) || selectedSignal : null) ||
+    signals[0];
 
   const formatIST = (timestampStr?: string) => {
     if (!timestampStr) return '--:--:-- IST';

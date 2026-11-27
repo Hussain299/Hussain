@@ -221,7 +221,11 @@ export function computeBotPerformance(
     ? optionalSignals
     : [];
 
-  const safeSignals = signals.filter(Boolean);
+  const byId = new Map<string, ResearchSignal>();
+  for (const s of signals) {
+    if (s?.id) byId.set(s.id, s);
+  }
+  const safeSignals = Array.from(byId.values());
   const accounting = summarizeSignalAccounting(safeSignals);
   const nowMs = Date.now();
   const activeTrades = safeSignals.filter(s => {

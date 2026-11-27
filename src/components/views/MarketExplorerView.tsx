@@ -21,25 +21,33 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [hoveredCandle, setHoveredCandle] = useState<Candle | null>(null);
 
-  const fetchPairData = async (symbol: ForexSymbol) => {
+  const fetchPairData = async (symbol: ForexSymbol, abortSignal?: AbortSignal) => {
     setIsLoading(true);
     try {
-      const res = await fetch(`/api/forex-candles?symbol=${symbol.replace('/', '')}&limit=80`);
-      if (res.ok) {
+      const res = await fetch(`/api/forex-candles?symbol=${symbol.replace('/', '')}&limit=80`, {
+        signal: abortSignal,
+      });
+      if (res.ok && !abortSignal?.aborted) {
         const data = await res.json();
         setCandles(data.candles || []);
         setActiveSource(data.source || 'biquote');
         setQualityScore(data.qualityScore || 90);
       }
-    } catch (e) {
-      console.error('Failed to fetch candles:', e);
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        console.error('Failed to fetch candles:', e);
+      }
     } finally {
-      setIsLoading(false);
+      if (!abortSignal?.aborted) {
+        setIsLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    fetchPairData(selectedPair);
+    const controller = new AbortController();
+    fetchPairData(selectedPair, controller.signal);
+    return () => controller.abort();
   }, [selectedPair]);
 
   const latestCandle = candles[candles.length - 1];
@@ -101,7 +109,7 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
         >
           {/* Horizontal Grid lines */}
           {[0.2, 0.4, 0.6, 0.8].map(ratio => {
-            const y = chartHeight * ratio;
+            const y = 20 + (chartHeight - 40) * ratio;
             const price = maxPrice - ratio * priceRange;
             return (
               <g key={ratio}>
@@ -260,41 +268,78 @@ export const MarketExplorerView: React.FC<MarketExplorerViewProps> = ({ provider
 
       {/* Provider Health Matrix & Architecture */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
-        <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
-          <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
-            <CheckCircle2 className="w-3.5 h-3.5 text-[#72A98B]" />
-            <span className="text-[#E8E5DE]">Tier 1 Provider: Biquote.io</span>
-          </div>
-          <p className="text-[#AAB4BF]">
-            Direct public forex endpoint (<code className="text-[#E8E5DE] bg-[#17212D] px-1 py-0.5 rounded">/api/symbol/ohlc</code>).
-            Unfinished candles stripped; timestamps converted to ISO IST.
-          </p>
-          <div className="text-[11px] text-[#72A98B] font-semibold">Status: Active / Monitored</div>
-        </div>
+        {(providers && providers.length > 0 ? providers.slice(0, 3) : null) ? (
+          providers.slice(0, 3).map(provider => {
+            const isHealthy = provider.status === 'ONLINE';
+            const isDegraded = provider.status === 'DEGRADED';
+            return (
+              <div
+                key={provider.provider}
+                className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2"
+              >
+                <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center justify-between gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <CheckCircle2
+                      className={`w-3.5 h-3.5 ${
+                        isHealthy ? 'text-[#72A98B]' : isDegraded ? 'text-[#C5A36A]' : 'text-[#B7797D]'
+                      }`}
+                    />
+                    <span className="text-[#E8E5DE]">{provider.provider}</span>
+                  </div>
+                  <span>{provider.latencyMs}ms</span>
+                </div>
+                <p className="text-[#AAB4BF]">
+                  Last success: {formatIST(provider.lastSuccess)} · Consecutive failures: {provider.consecutiveFailures}
+                </p>
+                <div
+                  className={`text-[11px] font-semibold ${
+                    isHealthy ? 'text-[#72A98B]' : isDegraded ? 'text-[#C5A36A]' : 'text-[#B7797D]'
+                  }`}
+                >
+                  Status: {provider.status}
+                </div>
+              </div>
+            );
+          })
+        ) : (
+          <>
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
+              <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5 text-[#72A98B]" />
+                <span className="text-[#E8E5DE]">Tier 1 Provider: Biquote.io</span>
+              </div>
+              <p className="text-[#AAB4BF]">
+                Direct public forex endpoint (<code className="text-[#E8E5DE] bg-[#17212D] px-1 py-0.5 rounded">/api/symbol/ohlc</code>).
+                Unfinished candles stripped; timestamps converted to ISO IST.
+              </p>
+              <div className="text-[11px] text-[#72A98B] font-semibold">Status: Standby / Monitoring</div>
+            </div>
 
-        <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
-          <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
-            <Activity className="w-3.5 h-3.5 text-[#C5A36A]" />
-            <span className="text-[#E8E5DE]">Tier 2 Fallback: Dukascopy</span>
-          </div>
-          <p className="text-[#AAB4BF]">
-            Dukascopy secondary feed with institutional bid/ask midpoints. Engages automatically if
-            Biquote exceeds 4s timeout.
-          </p>
-          <div className="text-[11px] text-[#AAB4BF]">Status: Standby Ready</div>
-        </div>
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
+              <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
+                <Activity className="w-3.5 h-3.5 text-[#C5A36A]" />
+                <span className="text-[#E8E5DE]">Tier 2 Fallback: Dukascopy</span>
+              </div>
+              <p className="text-[#AAB4BF]">
+                Dukascopy secondary feed with institutional bid/ask midpoints. Engages automatically if
+                Biquote exceeds 4s timeout.
+              </p>
+              <div className="text-[11px] text-[#AAB4BF]">Status: Standby Ready</div>
+            </div>
 
-        <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
-          <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
-            <Database className="w-3.5 h-3.5 text-[#6C9D91]" />
-            <span className="text-[#E8E5DE]">Tier 3 Fallback: Yahoo Finance</span>
-          </div>
-          <p className="text-[#AAB4BF]">
-            Chart v8 endpoint fallback. Handles weekend/session boundary fills with realistic
-            continuity engine.
-          </p>
-          <div className="text-[11px] text-[#AAB4BF]">Status: Standby Ready</div>
-        </div>
+            <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 text-xs font-mono space-y-2">
+              <div className="text-[#AAB4BF] uppercase text-[10px] tracking-wider font-semibold flex items-center gap-1.5">
+                <Database className="w-3.5 h-3.5 text-[#6C9D91]" />
+                <span className="text-[#E8E5DE]">Tier 3 Fallback: Yahoo Finance</span>
+              </div>
+              <p className="text-[#AAB4BF]">
+                Chart v8 endpoint fallback. Handles weekend/session boundary fills with realistic
+                continuity engine.
+              </p>
+              <div className="text-[11px] text-[#AAB4BF]">Status: Standby Ready</div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

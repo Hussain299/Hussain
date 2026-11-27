@@ -251,19 +251,61 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const isSyncRunningRef = useRef<boolean>(false);
   const lastHydratedKeyRef = useRef<string>('');
 
+  const activeUidRef = useRef<string | null>(null);
+
+  const ensureUserProfile = useCallback(async (currentUser: User): Promise<boolean> => {
+    const userPath = `users/${currentUser.uid}`;
+    try {
+      const userRef = doc(db, 'users', currentUser.uid);
+      const snap = await getDoc(userRef);
+      if (!snap.exists()) {
+        await setDoc(userRef, {
+          uid: currentUser.uid.slice(0, 128),
+          displayName: clampStr(currentUser.displayName || currentUser.email, 100, 'Trader'),
+          email: clampStr(currentUser.email, 200, 'trader@signalforge.app'),
+          role: 'trader',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      profileReadyRef.current = true;
+      setProfileReady(true);
+      setCloudStatusMessage(null);
+      return true;
+    } catch (error) {
+      if (isPermissionDeniedError(error)) {
+        try {
+          handleFirestoreError(error, OperationType.WRITE, userPath);
+        } catch {
+          setCloudStatusMessage('Cloud ledger write permission check failed; running with local backend ledger.');
+        }
+      } else {
+        // Transient offline/network hiccup — allow automatic retry on snapshot reconnect
+        console.warn('[FirebaseContext] Transient profile check error (continuing locally):', error);
+        setCloudStatusMessage('Cloud sync temporarily offline; local trade ledger remains active.');
+      }
+      return false;
+    }
+  }, []);
+
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async currentUser => {
+      const nextUid = currentUser?.uid || null;
+      if (activeUidRef.current !== nextUid) {
+        activeUidRef.current = nextUid;
+        setCloudSignals([]);
+        setCloudLedgerReady(false);
+        cloudMapRef.current.clear();
+        syncedStateFingerprintsRef.current.clear();
+        lastHydratedKeyRef.current = '';
+      }
+
       setUser(currentUser);
       setAuthReady(true);
       profileReadyRef.current = false;
       setProfileReady(false);
 
       if (!currentUser) {
-        setCloudSignals([]);
-        setCloudLedgerReady(false);
-        cloudMapRef.current.clear();
-        syncedStateFingerprintsRef.current.clear();
-        lastHydratedKeyRef.current = '';
         setCloudStatusMessage(null);
         return;
       }
@@ -273,45 +315,15 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         return;
       }
 
-      // Ensure user profile doc exists (required by Master Gate `exists(/users/{uid})`)
-      const userPath = `users/${currentUser.uid}`;
-      try {
-        const userRef = doc(db, 'users', currentUser.uid);
-        const snap = await getDoc(userRef);
-        if (!snap.exists()) {
-          await setDoc(userRef, {
-            uid: currentUser.uid.slice(0, 128),
-            displayName: clampStr(currentUser.displayName || currentUser.email, 100, 'Trader'),
-            email: clampStr(currentUser.email, 200, 'trader@signalforge.app'),
-            role: 'trader',
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
-        profileReadyRef.current = true;
-        setProfileReady(true);
-        setCloudStatusMessage(null);
-      } catch (error) {
-        if (isPermissionDeniedError(error)) {
-          try {
-            handleFirestoreError(error, OperationType.WRITE, userPath);
-          } catch {
-            setCloudStatusMessage('Cloud ledger write permission check failed; running with local backend ledger.');
-          }
-        } else {
-          // Transient offline/network hiccup — never crash the app on reload
-          console.warn('[FirebaseContext] Transient profile check error (continuing locally):', error);
-          setCloudStatusMessage('Cloud sync temporarily offline; local trade ledger remains active.');
-        }
-      }
+      await ensureUserProfile(currentUser);
     });
 
     return () => unsub();
-  }, []);
+  }, [ensureUserProfile]);
 
-  // Attach real-time Firestore listener ONLY when authenticated
+  // Attach real-time Firestore listener ONLY when authenticated and email-verified
   useEffect(() => {
-    if (!authReady || !user) return;
+    if (!authReady || !user || !user.emailVerified) return;
 
     const ledgerPath = `users/${user.uid}/tradeLedger`;
     const ledgerQuery = query(
@@ -322,6 +334,9 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const unsubscribe = onSnapshot(
       ledgerQuery,
       snapshot => {
+        if (!profileReadyRef.current) {
+          void ensureUserProfile(user);
+        }
         const nextList: ResearchSignal[] = [];
         const nextMap = new Map<string, ResearchSignal>();
 

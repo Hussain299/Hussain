@@ -1308,7 +1308,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 <Activity className="w-4 h-4 text-[#72A98B]" />
                 <span>Active &amp; Advance Signal Ledger</span>
               </h3>
-              {activeTrades.length === 0 && signalAlerts.length === 0 ? (
+              {activeTrades.length === 0 && signalAlerts.length === 0 && verifyingTrades.length === 0 ? (
                 <div className="bg-[#222B36] border border-[#354251] rounded-2xl p-8 text-center text-xs font-mono text-[#AAB4BF] space-y-3">
                   <Radio className="w-8 h-8 text-[#6C9D91] mx-auto animate-pulse" />
                   <div className="text-base font-black text-[#E8E5DE]">
@@ -1493,7 +1493,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                     onClick={() => setActiveLayer('YESTERDAY')}
                     className="px-3.5 py-2 rounded-lg bg-[#6C9D91] hover:bg-[#72A98B] text-[#17212D] text-xs font-black whitespace-nowrap transition-colors cursor-pointer"
                   >
-                    View Latest Completed Session ({latestCompletedSession.displayDate} · {latestCompletedSession.winRate}% WR) →
+                    View Latest Completed Session ({latestCompletedSession.displayDate} · {latestCompletedSession.winRate !== null ? `${latestCompletedSession.winRate}%` : '—'} WR) →
                   </button>
                 )}
               </div>
@@ -1535,7 +1535,7 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
                 </p>
                 <div className="flex flex-wrap items-center gap-3 pt-1">
                   <span className="px-2.5 py-1 rounded bg-[#17212D] text-[#72A98B] border border-[#72A98B]/40 font-bold">
-                    {latestCompletedSession.displayDate} · {latestCompletedSession.settledTrades.length} Trades · {latestCompletedSession.winRate}% Win Rate · {latestCompletedSession.netUnits >= 0 ? `+${latestCompletedSession.netUnits}` : latestCompletedSession.netUnits} U
+                    {latestCompletedSession.displayDate} · {latestCompletedSession.settledTrades.length} Trades · {latestCompletedSession.winRate !== null ? `${latestCompletedSession.winRate}% Win Rate` : 'Win Rate —'} · {latestCompletedSession.netUnits >= 0 ? `+${latestCompletedSession.netUnits}` : latestCompletedSession.netUnits} U
                   </span>
                   <button
                     onClick={() => setActiveLayer('DAILY_SESSIONS')}
@@ -2014,10 +2014,10 @@ export const SignalTerminalView: React.FC<SignalTerminalViewProps> = ({
               <div className="p-2 rounded-lg bg-[#17212D] border border-[#B7797D]/40">
                 <Trash2 className="w-5 h-5 text-[#B7797D]" />
               </div>
-              <h3 className="text-base font-bold text-[#E8E5DE]">Reset Today&apos;s Trade Counter?</h3>
+              <h3 className="text-base font-bold text-[#E8E5DE]">Clear Closed Signal History?</h3>
             </div>
             <p className="text-[#AAB4BF] leading-relaxed text-xs">
-              This resets today&apos;s trade list to 0. Yesterday&apos;s archive layer and historical statistics remain preserved.
+              This clears settled, expired, and cancelled signals from the terminal ledger while active contracts remain preserved.
             </p>
             <div className="flex items-center justify-end gap-3 pt-2">
               <button

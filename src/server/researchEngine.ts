@@ -118,15 +118,17 @@ export class ResearchEngine {
         upperWick / range,
         lowerWick / range,
         (ema9[i] - ema21[i]) * pipFactor,
-        (rsi14[i] || 50) / 100,
-        (atr14[i] || 0.0005) * pipFactor,
+        (rsi14[i] ?? 50) / 100,
+        (atr14[i] ?? 0.0005) * pipFactor,
         (candle.close - min20) / Math.max(0.00001, max20 - min20),
       ];
 
       const labels: Record<number, number> = {};
       const futureMoves: Record<number, number> = {};
       for (const horizon of horizons) {
-        const exitTime = entryTime + horizon * ONE_MIN_MS;
+        // Align with live settlement and prepareGeneResearchData: the final 1m candle inside
+        // an H-minute binary contract opens at entryTime + H*1m - 1m and closes at entryTime + H*1m.
+        const exitTime = entryTime + horizon * ONE_MIN_MS - ONE_MIN_MS;
         let exitIndex = entryIndex + 1;
         while (exitIndex < n && candles[exitIndex].timestampMs < exitTime) exitIndex++;
         if (exitIndex >= n || Math.abs(candles[exitIndex].timestampMs - exitTime) > 5_000) {
@@ -690,8 +692,8 @@ Policy: ${exp.auditorVerdict === 'ACCEPTED'
     const wickImbalance = (lowerWick - upperWick) / safeRange;
     const currentEmaSpread = ((ema9[index] ?? close) - (ema21[index] ?? close)) * pipFactor;
     const previousEmaSpread = ((ema9[Math.max(0, index - 1)] ?? close) - (ema21[Math.max(0, index - 1)] ?? close)) * pipFactor;
-    const currentRsi = rsi14[index] || 50;
-    const previousRsi = rsi14[Math.max(0, index - 3)] || currentRsi;
+    const currentRsi = Number.isFinite(rsi14[index]) ? rsi14[index] : 50;
+    const previousRsi = Number.isFinite(rsi14[Math.max(0, index - 3)]) ? rsi14[Math.max(0, index - 3)] : currentRsi;
 
     const absReturns: number[] = [];
     const returns: number[] = [];
@@ -1469,8 +1471,8 @@ Policy: ${exp.auditorVerdict === 'ACCEPTED'
     const lastEma21 = ema21[idx] || candle.close;
     const prevEma9 = ema9[Math.max(0, idx - 1)] || lastEma9;
     const prevEma21 = ema21[Math.max(0, idx - 1)] || lastEma21;
-    const lastRsi = rsi14[idx] || 50;
-    const prevRsi = rsi14[Math.max(0, idx - 1)] || 50;
+    const lastRsi = Number.isFinite(rsi14[idx]) ? rsi14[idx] : 50;
+    const prevRsi = Number.isFinite(rsi14[Math.max(0, idx - 1)]) ? rsi14[Math.max(0, idx - 1)] : lastRsi;
     const start = Math.max(0, idx - 19);
     const recentCloses = closes.slice(start, idx + 1);
     const sma20 = recentCloses.reduce((a, b) => a + b, 0) / Math.max(1, recentCloses.length);

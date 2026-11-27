@@ -15,7 +15,7 @@ export interface ServiceWorkerState {
   notificationPermission: NotificationPermission | 'default';
   lastPulseTime: string | null;
   pulsesCount: number;
-  lastHeartbeatStatus: 'HEALTHY' | 'SYNCING' | 'OFFLINE' | 'UNKNOWN';
+  lastHeartbeatStatus: 'HEALTHY' | 'SYNCING' | 'OFFLINE' | 'SERVER_ERROR' | 'UNKNOWN';
   version: string;
 }
 
@@ -77,9 +77,12 @@ class ServiceWorkerManager {
       this.state.isActive = !!reg.active;
       this.notify();
 
-      // Listen for controlling service worker changes
+      // Listen for controlling service worker changes and populate initial SW telemetry
       navigator.serviceWorker.addEventListener('controllerchange', () => {
         this.state.isActive = !!navigator.serviceWorker.controller;
+        if (this.state.isActive) {
+          this.ping();
+        }
         this.notify();
       });
 
@@ -150,12 +153,7 @@ class ServiceWorkerManager {
       this.state.lastHeartbeatStatus = 'SYNCING';
       this.notify();
 
-      // Trigger via active service worker if controlling
-      if (navigator.serviceWorker?.controller) {
-        navigator.serviceWorker.controller.postMessage({ type: 'FORCE_BACKGROUND_PULSE' });
-      }
-
-      // Also call direct pulse endpoint to ensure immediate feedback
+      // Call direct pulse endpoint for immediate feedback and single authoritative pulse
       const res = await fetch('/api/scheduler/pulse', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -166,11 +164,14 @@ class ServiceWorkerManager {
         this.state.lastHeartbeatStatus = 'HEALTHY';
         this.state.lastPulseTime = new Date().toISOString();
         this.state.pulsesCount++;
+        this.ping();
         this.notify();
         return true;
       }
+      this.state.lastHeartbeatStatus = 'SERVER_ERROR';
+      this.notify();
       return false;
-    } catch (err) {
+    } catch {
       this.state.lastHeartbeatStatus = 'OFFLINE';
       this.notify();
       return false;
@@ -179,10 +180,14 @@ class ServiceWorkerManager {
 
   public async requestNotificationPermission(): Promise<NotificationPermission> {
     if (typeof window !== 'undefined' && 'Notification' in window) {
-      const permission = await Notification.requestPermission();
-      this.state.notificationPermission = permission;
-      this.notify();
-      return permission;
+      try {
+        const permission = await Notification.requestPermission();
+        this.state.notificationPermission = permission;
+        this.notify();
+        return permission;
+      } catch {
+        return 'denied';
+      }
     }
     return 'denied';
   }

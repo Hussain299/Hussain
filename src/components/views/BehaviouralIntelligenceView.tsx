@@ -98,47 +98,57 @@ export const BehaviouralIntelligenceView: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshedIst, setLastRefreshedIst] = useState<string>('');
 
-  const fetchData = async () => {
+  const fetchData = async (abortSignal?: AbortSignal) => {
     try {
       // 1. Fetch Behavioral Assessment for selected pair
-      const hypRes = await fetch(`/api/behavioural/assessment?symbol=${encodeURIComponent(selectedPair)}`);
-      if (hypRes.ok) {
+      const hypRes = await fetch(`/api/behavioural/assessment?symbol=${encodeURIComponent(selectedPair)}`, {
+        signal: abortSignal,
+      });
+      if (hypRes.ok && !abortSignal?.aborted) {
         const hypData = await hypRes.json();
         setHypotheses(hypData.hypotheses || []);
         if (hypData.timestampIst) setLastRefreshedIst(hypData.timestampIst);
       }
 
       // 2. Fetch Bot Self-Monitoring Auditor State
-      const botRes = await fetch('/api/behavioural/bot-auditor');
-      if (botRes.ok) {
+      const botRes = await fetch('/api/behavioural/bot-auditor', { signal: abortSignal });
+      if (botRes.ok && !abortSignal?.aborted) {
         const botData = await botRes.json();
         setBotHealth(botData.botHealth || null);
       }
 
       // 3. Fetch Behavioral Memory Records
-      const memRes = await fetch('/api/behavioural/memory');
-      if (memRes.ok) {
+      const memRes = await fetch('/api/behavioural/memory', { signal: abortSignal });
+      if (memRes.ok && !abortSignal?.aborted) {
         const memData = await memRes.json();
         setMemoryRecords(memData.records || []);
       }
 
       // 4. Fetch Shadow Mode Comparison & Ablation Tests
-      const shadowRes = await fetch('/api/behavioural/shadow-comparison');
-      if (shadowRes.ok) {
+      const shadowRes = await fetch('/api/behavioural/shadow-comparison', { signal: abortSignal });
+      if (shadowRes.ok && !abortSignal?.aborted) {
         const shadowData = await shadowRes.json();
         setShadowComparison(shadowData.comparison || null);
       }
-    } catch (err) {
-      console.error('[BehaviouralIntelligenceView] Error loading data:', err);
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        console.error('[BehaviouralIntelligenceView] Error loading data:', err);
+      }
     } finally {
-      setIsLoading(false);
+      if (!abortSignal?.aborted) {
+        setIsLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 6000);
-    return () => clearInterval(interval);
+    const controller = new AbortController();
+    fetchData(controller.signal);
+    const interval = setInterval(() => fetchData(controller.signal), 6000);
+    return () => {
+      controller.abort();
+      clearInterval(interval);
+    };
   }, [selectedPair]);
 
   const activeHypothesesCount = hypotheses.filter(h => h.isActive).length;
@@ -174,7 +184,7 @@ export const BehaviouralIntelligenceView: React.FC = () => {
             <div className="text-xs text-[#E8E5DE] font-semibold mt-0.5">Timezone: Asia/Kolkata (IST)</div>
           </div>
           <button
-            onClick={fetchData}
+            onClick={() => fetchData()}
             className="p-2 rounded-lg bg-[#17212D] hover:bg-[#354251] text-[#AAB4BF] hover:text-[#E8E5DE] border border-[#354251] transition-colors"
             title="Refresh Behavioural Intelligence"
           >
@@ -229,9 +239,16 @@ export const BehaviouralIntelligenceView: React.FC = () => {
         >
           <Sliders className="w-3.5 h-3.5 text-[#72A98B]" />
           <span>Modules 4 &amp; 5: Shadow Mode &amp; Ablation Tests</span>
-          {shadowComparison?.calibrationImprovementPct ? (
-            <span className="px-1.5 py-0.2 rounded bg-[#72A98B]/15 text-[#72A98B] border border-[#72A98B]/40 text-[10px] font-mono">
-              +{shadowComparison.calibrationImprovementPct}% Brier
+          {shadowComparison && shadowComparison.calibrationImprovementPct !== 0 ? (
+            <span
+              className={`px-1.5 py-0.2 rounded text-[10px] font-mono border ${
+                shadowComparison.calibrationImprovementPct >= 0
+                  ? 'bg-[#72A98B]/15 text-[#72A98B] border-[#72A98B]/40'
+                  : 'bg-[#B7797D]/15 text-[#B7797D] border-[#B7797D]/40'
+              }`}
+            >
+              {shadowComparison.calibrationImprovementPct >= 0 ? '+' : ''}
+              {shadowComparison.calibrationImprovementPct}% Brier
             </span>
           ) : null}
         </button>
@@ -771,7 +788,7 @@ export const BehaviouralIntelligenceView: React.FC = () => {
                 <div className="p-4 rounded-xl bg-[#222B36] border border-[#354251] flex flex-col justify-between">
                   <span className="text-[11px] font-mono text-[#AAB4BF] uppercase">Baseline Win Rate</span>
                   <div className="text-xl font-bold font-mono text-[#E8E5DE] mt-1">
-                    {shadowComparison.baselineWinRate ? `${shadowComparison.baselineWinRate}%` : 'Evaluating'}
+                    {shadowComparison.baselineWinRate !== null ? `${shadowComparison.baselineWinRate}%` : 'Evaluating'}
                   </div>
                   <span className="text-[10px] font-mono text-[#AAB4BF] mt-1">
                     {shadowComparison.baselineTradesCount} trades
@@ -781,7 +798,7 @@ export const BehaviouralIntelligenceView: React.FC = () => {
                 <div className="p-4 rounded-xl bg-[#222B36] border border-[#6C9D91]/50 flex flex-col justify-between ring-1 ring-[#6C9D91]/20">
                   <span className="text-[11px] font-mono text-[#6C9D91] uppercase">Shadow Model Win Rate</span>
                   <div className="text-xl font-bold font-mono text-[#6C9D91] mt-1">
-                    {shadowComparison.shadowWinRate ? `${shadowComparison.shadowWinRate}%` : 'Evaluating'}
+                    {shadowComparison.shadowWinRate !== null ? `${shadowComparison.shadowWinRate}%` : 'Evaluating'}
                   </div>
                   <span className="text-[10px] font-mono text-[#AAB4BF] mt-1">
                     {shadowComparison.shadowTradesCount} trades
@@ -800,8 +817,9 @@ export const BehaviouralIntelligenceView: React.FC = () => {
 
                 <div className="p-4 rounded-xl bg-[#222B36] border border-[#354251] flex flex-col justify-between">
                   <span className="text-[11px] font-mono text-[#AAB4BF] uppercase">Brier Improvement</span>
-                  <div className="text-xl font-bold font-mono text-[#72A98B] mt-1">
-                    +{shadowComparison.calibrationImprovementPct}%
+                  <div className={`text-xl font-bold font-mono mt-1 ${shadowComparison.calibrationImprovementPct >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                    {shadowComparison.calibrationImprovementPct >= 0 ? '+' : ''}
+                    {shadowComparison.calibrationImprovementPct}%
                   </div>
                   <span className="text-[10px] font-mono text-[#AAB4BF] mt-1">
                     {shadowComparison.brierScoreBaseline} → {shadowComparison.brierScoreShadow}
@@ -823,7 +841,7 @@ export const BehaviouralIntelligenceView: React.FC = () => {
                     </p>
                   </div>
                   <span className="px-2.5 py-1 rounded-md text-[10px] font-mono bg-[#17212D] text-[#AAB4BF] border border-[#354251]">
-                    5 Components Monitored
+                    {shadowComparison.ablationTests.length} Components Monitored
                   </span>
                 </div>
 
@@ -846,11 +864,13 @@ export const BehaviouralIntelligenceView: React.FC = () => {
                           <td className="py-2.5 px-3 font-bold text-[#E8E5DE]">{test.componentName}</td>
                           <td className="py-2.5 px-3 text-[#AAB4BF] max-w-xs">{test.description}</td>
                           <td className="py-2.5 px-3 text-[#AAB4BF]">{test.sampleSize} trades</td>
-                          <td className="py-2.5 px-3 text-[#72A98B] font-bold">
-                            +{test.marginalWinRateDelta.toFixed(1)}%
+                          <td className={`py-2.5 px-3 font-bold ${test.marginalWinRateDelta >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                            {test.marginalWinRateDelta >= 0 ? '+' : ''}
+                            {test.marginalWinRateDelta.toFixed(1)}%
                           </td>
-                          <td className="py-2.5 px-3 text-[#6C9D91] font-bold">
-                            +{test.marginalEVUnitsDelta.toFixed(2)}
+                          <td className={`py-2.5 px-3 font-bold ${test.marginalEVUnitsDelta >= 0 ? 'text-[#6C9D91]' : 'text-[#B7797D]'}`}>
+                            {test.marginalEVUnitsDelta >= 0 ? '+' : ''}
+                            {test.marginalEVUnitsDelta.toFixed(2)}
                           </td>
                           <td className="py-2.5 px-3">
                             <span

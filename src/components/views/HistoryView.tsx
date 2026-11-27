@@ -433,7 +433,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({ signals, onRefresh }) 
                 onChange={e => setPairFilter(e.target.value)}
                 className="bg-[#121820] border border-[#243040] rounded px-2.5 py-1 text-[#E8E5DE] outline-none cursor-pointer"
               >
-                <option value="ALL">All Pairs (20)</option>
+                <option value="ALL">All Pairs ({FOREX_PAIRS.length})</option>
                 {FOREX_PAIRS.map(p => (
                   <option key={p} value={p}>{p}</option>
                 ))}

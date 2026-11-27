@@ -71,7 +71,8 @@ class HistoricalDataStore {
       const candles: Candle[] = [];
       for (const month of months) candles.push(...this.readMonth(symbol, month));
       candles.sort((a, b) => a.timestampMs - b.timestampMs);
-      return candles.slice(-Math.max(1, Math.min(limit, MAX_CANDLES_PER_PAIR)));
+      const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), MAX_CANDLES_PER_PAIR)) : MAX_CANDLES_PER_PAIR;
+      return candles.slice(-safeLimit);
     } catch (error) {
       console.error(`[HistoricalData] Failed to list ${symbol} history:`, error);
       return [];
@@ -110,7 +111,8 @@ class HistoricalDataStore {
 
       if (
         !Number.isFinite(timestampMs) ||
-        ![open, high, low, close].every(Number.isFinite) ||
+        timestampMs <= 0 ||
+        ![open, high, low, close].every(v => Number.isFinite(v) && v > 0) ||
         high < Math.max(open, close, low) ||
         low > Math.min(open, close, high) ||
         !ALLOWED_SOURCES.has(suppliedSource)
@@ -173,9 +175,25 @@ class HistoricalDataStore {
 
     for (const [month, sortedMonth] of changedPartitions) {
       const file = this.fileFor(symbol, month);
-      const temp = `${file}.tmp`;
-      fs.writeFileSync(temp, JSON.stringify(sortedMonth), 'utf-8');
-      fs.renameSync(temp, file);
+      const temp = `${file}.${process.pid}.tmp`;
+      try {
+        fs.writeFileSync(temp, JSON.stringify(sortedMonth), 'utf-8');
+        let renamed = false;
+        for (let attempt = 0; attempt < 4 && !renamed; attempt++) {
+          try {
+            fs.renameSync(temp, file);
+            renamed = true;
+          } catch (err: any) {
+            if (!['EBUSY', 'EPERM', 'EACCES'].includes(String(err?.code || '')) || attempt >= 3) {
+              throw err;
+            }
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40 * (attempt + 1));
+          }
+        }
+      } catch (err) {
+        try { fs.rmSync(temp, { force: true }); } catch { /* ignore cleanup error */ }
+        throw err;
+      }
     }
 
     const sorted = this.getCandles(symbol, MAX_CANDLES_PER_PAIR);

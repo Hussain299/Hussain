@@ -240,15 +240,15 @@ export function runCounterfactualStressSuite(
       const pUp = forwardFn(v).probabilityUp;
       return direction === 'BUY' ? pUp : 1 - pUp;
     }
-    // Cold-start interpretable linear stress surrogate over core prediction-time 19D features:
-    // ret1 (0), ret3 (1), emaSpread (11), rsiProxy (13), bodyDir (4), wickImbalance (8)
+    // Cold-start interpretable linear stress surrogate over canonical 19D features:
+    // ret1 (0), ret3 (1), emaSpread (9), rsiProxy (11), bodyDir (4), wickImbalance=upper-lower (6)
     const rawMomentum =
       0.22 * v[0] +
       0.16 * v[1] +
-      0.18 * v[11] +
-      0.25 * v[13] +
+      0.18 * v[9] -
+      0.15 * v[11] +
       0.15 * v[4] -
-      0.20 * v[8];
+      0.20 * v[6];
     return sigmoid(dirSign * rawMomentum * 0.45);
   };
 
@@ -261,7 +261,7 @@ export function runCounterfactualStressSuite(
       build: (b) => {
         const copy = [...b];
         copy[0] = b[0] - dirSign * 0.85;
-        copy[10] = b[10] * 1.15;
+        copy[9] = b[9] * 0.85;
         return copy;
       },
     },
@@ -271,8 +271,8 @@ export function runCounterfactualStressSuite(
         const copy = [...b];
         copy[1] = b[1] * 0.45;
         copy[2] = b[2] * 0.45;
-        copy[11] = b[11] * 0.55;
-        copy[14] = b[14] - 0.35;
+        copy[9] = b[9] * 0.55;
+        copy[10] = b[10] * 0.55;
         return copy;
       },
     },
@@ -280,9 +280,9 @@ export function runCounterfactualStressSuite(
       name: 'WICK_REJECTION',
       build: (b) => {
         const copy = [...b];
-        copy[8] = dirSign * 0.45;
-        copy[6] = dirSign > 0 ? Math.max(b[6], 0.48) : b[6];
-        copy[7] = dirSign < 0 ? Math.max(b[7], 0.48) : b[7];
+        copy[6] = dirSign * 0.45;
+        copy[7] = dirSign > 0 ? 0.08 : 0.92;
+        copy[8] = Math.max(b[8], 0.45);
         return copy;
       },
     },
@@ -290,8 +290,8 @@ export function runCounterfactualStressSuite(
       name: 'VOLATILITY_SPIKE',
       build: (b) => {
         const copy = [...b];
-        copy[10] = b[10] * 1.35;
-        copy[17] = b[17] * 1.35;
+        copy[8] = b[8] * 1.35;
+        copy[15] = b[15] * 1.35;
         copy[4] = b[4] * 0.7;
         return copy;
       },
@@ -343,30 +343,29 @@ export function runMultiAgentDebate(
     : 80;
   const breakEvenProb = computeBreakEvenProbability(payoutPct);
 
-  // Unpack interpretable 19D prediction-time features (defined in agiEngine.extractFeatureVector)
+  // Unpack canonical 19D prediction-time features (defined in agiEngine.extractFeatureVector)
   const ret1 = vec[0];
   const ret3 = vec[1];
   const ret5 = vec[2];
   const bodyRatio = vec[5];
-  const upperWick = vec[6];
-  const lowerWick = vec[7];
-  const wickImbalance = vec[8];
-  const rangeExpansion = vec[10];
-  const emaSpread = vec[11];
-  const emaCurvature = vec[12];
-  const rsiCentered = vec[13]; // [-1, +1], positive = high RSI
-  const pos13 = vec[15];
-  const pos34 = vec[16];
-  const volRatio = vec[17];
+  const wickImbalance = vec[6]; // (upperWick - lowerWick)/range: + = upper wick rejection, - = lower wick support
+  const closeLocation = vec[7];
+  const rangeExpansion = vec[8];
+  const emaSpread = vec[9];
+  const emaCurvature = vec[10];
+  const rsiCentered = vec[11]; // [-1, +1], positive = high RSI
+  const pos13 = vec[13];
+  const pos34 = vec[14];
+  const volRatio = vec[15];
 
   // =========================================================================
   // ROUND 1: INDEPENDENT AGENT ANALYSES
   // =========================================================================
 
   // 1. BULL_MOMENTUM (Trend & Breakout Advocate)
-  const alignedEma = clamp(dirSign * emaSpread * 0.12, -1.2, 1.2);
-  const alignedReturns = clamp(dirSign * (ret1 * 0.08 + ret3 * 0.06 + ret5 * 0.04), -1.2, 1.2);
-  const breakoutSupport = clamp((rangeExpansion - 1.0) * 0.25 + (volRatio - 1.0) * 0.2 + (bodyRatio - 0.45) * 0.4, -0.6, 0.7);
+  const alignedEma = clamp(dirSign * emaSpread * 0.45, -1.2, 1.2);
+  const alignedReturns = clamp(dirSign * (ret1 * 0.35 + ret3 * 0.25 + ret5 * 0.15), -1.2, 1.2);
+  const breakoutSupport = clamp((rangeExpansion * 0.25) + (volRatio * 0.2) + (bodyRatio * 0.35) + (dirSign * (closeLocation - 0.5) * 0.4), -0.6, 0.7);
   const regimeTrendAlign =
     input.regime?.regimeType === 'TRENDING'
       ? 0.25
@@ -377,10 +376,10 @@ export function runMultiAgentDebate(
 
   // 2. BEAR_CONTRARIAN (Exhaustion / Reversion Counter-Thesis)
   // Argues AGAINST trade continuation whenever RSI/Donchian is overextended or adverse wick absorption appears
-  const dirRsi = dirSign * rsiCentered; // > 0.32 means chasing overbought (BUY) / oversold (SELL)
-  const exhaustionPenalty = dirRsi > 0.25 ? (dirRsi - 0.25) * 1.15 : dirRsi < -0.20 ? dirRsi * 0.65 : 0;
-  const adverseWick = dirSign > 0 ? upperWick - lowerWick * 0.4 : lowerWick - upperWick * 0.4;
-  const stretchPos = dirSign > 0 ? pos34 - 0.55 : (1 - pos34) - 0.55;
+  const dirRsi = dirSign * rsiCentered; // > 0.20 means chasing overbought (BUY) / oversold (SELL)
+  const exhaustionPenalty = dirRsi > 0.20 ? (dirRsi - 0.20) * 1.15 : dirRsi < -0.20 ? dirRsi * 0.65 : 0;
+  const adverseWick = dirSign * wickImbalance;
+  const stretchPos = (dirSign > 0 ? pos34 : 1 - pos34) - 0.58;
   const meanRevBonus = input.regime?.regimeType === 'MEAN_REVERTING' && stretchPos > 0.15 ? 0.35 : 0;
   const contrarianHeadwind = clamp(
     0.75 * exhaustionPenalty + 0.9 * Math.max(0, adverseWick) + 0.75 * Math.max(0, stretchPos) + meanRevBonus - clamp(-dirSign * emaCurvature * 0.05, -0.3, 0.3),
@@ -462,7 +461,7 @@ export function runMultiAgentDebate(
     challenges.push({
       challenger: 'BEAR_CONTRARIAN',
       target: 'BULL_MOMENTUM',
-      flawCited: `Counter-thesis detects extension headwind (RSI=${(50 + rsiCentered * 50).toFixed(0)}, Pos34=${(pos34 * 100).toFixed(0)}%, WickImb=${wickImbalance.toFixed(2)}).`,
+      flawCited: `Counter-thesis detects extension headwind (RSI=${clamp(50 + rsiCentered * 50, 0, 100).toFixed(0)}, Pos34=${(pos34 * 100).toFixed(0)}%, WickImb=${wickImbalance.toFixed(2)}).`,
       rebuttal: `Momentum thesis discounted by ${Math.abs(shift * 100).toFixed(1)}pp after structural exhaustion challenge.`,
       probabilityAdjustment: round(shift, 4),
       outcome: 'CONCEDED_REVISION',

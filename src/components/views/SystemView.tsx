@@ -40,6 +40,7 @@ export const SystemView: React.FC = () => {
   const [copiedWorkerCode, setCopiedWorkerCode] = useState(false);
   const [selfHealReport, setSelfHealReport] = useState<any>(null);
   const [isRunningSelfHeal, setIsRunningSelfHeal] = useState(false);
+  const [actionError, setActionError] = useState<string>('');
 
   const fetchHealth = async () => {
     setIsLoadingHealth(true);
@@ -52,13 +53,16 @@ export const SystemView: React.FC = () => {
         const data = await healthRes.json();
         setHealth(data);
         if (data.selfHealing) setSelfHealReport(data.selfHealing);
+      } else {
+        setActionError(`Health check failed (${healthRes.status})`);
       }
       if (uptimeRes.ok) {
         const uData = await uptimeRes.json();
         setUptimeStatus(uData);
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      setActionError(e?.message || 'Failed to load system health.');
     } finally {
       setIsLoadingHealth(false);
     }
@@ -66,13 +70,17 @@ export const SystemView: React.FC = () => {
 
   const handleRunSelfHeal = async () => {
     setIsRunningSelfHeal(true);
+    setActionError('');
     try {
       const res = await fetch('/api/system/self-heal/run', { method: 'POST' });
-      if (res.ok) {
-        setSelfHealReport(await res.json());
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
+        throw new Error(data?.error || `Self-healing pass failed (${res.status})`);
       }
-    } catch (e) {
+      setSelfHealReport(data);
+    } catch (e: any) {
       console.error(e);
+      setActionError(e?.message || 'Failed to run self-healing pass.');
     } finally {
       setIsRunningSelfHeal(false);
     }
@@ -80,15 +88,18 @@ export const SystemView: React.FC = () => {
 
   const handleTestCronTick = async () => {
     setIsTestingCron(true);
+    setActionError('');
     try {
       const res = await fetch('/api/cron/tick?source=SYSTEM_UI_TEST');
-      if (res.ok) {
-        const data = await res.json();
-        setCronTestResult(data);
-        await fetchHealth();
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
+        throw new Error(data?.error || `Cron test tick failed (${res.status})`);
       }
-    } catch (e) {
+      setCronTestResult(data);
+      await fetchHealth();
+    } catch (e: any) {
       console.error(e);
+      setActionError(e?.message || 'Failed to run cron test tick.');
     } finally {
       setIsTestingCron(false);
     }
@@ -111,12 +122,17 @@ export const SystemView: React.FC = () => {
     fetchTelegram();
 
     fetch('/api/system/export-d1')
-      .then(res => res.json())
+      .then(async res => {
+        if (!res.ok) throw new Error(`D1 schema export failed (${res.status})`);
+        return res.json();
+      })
       .then(data => {
         setD1Schema(data.schemaSql || '');
         setWranglerToml(data.wranglerToml || '');
       })
-      .catch(console.error);
+      .catch(err => {
+        console.error(err);
+      });
 
     const interval = setInterval(fetchHealth, 10000);
     return () => clearInterval(interval);
@@ -124,14 +140,17 @@ export const SystemView: React.FC = () => {
 
   const handleRunTests = async () => {
     setIsRunningTests(true);
+    setActionError('');
     try {
       const res = await fetch('/api/test/run', { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        setTestResults(data);
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
+        throw new Error(data?.error || `Verification suite failed (${res.status})`);
       }
-    } catch (e) {
+      setTestResults(data);
+    } catch (e: any) {
       console.error(e);
+      setActionError(e?.message || 'Failed to run verification test suite.');
     } finally {
       setIsRunningTests(false);
     }
@@ -182,6 +201,11 @@ export const SystemView: React.FC = () => {
       </div>
 
       <div className="max-w-7xl mx-auto px-4 lg:px-8 py-6 space-y-6">
+        {actionError && (
+          <div className="bg-[#B7797D]/15 border border-[#B7797D]/40 text-[#B7797D] rounded-lg px-4 py-2.5 text-xs font-mono">
+            {actionError}
+          </div>
+        )}
         {/* ------------------------------------------------------------- */}
         {/* SECTION 1: CORE INFRASTRUCTURE TELEMETRY STRIP */}
         {/* ------------------------------------------------------------- */}

@@ -915,7 +915,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                     const isActive = sig.lifecycleState === 'ACTIVE';
                     const currPrice = latestPrices[sig.symbol] || sig.actualEntryPrice || sig.triggerPrice || 0;
                     const entry = sig.actualEntryPrice || sig.triggerPrice || 0;
-                    const diffPips = Number(((isBuy ? currPrice - entry : entry - currPrice) * 10000).toFixed(1));
+                    const pipMultiplier = sig.symbol.includes('JPY') ? 100 : 10000;
+                    const diffPips = Number(((isBuy ? currPrice - entry : entry - currPrice) * pipMultiplier).toFixed(1));
 
                     return (
                       <div

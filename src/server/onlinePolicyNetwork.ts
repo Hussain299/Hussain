@@ -589,6 +589,14 @@ export class OnlinePolicyNetwork {
     if (tradeOutcome === 'CANCELLED' || tradeOutcome === 'SCRATCH') {
       return { loss: 0, gradientNorm: 0, step: this.t, linUcbV2Trained: false };
     }
+    if (!Array.isArray(x) || x.length !== this.inputDim || !x.every(Number.isFinite)) {
+      return {
+        loss: Number((this.trailingLosses[this.trailingLosses.length - 1] || 0).toFixed(4)),
+        gradientNorm: Number(this.lastGradNorm.toFixed(4)),
+        step: this.t,
+        linUcbV2Trained: false,
+      };
+    }
     if (signalId && this.trainedSignalIds.has(signalId)) {
       this.duplicateBlocks++;
       return {

@@ -97,13 +97,15 @@ export class BotAuditor {
     ];
 
     for (const t of completedTrades) {
-      const p = t.confidence || 0.65;
+      const p = typeof t.confidence === 'number' && Number.isFinite(t.confidence) ? t.confidence : 0.65;
       const y = t.outcomeResult === 'WIN' ? 1 : 0;
       brierSum += Math.pow(p - y, 2);
       confidenceSum += p;
       if (y === 1) winCount++;
 
-      const bin = bins.find(b => p >= b.min && p < b.max) || bins[bins.length - 1];
+      const bin =
+        bins.find(b => p >= b.min && p < b.max) ||
+        (p < bins[0].min ? bins[0] : bins[bins.length - 1]);
       bin.sumP += p;
       if (y === 1) bin.wins++;
       bin.count++;
@@ -162,8 +164,13 @@ export class BotAuditor {
       };
     }
 
-    // Recent trades ordered chronologically descending
-    const recent = completedTrades.slice(-8).reverse();
+    // Ensure newest-first chronological ordering regardless of caller input order
+    const orderedDesc = [...completedTrades].sort((a, b) => {
+      const tb = Date.parse(b.actualExitTimeUtc || b.predictionTimeUtc || '');
+      const ta = Date.parse(a.actualExitTimeUtc || a.predictionTimeUtc || '');
+      return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
+    });
+    const recent = orderedDesc.slice(0, 8);
     const firstOutcome = recent[0].outcomeResult;
     let streak = 0;
     for (const t of recent) {

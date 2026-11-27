@@ -1,30 +1,127 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   BarChart3,
-  TrendingUp,
+  RotateCw,
+  ShieldCheck,
+  Target,
   Activity,
-  Globe,
-  PieChart,
-  ArrowUpRight,
-  ArrowDownRight,
-  Sliders,
-  CheckCircle2,
-  XCircle,
-  Clock,
-  Layers,
 } from 'lucide-react';
 import {
   ResearchExperiment,
   ResearchSignal,
   FOREX_PAIRS,
-  ForexSymbol,
-  MarketSessionInfo,
 } from '../../types/index.js';
 import {
   BOT_DEFINITION,
   computeBotPerformance,
 } from '../../utils/botControls.js';
 import { getForwardObservations, summarizeForwardObservations } from '../../utils/tradeAccounting.js';
+
+interface DecisionBandStat {
+  band: string;
+  count: number;
+  wins: number;
+  losses: number;
+  meanPredicted: number;
+  empiricalWinRate: number;
+  ci95Low: number;
+  ci95High: number;
+  netReturnUnits: number;
+}
+
+interface DecisionGroupStat {
+  key: string;
+  count: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  ci95Low: number;
+  ci95High: number;
+  netReturnUnits: number;
+}
+
+interface DecisionEvalSummary {
+  sampleCount: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  ci95Low: number;
+  ci95High: number;
+  netReturnUnits: number;
+  meanConfidence: number;
+  prevalenceBrierBaseline: number;
+  brierScore: number;
+  brierSkillVsPrevalence: number;
+  logLoss: number;
+  ece: number;
+  confidenceBands: DecisionBandStat[];
+}
+
+interface ShadowBenchmarkData {
+  generatedAt: string;
+  datasetSummary: {
+    settledWinLoss: number;
+    legacyWinLoss: number;
+    olympVerifiedWinLoss: number;
+    withFrozenFeatures: number;
+  };
+  baselineAll: DecisionEvalSummary;
+  shadowAccepted: DecisionEvalSummary;
+  shadowAbstained: DecisionEvalSummary;
+  splitByProvenance: {
+    legacy: { baseline: DecisionEvalSummary; shadowAccepted: DecisionEvalSummary };
+    olympVerified: { baseline: DecisionEvalSummary; shadowAccepted: DecisionEvalSummary };
+  };
+  breakdowns: {
+    byDirection: DecisionGroupStat[];
+    byRuleFamily: DecisionGroupStat[];
+    byRegime: DecisionGroupStat[];
+  };
+  knnComparison: {
+    exactPairEvaluations: number;
+    exactPairSufficientCount: number;
+    exactPairVetoes: number;
+    exactPairVetoedWinRate: number | null;
+    crossPairSufficientCount: number;
+    crossPairVetoes: number;
+    crossPairVetoedWinRate: number | null;
+    crossPairClearedWinRate: number | null;
+  };
+}
+
+interface QuantInstitutionalData {
+  portfolioStats: {
+    settledCount: number;
+    expectancyUnitsPerTrade: number;
+    profitFactor: number;
+    sharpePerTrade: number;
+    sortinoPerTrade: number;
+    maxDrawdownUnits: number;
+    currentDrawdownUnits: number;
+    drawdownMode: string;
+    drawdownThrottleFactor: number;
+    longestWinStreak: number;
+    longestLossStreak: number;
+  };
+  promotionGate: {
+    minRequiredSamples: number;
+    breakEvenAt80Pct: number;
+    shadowCalibrator: {
+      sampleCount: number;
+      winRatePct: number | null;
+      wilson95LowerPct: number | null;
+      progressPct: number;
+      status: string;
+    };
+    agentCouncil: {
+      sampleCount: number;
+      winRatePct: number | null;
+      wilson95LowerPct: number | null;
+      progressPct: number;
+      status: string;
+    };
+  };
+}
 
 interface AnalyticsViewProps {
   signals: ResearchSignal[];
@@ -33,6 +130,39 @@ interface AnalyticsViewProps {
 
 export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experiments }) => {
   const [assetSortKey, setAssetSortKey] = useState<'winRate' | 'trades' | 'netUnits'>('winRate');
+  const [shadowBenchmark, setShadowBenchmark] = useState<ShadowBenchmarkData | null>(null);
+  const [quantData, setQuantData] = useState<QuantInstitutionalData | null>(null);
+  const [councilBench, setCouncilBench] = useState<any>(null);
+  const [isRefreshingDecisionStats, setIsRefreshingDecisionStats] = useState(false);
+
+  const loadDecisionPerformance = useCallback(async (abortSignal?: AbortSignal) => {
+    setIsRefreshingDecisionStats(true);
+    try {
+      const [benchRes, quantRes, councilRes] = await Promise.all([
+        fetch('/api/evolution/shadow-benchmark', { signal: abortSignal }).then(r => (r.ok ? r.json() : null)),
+        fetch('/api/quant/institutional', { signal: abortSignal }).then(r => (r.ok ? r.json() : null)),
+        fetch('/api/agi/council', { signal: abortSignal }).then(r => (r.ok ? r.json() : null)),
+      ]);
+      if (abortSignal?.aborted) return;
+      if (benchRes) setShadowBenchmark(benchRes);
+      if (quantRes) setQuantData(quantRes);
+      if (councilRes?.benchmark) setCouncilBench(councilRes.benchmark);
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        console.error('[AnalyticsView] Failed to load decision-performance telemetry:', err);
+      }
+    } finally {
+      if (!abortSignal?.aborted) {
+        setIsRefreshingDecisionStats(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    loadDecisionPerformance(controller.signal);
+    return () => controller.abort();
+  }, [loadDecisionPerformance, signals.length, experiments.length]);
 
   // The append-only forward journal is the canonical all-time paper-outcome source.
   const forwardObservations = useMemo(() => getForwardObservations(experiments), [experiments]);
@@ -184,8 +314,18 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
             </span>
           </div>
 
-          <div className="text-xs text-[#AAB4BF]">
-            Total Forward Outcomes: <strong className="text-[#E8E5DE]">{forwardStats.observations}</strong>
+          <div className="flex items-center gap-3 text-xs text-[#AAB4BF]">
+            <span>
+              Total Forward Outcomes: <strong className="text-[#E8E5DE]">{forwardStats.observations}</strong>
+            </span>
+            <button
+              onClick={() => loadDecisionPerformance()}
+              disabled={isRefreshingDecisionStats}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#121820] hover:bg-[#243040] border border-[#243040] text-[#E8E5DE] cursor-pointer disabled:opacity-50"
+            >
+              <RotateCw className={`w-3 h-3 ${isRefreshingDecisionStats ? 'animate-spin text-[#72A98B]' : ''}`} />
+              <span>Refresh Metrics</span>
+            </button>
           </div>
         </div>
       </div>
@@ -409,7 +549,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-[#AAB4BF]">Net P&amp;L Units:</span>
-                  <span className={`font-black ${botStats.netUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                  <span className={`font-black ${totalNetUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
                     {totalNetUnits >= 0 ? `+${totalNetUnits}` : totalNetUnits} U
                   </span>
                 </div>
@@ -418,13 +558,33 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
                   <span className="font-bold text-[#E8E5DE]">{forwardStats.missingReturnCount}</span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-[#AAB4BF]">Target R:R:</span>
-                  <span className="text-[#72A98B] font-bold">+1.5 : 1 (12p TP / 8p SL)</span>
+                  <span className="text-[#AAB4BF]">Expectancy / Trade:</span>
+                  <span
+                    className={`font-bold ${
+                      (quantData?.portfolioStats?.expectancyUnitsPerTrade ?? 0) >= 0
+                        ? 'text-[#72A98B]'
+                        : 'text-[#B7797D]'
+                    }`}
+                  >
+                    {quantData?.portfolioStats
+                      ? `${quantData.portfolioStats.expectancyUnitsPerTrade >= 0 ? '+' : ''}${quantData.portfolioStats.expectancyUnitsPerTrade.toFixed(3)} U`
+                      : forwardStats.scoredOutcomes > 0
+                        ? `${(totalNetUnits / forwardStats.scoredOutcomes) >= 0 ? '+' : ''}${(totalNetUnits / forwardStats.scoredOutcomes).toFixed(3)} U`
+                        : '—'}
+                  </span>
                 </div>
+                {quantData?.portfolioStats && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#AAB4BF]">Max Drawdown / Sharpe:</span>
+                    <span className="text-[#E8E5DE] font-bold">
+                      -{quantData.portfolioStats.maxDrawdownUnits.toFixed(2)} U · {quantData.portfolioStats.sharpePerTrade.toFixed(2)}
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div className="text-[11px] text-[#AAB4BF] leading-relaxed">
-                Candle-based paper settlement at the saved payout; broker fills are not verified.
+                Candle-based binary settlement at observed payout (break-even ~55.6% at 80%); broker fills are not verified.
               </div>
             </div>
 
@@ -466,6 +626,221 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ signals, experimen
               </div>
             </div>
           </div>
+        </div>
+
+        {/* ------------------------------------------------------------- */}
+        {/* SECTION 2B: DECISION-PERFORMANCE ANALYSIS & MODEL ATTRIBUTION */}
+        {/* ------------------------------------------------------------- */}
+        <div className="bg-[#161F2B] border border-[#243040] rounded-xl p-5 sm:p-6 space-y-5 shadow-lg font-mono">
+          <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#243040] gap-3">
+            <div>
+              <h2 className="text-base font-bold text-[#E8E5DE] tracking-tight flex items-center gap-2">
+                <Target className="w-4 h-4 text-[#6C9D91]" />
+                <span>Decision-Performance Analysis &amp; Model Attribution</span>
+              </h2>
+              <p className="text-xs text-[#AAB4BF] mt-0.5">
+                Walk-forward baseline vs shadow calibrator, confidence calibration bands, regime/rule-family breakdown, k-NN veto accuracy, and promotion readiness.
+              </p>
+            </div>
+            {shadowBenchmark && (
+              <span className="text-[11px] text-[#AAB4BF]">
+                Settled W/L: <strong className="text-[#E8E5DE]">{shadowBenchmark.datasetSummary.settledWinLoss}</strong> · Frozen Features:{' '}
+                <strong className="text-[#72A98B]">{shadowBenchmark.datasetSummary.withFrozenFeatures}</strong> · Olymp Verified:{' '}
+                <strong className="text-[#6C9D91]">{shadowBenchmark.datasetSummary.olympVerifiedWinLoss}</strong>
+              </span>
+            )}
+          </div>
+
+          {!shadowBenchmark ? (
+            <div className="text-xs text-[#AAB4BF] py-6 text-center bg-[#121820] border border-[#243040] rounded-lg">
+              Loading walk-forward decision benchmark &amp; calibration diagnostics...
+            </div>
+          ) : (
+            <div className="space-y-5">
+              {/* Row 1: Baseline vs Shadow Accepted vs Shadow Abstained vs Council */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+                <div className="bg-[#121820] border border-[#243040] rounded-lg p-4 space-y-1.5">
+                  <span className="text-[10px] text-[#AAB4BF] uppercase font-bold block">Baseline Executed Decisions</span>
+                  <div className="text-xl font-black text-[#E8E5DE]">
+                    {shadowBenchmark.baselineAll.sampleCount > 0
+                      ? `${(shadowBenchmark.baselineAll.winRate * 100).toFixed(1)}% WR`
+                      : '—'}
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    n={shadowBenchmark.baselineAll.sampleCount} · CI95 [{(shadowBenchmark.baselineAll.ci95Low * 100).toFixed(1)}%–{(shadowBenchmark.baselineAll.ci95High * 100).toFixed(1)}%]
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    Net: <strong className={shadowBenchmark.baselineAll.netReturnUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}>
+                      {shadowBenchmark.baselineAll.netReturnUnits >= 0 ? '+' : ''}{shadowBenchmark.baselineAll.netReturnUnits.toFixed(2)} U
+                    </strong> · Brier {shadowBenchmark.baselineAll.brierScore.toFixed(4)} · ECE {shadowBenchmark.baselineAll.ece.toFixed(4)}
+                  </div>
+                </div>
+
+                <div className="bg-[#121820] border border-[#72A98B]/40 rounded-lg p-4 space-y-1.5">
+                  <span className="text-[10px] text-[#72A98B] uppercase font-bold block">Shadow Calibrator Accepted</span>
+                  <div className="text-xl font-black text-[#72A98B]">
+                    {shadowBenchmark.shadowAccepted.sampleCount > 0
+                      ? `${(shadowBenchmark.shadowAccepted.winRate * 100).toFixed(1)}% WR`
+                      : '—'}
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    n={shadowBenchmark.shadowAccepted.sampleCount} · CI95 [{(shadowBenchmark.shadowAccepted.ci95Low * 100).toFixed(1)}%–{(shadowBenchmark.shadowAccepted.ci95High * 100).toFixed(1)}%]
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    Net: <strong className={shadowBenchmark.shadowAccepted.netReturnUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}>
+                      {shadowBenchmark.shadowAccepted.netReturnUnits >= 0 ? '+' : ''}{shadowBenchmark.shadowAccepted.netReturnUnits.toFixed(2)} U
+                    </strong> · Skill {shadowBenchmark.shadowAccepted.brierSkillVsPrevalence >= 0 ? '+' : ''}{shadowBenchmark.shadowAccepted.brierSkillVsPrevalence.toFixed(3)}
+                  </div>
+                </div>
+
+                <div className="bg-[#121820] border border-[#C4A574]/40 rounded-lg p-4 space-y-1.5">
+                  <span className="text-[10px] text-[#C4A574] uppercase font-bold block">Shadow Abstained Setups</span>
+                  <div className="text-xl font-black text-[#C4A574]">
+                    {shadowBenchmark.shadowAbstained.sampleCount > 0
+                      ? `${(shadowBenchmark.shadowAbstained.winRate * 100).toFixed(1)}% WR`
+                      : '—'}
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    Abstained: {shadowBenchmark.shadowAbstained.sampleCount} ({shadowBenchmark.shadowAbstained.wins}W–{shadowBenchmark.shadowAbstained.losses}L)
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    Skipped Net: <strong className={shadowBenchmark.shadowAbstained.netReturnUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}>
+                      {shadowBenchmark.shadowAbstained.netReturnUnits >= 0 ? '+' : ''}{shadowBenchmark.shadowAbstained.netReturnUnits.toFixed(2)} U
+                    </strong>
+                  </div>
+                </div>
+
+                <div className="bg-[#121820] border border-[#6C9D91]/40 rounded-lg p-4 space-y-1.5">
+                  <span className="text-[10px] text-[#6C9D91] uppercase font-bold block">5-Agent Council &amp; k-NN Veto</span>
+                  <div className="text-xl font-black text-[#6C9D91]">
+                    {councilBench?.hedgeApproveWinRate !== null && councilBench?.hedgeApproveWinRate !== undefined
+                      ? `${councilBench.hedgeApproveWinRate}% APPROVE WR`
+                      : 'Collecting'}
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    Approved: {councilBench?.hedgeApproveCount ?? 0} · Veto Loss Avoidance: {councilBench?.hedgeVetoedLossAvoidancePct ?? '—'}%
+                  </div>
+                  <div className="text-[11px] text-[#AAB4BF]">
+                    Cross k-NN Veto WR: {shadowBenchmark.knnComparison.crossPairVetoedWinRate !== null ? `${(shadowBenchmark.knnComparison.crossPairVetoedWinRate * 100).toFixed(1)}%` : '—'} vs Cleared:{' '}
+                    {shadowBenchmark.knnComparison.crossPairClearedWinRate !== null ? `${(shadowBenchmark.knnComparison.crossPairClearedWinRate * 100).toFixed(1)}%` : '—'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Row 2: Promotion Gate & Provenance Split */}
+              {quantData?.promotionGate && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                  {[
+                    { title: 'Shadow Calibrator Promotion Gate', gate: quantData.promotionGate.shadowCalibrator },
+                    { title: '5-Agent Council Promotion Gate', gate: quantData.promotionGate.agentCouncil },
+                  ].map(({ title, gate }) => (
+                    <div key={title} className="bg-[#121820] border border-[#243040] rounded-lg p-4 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-bold text-[#E8E5DE] flex items-center gap-1.5">
+                          <ShieldCheck className="w-3.5 h-3.5 text-[#72A98B]" />
+                          {title}
+                        </span>
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            gate.status === 'READY_FOR_PROMOTION'
+                              ? 'bg-[#72A98B]/20 text-[#72A98B]'
+                              : gate.status === 'INSUFFICIENT_EDGE'
+                                ? 'bg-[#B7797D]/20 text-[#B7797D]'
+                                : 'bg-[#C4A574]/20 text-[#C4A574]'
+                          }`}
+                        >
+                          {gate.status}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between text-[11px] text-[#AAB4BF]">
+                        <span>Samples: {gate.sampleCount} / {quantData.promotionGate.minRequiredSamples} ({gate.progressPct}%)</span>
+                        <span>WR: {gate.winRatePct !== null ? `${gate.winRatePct}%` : '—'} · CI95 Low: {gate.wilson95LowerPct !== null ? `${gate.wilson95LowerPct}%` : '—'} (vs {quantData.promotionGate.breakEvenAt80Pct}%)</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-[#161F2B] rounded-full overflow-hidden">
+                        <div className="h-full bg-[#72A98B]" style={{ width: `${Math.min(100, gate.progressPct)}%` }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Row 3: Confidence Band Calibration Table & Regime / Rule Attribution */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 text-xs">
+                <div className="bg-[#121820] border border-[#243040] rounded-lg p-4 space-y-2.5 overflow-x-auto">
+                  <div className="text-[11px] font-bold text-[#E8E5DE] uppercase flex items-center gap-1.5">
+                    <Activity className="w-3.5 h-3.5 text-[#C4A574]" />
+                    <span>Confidence Calibration Bands (Baseline vs Realized WR)</span>
+                  </div>
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead>
+                      <tr className="border-b border-[#243040] text-[#AAB4BF] text-[10px] uppercase">
+                        <th className="py-1.5 pr-2">Band</th>
+                        <th className="py-1.5 px-2">n (W-L)</th>
+                        <th className="py-1.5 px-2">Stated</th>
+                        <th className="py-1.5 px-2">Realized</th>
+                        <th className="py-1.5 pl-2 text-right">Net Units</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {shadowBenchmark.baselineAll.confidenceBands.filter(b => b.count > 0).length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="py-3 text-[#AAB4BF]">No settled trades in calibration bands yet.</td>
+                        </tr>
+                      ) : (
+                        shadowBenchmark.baselineAll.confidenceBands.filter(b => b.count > 0).map(b => (
+                          <tr key={b.band} className="border-b border-[#243040]/40">
+                            <td className="py-1.5 pr-2 text-[#E8E5DE] font-bold">{b.band}</td>
+                            <td className="py-1.5 px-2 text-[#AAB4BF]">{b.count} ({b.wins}-{b.losses})</td>
+                            <td className="py-1.5 px-2 text-[#AAB4BF]">{(b.meanPredicted * 100).toFixed(1)}%</td>
+                            <td className={`py-1.5 px-2 font-bold ${b.empiricalWinRate >= 0.556 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                              {(b.empiricalWinRate * 100).toFixed(1)}%
+                            </td>
+                            <td className={`py-1.5 pl-2 text-right font-bold ${b.netReturnUnits >= 0 ? 'text-[#72A98B]' : 'text-[#B7797D]'}`}>
+                              {b.netReturnUnits >= 0 ? '+' : ''}{b.netReturnUnits.toFixed(2)} U
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="bg-[#121820] border border-[#243040] rounded-lg p-4 space-y-3 overflow-x-auto">
+                  <div className="text-[11px] font-bold text-[#E8E5DE] uppercase">
+                    Attribution by Direction, Market Regime &amp; Rule Family
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <div className="text-[10px] text-[#AAB4BF] uppercase mb-1">By Market Regime</div>
+                      {shadowBenchmark.breakdowns.byRegime.length === 0 ? (
+                        <div className="text-[11px] text-[#AAB4BF]">No settled regime records.</div>
+                      ) : (
+                        shadowBenchmark.breakdowns.byRegime.map(r => (
+                          <div key={r.key} className="flex items-center justify-between py-1 border-b border-[#243040]/40 text-[11px]">
+                            <span className="text-[#E8E5DE] truncate max-w-[130px]">{r.key} ({r.count})</span>
+                            <span className={r.netReturnUnits >= 0 ? 'text-[#72A98B] font-bold' : 'text-[#B7797D] font-bold'}>
+                              {(r.winRate * 100).toFixed(0)}% · {r.netReturnUnits >= 0 ? '+' : ''}{r.netReturnUnits.toFixed(2)}U
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-[#AAB4BF] uppercase mb-1">By Direction &amp; Top Rule Family</div>
+                      {[...shadowBenchmark.breakdowns.byDirection, ...shadowBenchmark.breakdowns.byRuleFamily.slice(0, 4)].map(r => (
+                        <div key={r.key} className="flex items-center justify-between py-1 border-b border-[#243040]/40 text-[11px]">
+                          <span className="text-[#E8E5DE] truncate max-w-[130px]">{r.key} ({r.count})</span>
+                          <span className={r.netReturnUnits >= 0 ? 'text-[#72A98B] font-bold' : 'text-[#B7797D] font-bold'}>
+                            {(r.winRate * 100).toFixed(0)}% · {r.netReturnUnits >= 0 ? '+' : ''}{r.netReturnUnits.toFixed(2)}U
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* ------------------------------------------------------------- */}

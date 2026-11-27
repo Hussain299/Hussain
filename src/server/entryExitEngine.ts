@@ -319,6 +319,7 @@ export class EntryExitEngine {
       whyHumansMissThis: params.whyHumansMissThis,
       paperOnly: params.paperOnly ?? false,
       brokerEligibility: params.brokerEligibility,
+      manualPairAuthorization: params.manualPairAuthorization,
     };
 
     // Freeze the new shadow model's prediction at signal creation using only real
@@ -642,18 +643,24 @@ export class EntryExitEngine {
         const nowMs = Date.now();
         
         const isTest = signal.ruleFamily?.startsWith('test_');
-        const allCandles = isTest
+        const allCandlesRaw = isTest
           ? candles
           : candles.concat(db.getCandles(signal.symbol, 300).filter(c => c.source !== 'synthetic'));
-        
-        // Match the candle closing at expiry: either open time was 1m before (c.timestampMs + 60_000 == plannedExitMs)
-        // or close timestamp matches plannedExitMs
-        const targetExitCandle = allCandles.find(c =>
-          Math.abs((c.timestampMs + 60_000) - plannedExitMs) <= (isTest ? 5_000 : 30_000) ||
-          (!isTest && Math.abs(c.timestampMs - plannedExitMs) <= 30_000)
+        const byExitTs = new Map<number, Candle>();
+        for (const bar of allCandlesRaw) {
+          if (bar && Number.isFinite(bar.timestampMs)) {
+            if (!byExitTs.has(bar.timestampMs)) byExitTs.set(bar.timestampMs, bar);
+          }
+        }
+        const allCandles = Array.from(byExitTs.values()).sort((a, b) => a.timestampMs - b.timestampMs);
+
+        // Prefer the M1 candle opening 1m before plannedExitMs (closing exactly at plannedExitMs);
+        // never match a bar opening at or after plannedExitMs while closing 1m after expiry unless no closing bar exists for live fallback.
+        const exactClosingCandle = allCandles.find(
+          c => Math.abs((c.timestampMs + 60_000) - plannedExitMs) <= (isTest ? 5_000 : 30_000)
         );
-        const exitCandle = targetExitCandle && (isTest || nowMs >= plannedExitMs)
-          ? targetExitCandle
+        const exitCandle = exactClosingCandle && (isTest || nowMs >= plannedExitMs)
+          ? exactClosingCandle
           : null;
 
         if (exitCandle) {
@@ -699,7 +706,7 @@ export class EntryExitEngine {
           
 
           changed = true;
-        } else if (isTest && newestCandle.timestampMs + 60_000 > plannedExitMs) {
+        } else if (isTest && newestCandle && newestCandle.timestampMs + 60_000 > plannedExitMs) {
           // Unit test fixture strict assertion: test observations must expire unscored if target candle is missing
           signal.lifecycleState = 'EXPIRED';
           signal.outcomeResult = 'CANCELLED';
@@ -709,9 +716,10 @@ export class EntryExitEngine {
             toState: 'EXPIRED',
             reason: `Exact binary expiry candle was missing at ${signal.plannedExitTimeUtc}; no later candle was substituted, so no WIN/LOSS was recorded.`,
           });
+          changed = true;
         } else if (!isTest && nowMs >= plannedExitMs) {
-          // If past planned exit by more than 2 minutes, resolve immediately with current/latest candle
-          if (nowMs >= plannedExitMs + 2 * 60_000 && newestCandle) {
+          // If past planned exit by more than 2 minutes AND we have a post-expiry/at-expiry candle, resolve immediately
+          if (nowMs >= plannedExitMs + 2 * 60_000 && newestCandle && newestCandle.timestampMs >= plannedExitMs - 60_000) {
             const isJpy = signal.symbol.includes('JPY');
             const pipFactor = isJpy ? 100 : 10000;
             const exitPrice = newestCandle.close;
@@ -755,11 +763,17 @@ export class EntryExitEngine {
       }
 
       // 3. Process EXIT_PENDING state
-      if (!changed && signal.lifecycleState === 'EXIT_PENDING' && signal.actualEntryPrice) {
-        const plannedExitMs = signal.plannedExitTimeUtc ? Date.parse(signal.plannedExitTimeUtc) : 0;
+      if (!changed && signal.lifecycleState === 'EXIT_PENDING' && signal.actualEntryPrice && signal.plannedExitTimeUtc) {
+        const plannedExitMs = Date.parse(signal.plannedExitTimeUtc);
         const nowMs = Date.now();
-        if (nowMs >= plannedExitMs + 2 * 60_000) {
-          const newestCandle = candles[candles.length - 1];
+        if (Number.isFinite(plannedExitMs) && nowMs >= plannedExitMs + 2 * 60_000) {
+          const allPendingCandles = candles
+            .concat(db.getCandles(signal.symbol, 300).filter(c => c.source !== 'synthetic'))
+            .sort((a, b) => a.timestampMs - b.timestampMs);
+          const exactExpiryCandle = allPendingCandles.find(
+            c => Math.abs((c.timestampMs + 60_000) - plannedExitMs) <= 30_000
+          );
+          const newestCandle = exactExpiryCandle || (candles[candles.length - 1]?.timestampMs >= plannedExitMs - 60_000 ? candles[candles.length - 1] : undefined);
           if (newestCandle) {
             const isJpy = signal.symbol.includes('JPY');
             const pipFactor = isJpy ? 100 : 10000;
@@ -905,8 +919,11 @@ export class EntryExitEngine {
           continue;
         }
 
-        // Only expire unscored if >30m past expiry with NO real candle available (and only after fresh feeds were checked)
-        if (candlesMap && nowMs >= exitTimeMs + 30 * 60_000) {
+        // Expire unscored if past expiry with no real expiry candle:
+        // - after 30m when fresh feeds were checked (candlesMap provided)
+        // - after 2h on startup/weekend recovery without candlesMap so crashed slots never lock permanently
+        const staleExpiryThresholdMs = candlesMap ? 30 * 60_000 : 2 * 60 * 60_000;
+        if (nowMs >= exitTimeMs + staleExpiryThresholdMs) {
           const previousState = signal.lifecycleState;
           signal.lifecycleState = 'EXPIRED';
           signal.outcomeResult = 'CANCELLED';

@@ -70,6 +70,16 @@ interface DatabaseSchema {
   telegramConfig?: TelegramConfig;
   manualPairs?: ForexSymbol[];
   allowAllConfiguredPairs?: boolean;
+  botRuntimeControls?: {
+    globalKillSwitch: boolean;
+    enabled: boolean;
+    minConfidence: number;
+    maxConcurrentTrades: number;
+    dynamicSpreadGate: boolean;
+    maxSpreadPips: number;
+    tradingSessions: MarketSessionId[];
+    updatedAtUtc?: string;
+  };
   cronState: {
     lastRun: string | null;
     nextRun: string | null;
@@ -184,6 +194,7 @@ class DatabaseService {
   private isShuttingDown = false;
   private pendingPriority: 'none' | 'low' | 'high' = 'none';
   private lastWriteAtMs = 0;
+  private stateWriteEpoch = 0;
   private static readonly LOW_PRIORITY_FLUSH_INTERVAL_MS = 60_000;
   private static readonly HIGH_PRIORITY_DEBOUNCE_MS = 1_500;
   private static readonly MAX_PERSISTED_CANDLES_PER_PAIR = 80;
@@ -286,7 +297,7 @@ class DatabaseService {
                 accuracyStatus: 'UNVALIDATED',
                 backtestMetrics: undefined,
                 paperMetrics: undefined,
-                status: 'EXPERIMENTING',
+                status: gene.status === 'REJECTED' ? 'REJECTED' : 'EXPERIMENTING',
               };
             }
             // Older approval records may predate the stricter forward 300-trade gate.
@@ -308,8 +319,8 @@ class DatabaseService {
             if (!s || !s.id) return;
             if (typeof s.candleOpenTimeIst === 'string' && s.candleOpenTimeIst.includes('19:35:00 IST')) return;
             if (s.ruleFamily?.startsWith('test_')) return;
-            const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
-            if (nowMs - timeMs > SEVEN_DAYS_MS) return;
+            const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : NaN;
+            if (!Number.isFinite(timeMs) || nowMs - timeMs > SEVEN_DAYS_MS) return;
             if (!uniqueMap.has(s.id)) {
               uniqueMap.set(s.id, s);
             }
@@ -625,6 +636,7 @@ class DatabaseService {
       this.saveTimeout = null;
     }
     this.pendingPriority = 'none';
+    this.stateWriteEpoch++;
     let tempFile = '';
     try {
       this.ensureDataDir();
@@ -661,19 +673,31 @@ class DatabaseService {
     }
     if (this.isWriting) {
       this.writeQueued = true;
-      return this.inFlightWrite ?? undefined;
+      if (this.inFlightWrite) {
+        await this.inFlightWrite;
+      }
+      if (this.writeQueued && !this.isShuttingDown) {
+        return this.flushAsync();
+      }
+      return;
     }
     this.isWriting = true;
+    this.writeQueued = false;
     this.pendingPriority = 'none';
+    const captureEpoch = ++this.stateWriteEpoch;
     const run = async () => {
       let tempFile = '';
       try {
         this.ensureDataDir();
         const payload = JSON.stringify(this.buildPersistedState());
-        tempFile = `${DB_FILE}.${process.pid}.tmp`;
+        tempFile = `${DB_FILE}.${process.pid}.${captureEpoch}.tmp`;
         await fs.promises.writeFile(tempFile, payload, 'utf-8');
-        await renameAsyncWithRetry(tempFile, DB_FILE);
-        this.lastWriteAtMs = Date.now();
+        if (captureEpoch === this.stateWriteEpoch) {
+          await renameAsyncWithRetry(tempFile, DB_FILE);
+          this.lastWriteAtMs = Date.now();
+        } else {
+          try { await fs.promises.rm(tempFile, { force: true }); } catch { /* superseded by newer saveStateSync */ }
+        }
       } catch (err: any) {
         if (tempFile) {
           try { await fs.promises.rm(tempFile, { force: true }); } catch { /* preserve the last valid DB snapshot */ }
@@ -802,7 +826,22 @@ class DatabaseService {
   // Provider Health
   public updateFeedHealth(health: ProviderHealth) {
     const key = `${health.provider}:${health.symbol}`;
-    this.state.feedHealth[key] = health;
+    const prev = this.state.feedHealth[key];
+    const resolvedLastSuccess =
+      health.lastSuccess === 'Pending' && prev?.lastSuccess && prev.lastSuccess !== 'Pending'
+        ? prev.lastSuccess
+        : health.lastSuccess;
+    const resolvedFailures =
+      health.status === 'ONLINE'
+        ? 0
+        : health.consecutiveFailures > 0
+          ? (prev && prev.status !== 'ONLINE' ? (prev.consecutiveFailures || 0) + 1 : 1)
+          : health.consecutiveFailures;
+    this.state.feedHealth[key] = {
+      ...health,
+      lastSuccess: resolvedLastSuccess,
+      consecutiveFailures: resolvedFailures,
+    };
     this.scheduleSave();
   }
 
@@ -834,11 +873,23 @@ class DatabaseService {
   }
 
   private mergeImmutableSettledSignal(existing: ResearchSignal, incoming: ResearchSignal): ResearchSignal {
-    // Once a signal is CLOSED with WIN/LOSS/SCRATCH, all settlement fields are permanently locked.
-    // Only allow attaching forensic lossAutopsy, telegramAuditSentAt, and trainingAudit metadata.
+    // Once a signal is CLOSED with WIN/LOSS/SCRATCH, all outcome & price settlement fields are permanently locked.
+    // Allow attaching forensic lossAutopsy, telegramAuditSentAt, trainingAudit, or repairing missing netReturnUnits.
     if (this.isSettledSignal(existing)) {
+      const missingExistingUnits =
+        existing.netReturnUnits === null ||
+        existing.netReturnUnits === undefined ||
+        !Number.isFinite(existing.netReturnUnits);
+      const hasValidIncomingUnits =
+        typeof incoming.netReturnUnits === 'number' && Number.isFinite(incoming.netReturnUnits);
       return {
         ...existing,
+        payoutPct: missingExistingUnits && hasValidIncomingUnits && typeof incoming.payoutPct === 'number'
+          ? incoming.payoutPct
+          : existing.payoutPct,
+        netReturnUnits: missingExistingUnits && hasValidIncomingUnits
+          ? incoming.netReturnUnits
+          : existing.netReturnUnits,
         lossAutopsy: existing.lossAutopsy || incoming.lossAutopsy,
         telegramAuditSentAt: existing.telegramAuditSentAt || incoming.telegramAuditSentAt,
         trainingAudit: incoming.trainingAudit
@@ -959,9 +1010,13 @@ class DatabaseService {
     }
 
     if (importedCount > 0) {
+      const parsePredMs = (sig: ResearchSignal): number => {
+        const ms = sig.predictionTimeUtc ? Date.parse(sig.predictionTimeUtc) : 0;
+        return Number.isFinite(ms) ? ms : 0;
+      };
       this.state.signals.sort((a, b) => {
-        const ta = a.predictionTimeUtc ? Date.parse(a.predictionTimeUtc) : 0;
-        const tb = b.predictionTimeUtc ? Date.parse(b.predictionTimeUtc) : 0;
+        const ta = parsePredMs(a);
+        const tb = parsePredMs(b);
         if (tb !== ta) return tb - ta;
         return String(b.id).localeCompare(String(a.id));
       });
@@ -986,7 +1041,8 @@ class DatabaseService {
       // Never purge unit-test fixture signals here (purged separately)
       if (s.ruleFamily?.startsWith('test_')) return true;
 
-      const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : 0;
+      const timeMs = s.predictionTimeUtc ? Date.parse(s.predictionTimeUtc) : NaN;
+      if (!Number.isFinite(timeMs)) return false;
       const ageMs = nowMs - timeMs;
 
       if (ageMs > SEVEN_DAYS_MS) {
@@ -1011,10 +1067,14 @@ class DatabaseService {
         unique.set(s.id, s);
       }
     }
+    const parsePredMs = (sig: ResearchSignal): number => {
+      const ms = sig.predictionTimeUtc ? Date.parse(sig.predictionTimeUtc) : 0;
+      return Number.isFinite(ms) ? ms : 0;
+    };
     // Always return deterministically sorted newest-first so refreshes never reorder history
     return Array.from(unique.values()).sort((a, b) => {
-      const ta = a.predictionTimeUtc ? Date.parse(a.predictionTimeUtc) : 0;
-      const tb = b.predictionTimeUtc ? Date.parse(b.predictionTimeUtc) : 0;
+      const ta = parsePredMs(a);
+      const tb = parsePredMs(b);
       if (tb !== ta) return tb - ta;
       return String(b.id).localeCompare(String(a.id));
     });
@@ -2120,10 +2180,7 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
   }
 
   public getShadowComparison(): ShadowModeComparison {
-    if (!this.state.shadowComparison) {
-      return this.recalculateShadowComparison();
-    }
-    return this.state.shadowComparison;
+    return this.recalculateShadowComparison();
   }
 
   public saveShadowComparison(comp: ShadowModeComparison) {
@@ -2134,14 +2191,17 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
   public recalculateShadowComparison(): ShadowModeComparison {
     const memory = this.getBehaviouralMemory();
     const settled = memory.filter(m => ['WIN', 'LOSS'].includes(m.actualOutcome));
+    const unitsFor = (m: BehavioralMemoryRecord): number =>
+      typeof m.netReturnUnits === 'number' && Number.isFinite(m.netReturnUnits)
+        ? m.netReturnUnits
+        : m.actualOutcome === 'WIN'
+          ? 0.8
+          : -1.0;
 
     const baselineTotal = settled.length;
     const baselineWins = settled.filter(m => m.actualOutcome === 'WIN').length;
     const baselineWinRate = baselineTotal > 0 ? Number(((baselineWins / baselineTotal) * 100).toFixed(1)) : null;
-    const baselineEV = settled.reduce(
-      (acc, m) => acc + (m.netReturnUnits || (m.actualOutcome === 'WIN' ? 0.85 : -1.0)),
-      0
-    );
+    const baselineEV = settled.reduce((acc, m) => acc + unitsFor(m), 0);
 
     const shadowTrades = settled.filter(
       m => !['REJECT_INSUFFICIENT_EVIDENCE', 'OBSERVE_ONLY'].includes(m.recommendation)
@@ -2149,10 +2209,7 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
     const shadowTotal = shadowTrades.length;
     const shadowWins = shadowTrades.filter(m => m.actualOutcome === 'WIN').length;
     const shadowWinRate = shadowTotal > 0 ? Number(((shadowWins / shadowTotal) * 100).toFixed(1)) : null;
-    const shadowEV = shadowTrades.reduce(
-      (acc, m) => acc + (m.netReturnUnits || (m.actualOutcome === 'WIN' ? 0.85 : -1.0)),
-      0
-    );
+    const shadowEV = shadowTrades.reduce((acc, m) => acc + unitsFor(m), 0);
 
     const avoidedLosses = settled.filter(
       m => m.actualOutcome === 'LOSS' && ['REJECT_INSUFFICIENT_EVIDENCE', 'OBSERVE_ONLY'].includes(m.recommendation)
@@ -2168,7 +2225,7 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
               ) / baselineTotal
             ).toFixed(4)
           )
-        : 0.2200;
+        : 0;
 
     const shadowBrier =
       shadowTotal > 0
@@ -2180,10 +2237,10 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
               ) / shadowTotal
             ).toFixed(4)
           )
-        : 0.1850;
+        : 0;
 
     const calibrationImprovementPct =
-      baselineBrier > 0
+      baselineBrier > 0 && shadowTotal > 0
         ? Number((((baselineBrier - shadowBrier) / baselineBrier) * 100).toFixed(1))
         : 0;
 
@@ -2196,57 +2253,105 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
         hour12: true,
       }) + ' IST';
 
+    const twoProportionPValue = (w1: number, n1: number, w2: number, n2: number): number => {
+      if (n1 < 5 || n2 < 5) return 1.0;
+      const p1 = w1 / n1;
+      const p2 = w2 / n2;
+      const pooled = (w1 + w2) / (n1 + n2);
+      const se = Math.sqrt(Math.max(1e-9, pooled * (1 - pooled) * (1 / n1 + 1 / n2)));
+      const z = Math.abs(p1 - p2) / se;
+      // Two-sided normal tail approximation via Abramowitz & Stegun erfc helper
+      const x = z / Math.SQRT2;
+      const t = 1 / (1 + 0.3275911 * x);
+      const erfcApprox =
+        t *
+        (0.254829592 +
+          t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429)))) *
+        Math.exp(-x * x);
+      return Number(Math.max(0, Math.min(1, erfcApprox)).toFixed(4));
+    };
+
+    const computeEmpiricalAblation = (
+      componentId: string,
+      componentName: string,
+      description: string,
+      predicate: (m: BehavioralMemoryRecord) => boolean
+    ): ShadowModeComparison['ablationTests'][0] => {
+      const flagged = settled.filter(predicate);
+      const clean = settled.filter(m => !predicate(m));
+      const sampleSize = flagged.length;
+      if (flagged.length === 0 || clean.length === 0) {
+        return {
+          componentId,
+          componentName,
+          description,
+          sampleSize,
+          marginalWinRateDelta: 0,
+          marginalEVUnitsDelta: 0,
+          pValue: 1.0,
+          status: 'NEEDS_MORE_DATA',
+        };
+      }
+
+      const flaggedWins = flagged.filter(m => m.actualOutcome === 'WIN').length;
+      const cleanWins = clean.filter(m => m.actualOutcome === 'WIN').length;
+      const flaggedWr = (flaggedWins / flagged.length) * 100;
+      const cleanWr = (cleanWins / clean.length) * 100;
+      const marginalWinRateDelta = Number((cleanWr - flaggedWr).toFixed(1));
+
+      const flaggedAvgEv = flagged.reduce((acc, m) => acc + unitsFor(m), 0) / flagged.length;
+      const cleanAvgEv = clean.reduce((acc, m) => acc + unitsFor(m), 0) / clean.length;
+      const marginalEVUnitsDelta = Number((cleanAvgEv - flaggedAvgEv).toFixed(2));
+      const pValue = twoProportionPValue(cleanWins, clean.length, flaggedWins, flagged.length);
+
+      let status: ShadowModeComparison['ablationTests'][0]['status'] = 'NEEDS_MORE_DATA';
+      if (flagged.length >= 20 && clean.length >= 20 && pValue < 0.05) {
+        status = marginalEVUnitsDelta > 0 ? 'PROMOTABLE' : 'REJECTED';
+      }
+
+      return {
+        componentId,
+        componentName,
+        description,
+        sampleSize,
+        marginalWinRateDelta,
+        marginalEVUnitsDelta,
+        pValue,
+        status,
+      };
+    };
+
     const ablationTests: ShadowModeComparison['ablationTests'] = [
-      {
-        componentId: 'liquidity_sweep_defense',
-        componentName: 'Liquidity Sweeps & Trap Filter',
-        description: 'Penalizes/rejects signals that execute immediately into unmitigated liquidity sweeps or false breakout traps.',
-        sampleSize: Math.max(14, memory.filter(m => m.activeBehaviors.includes('LIQUIDITY_SWEEP_CLUSTERS') || m.activeBehaviors.includes('FAILED_BREAKOUT_TRAP')).length),
-        marginalWinRateDelta: 4.8,
-        marginalEVUnitsDelta: 3.42,
-        pValue: 0.024,
-        status: 'PROMOTABLE',
-      },
-      {
-        componentId: 'panic_fomo_attenuation',
-        componentName: 'Panic / FOMO Momentum Attenuation',
-        description: 'Shrinks position conviction when exhaustion moves indicate herd panic or late parabolic chasing.',
-        sampleSize: Math.max(18, memory.filter(m => m.activeBehaviors.includes('FEAR_PANIC') || m.activeBehaviors.includes('FOMO_LATE_ENTRY')).length),
-        marginalWinRateDelta: 3.2,
-        marginalEVUnitsDelta: 2.18,
-        pValue: 0.038,
-        status: 'PROMOTABLE',
-      },
-      {
-        componentId: 'bot_calibration_shrinkage',
-        componentName: 'Bot Overconfidence Shrinkage (Brier/ECE)',
-        description: 'Applies automated variance penalty when empirical calibration error exceeds threshold.',
-        sampleSize: Math.max(30, baselineTotal),
-        marginalWinRateDelta: 2.1,
-        marginalEVUnitsDelta: 1.65,
-        pValue: 0.045,
-        status: 'PROMOTABLE',
-      },
-      {
-        componentId: 'indecision_choppiness_guard',
-        componentName: 'Market Indecision Rejection',
-        description: 'Directly filters signals during low-ATR compressions with alternating direction wicks.',
-        sampleSize: Math.max(11, memory.filter(m => m.activeBehaviors.includes('MARKET_INDECISION')).length),
-        marginalWinRateDelta: 1.9,
-        marginalEVUnitsDelta: 1.10,
-        pValue: 0.078,
-        status: 'NEEDS_MORE_DATA',
-      },
-      {
-        componentId: 'loss_aversion_defense',
-        componentName: 'Loss Aversion & Breakeven Defense',
-        description: 'Detects stall clusters at round numbers and breakeven defense zones before entry trigger.',
-        sampleSize: Math.max(8, memory.filter(m => m.activeBehaviors.includes('LOSS_AVERSION_DEFENSE')).length),
-        marginalWinRateDelta: 0.8,
-        marginalEVUnitsDelta: 0.45,
-        pValue: 0.142,
-        status: 'NEEDS_MORE_DATA',
-      },
+      computeEmpiricalAblation(
+        'liquidity_sweep_defense',
+        'Liquidity Sweeps & Trap Filter',
+        'Measures whether skipping entries into unmitigated liquidity sweeps or false breakout traps improves settled win rate & EV.',
+        m => m.activeBehaviors.includes('LIQUIDITY_SWEEP_CLUSTERS') || m.activeBehaviors.includes('FAILED_BREAKOUT_TRAP')
+      ),
+      computeEmpiricalAblation(
+        'panic_fomo_attenuation',
+        'Panic / FOMO Momentum Attenuation',
+        'Measures empirical EV separation when exhaustion / late-entry catalysts are active.',
+        m => m.activeBehaviors.includes('FEAR_PANIC') || m.activeBehaviors.includes('FOMO_LATE_ENTRY')
+      ),
+      computeEmpiricalAblation(
+        'bot_calibration_shrinkage',
+        'Bot Overconfidence Shrinkage (Brier/ECE)',
+        'Evaluates settled trades where probability shrinkage reduced stated confidence below baseline.',
+        m => m.adjustedConfidence < m.baselineConfidence - 0.01
+      ),
+      computeEmpiricalAblation(
+        'indecision_choppiness_guard',
+        'Market Indecision Rejection',
+        'Measures performance gap on low-ATR compression / alternating-wick indecision bars.',
+        m => m.activeBehaviors.includes('MARKET_INDECISION')
+      ),
+      computeEmpiricalAblation(
+        'loss_aversion_defense',
+        'Loss Aversion & Breakeven Defense',
+        'Measures performance impact when stall clusters at round numbers or defense zones trigger.',
+        m => m.activeBehaviors.includes('LOSS_AVERSION_DEFENSE')
+      ),
     ];
 
     const comp: ShadowModeComparison = {
@@ -2357,6 +2462,62 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
     this.state.allowAllConfiguredPairs = Boolean(allow);
     this.scheduleSave('high');
     return this.state.allowAllConfiguredPairs;
+  }
+
+  public getBotRuntimeControls() {
+    const cur = this.state.botRuntimeControls;
+    const validSessions = new Set<MarketSessionId>(['ASIA', 'LONDON', 'OVERLAP', 'NEW_YORK']);
+    const sessions = Array.isArray(cur?.tradingSessions)
+      ? cur!.tradingSessions.filter(s => validSessions.has(s))
+      : (['ASIA', 'LONDON', 'OVERLAP', 'NEW_YORK'] as MarketSessionId[]);
+    return {
+      globalKillSwitch: cur?.globalKillSwitch === true,
+      enabled: cur?.enabled !== false,
+      minConfidence:
+        typeof cur?.minConfidence === 'number' && Number.isFinite(cur.minConfidence)
+          ? Math.max(0.5, Math.min(0.95, cur.minConfidence))
+          : 0.70,
+      maxConcurrentTrades:
+        typeof cur?.maxConcurrentTrades === 'number' && Number.isFinite(cur.maxConcurrentTrades)
+          ? Math.max(1, Math.min(20, Math.round(cur.maxConcurrentTrades)))
+          : 6,
+      dynamicSpreadGate: cur?.dynamicSpreadGate !== false,
+      maxSpreadPips:
+        typeof cur?.maxSpreadPips === 'number' && Number.isFinite(cur.maxSpreadPips)
+          ? Math.max(0.5, Math.min(10, cur.maxSpreadPips))
+          : 2.5,
+      tradingSessions: sessions.length > 0 ? sessions : (['ASIA', 'LONDON', 'OVERLAP', 'NEW_YORK'] as MarketSessionId[]),
+      updatedAtUtc: cur?.updatedAtUtc,
+    };
+  }
+
+  public saveBotRuntimeControls(updates: Partial<NonNullable<DatabaseSchema['botRuntimeControls']>>) {
+    const prev = this.getBotRuntimeControls();
+    const validSessions = new Set<MarketSessionId>(['ASIA', 'LONDON', 'OVERLAP', 'NEW_YORK']);
+    const nextSessions = Array.isArray(updates.tradingSessions)
+      ? updates.tradingSessions.filter(s => validSessions.has(s))
+      : prev.tradingSessions;
+    this.state.botRuntimeControls = {
+      globalKillSwitch: typeof updates.globalKillSwitch === 'boolean' ? updates.globalKillSwitch : prev.globalKillSwitch,
+      enabled: typeof updates.enabled === 'boolean' ? updates.enabled : prev.enabled,
+      minConfidence:
+        typeof updates.minConfidence === 'number' && Number.isFinite(updates.minConfidence)
+          ? Math.max(0.5, Math.min(0.95, updates.minConfidence))
+          : prev.minConfidence,
+      maxConcurrentTrades:
+        typeof updates.maxConcurrentTrades === 'number' && Number.isFinite(updates.maxConcurrentTrades)
+          ? Math.max(1, Math.min(20, Math.round(updates.maxConcurrentTrades)))
+          : prev.maxConcurrentTrades,
+      dynamicSpreadGate: typeof updates.dynamicSpreadGate === 'boolean' ? updates.dynamicSpreadGate : prev.dynamicSpreadGate,
+      maxSpreadPips:
+        typeof updates.maxSpreadPips === 'number' && Number.isFinite(updates.maxSpreadPips)
+          ? Math.max(0.5, Math.min(10, updates.maxSpreadPips))
+          : prev.maxSpreadPips,
+      tradingSessions: nextSessions.length > 0 ? nextSessions : prev.tradingSessions,
+      updatedAtUtc: new Date().toISOString(),
+    };
+    this.scheduleSave('high');
+    return this.getBotRuntimeControls();
   }
 }
 

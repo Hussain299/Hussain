@@ -128,9 +128,10 @@ apiRouter.get('/scan', async (_req: Request, res: Response) => {
       const { candles, source, qualityScore } = await dataFeedEngine.fetchCandles(pair, 30);
       const lastCandle = candles[candles.length - 1];
       const firstCandle = candles[0];
-      const change24hPct = firstCandle
-        ? Number((((lastCandle.close - firstCandle.open) / firstCandle.open) * 100).toFixed(2))
-        : 0;
+      const change24hPct =
+        firstCandle && lastCandle && Number.isFinite(firstCandle.open) && firstCandle.open > 0
+          ? Number((((lastCandle.close - firstCandle.open) / firstCandle.open) * 100).toFixed(2))
+          : 0;
 
       scanResults.push({
         symbol: pair,
@@ -155,10 +156,11 @@ apiRouter.get('/scan', async (_req: Request, res: Response) => {
 // POST /api/analyze — Deep quantitative analysis for a specific pair
 apiRouter.post('/analyze', async (req: Request, res: Response) => {
   try {
-    const rawSymbol = ((req.body.symbol as string) || 'EUR/USD').toUpperCase();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rawSymbol = String(body.symbol || 'EUR/USD').toUpperCase();
     const symbol = FOREX_PAIRS.find(p => p.replace('/', '') === rawSymbol.replace('/', '')) || 'EUR/USD';
-    const horizon = Number(req.body.horizon) || 10;
-    const ruleFamily = (req.body.ruleFamily as RuleFamily) || 'momentum_5';
+    const horizon = Number(body.horizon) || 10;
+    const ruleFamily = (body.ruleFamily as RuleFamily) || 'momentum_5';
 
     const candles = historicalDataStore.getCandles(symbol);
     if (candles.length < 10_000) {
@@ -277,10 +279,11 @@ apiRouter.get('/strategies/synthesized', (_req: Request, res: Response) => {
 // Historical market-data import and audit endpoints. Files are kept outside the rolling live cache.
 apiRouter.post('/research/candles/import', (req: Request, res: Response) => {
   try {
-    const rawSymbol = String(req.body.symbol || '').toUpperCase();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rawSymbol = String(body.symbol || '').toUpperCase();
     const symbol = FOREX_PAIRS.find(p => p.replace('/', '') === rawSymbol.replace('/', ''));
     if (!symbol) return res.status(400).json({ error: 'Unknown or unsupported forex pair.' });
-    const result = historicalDataStore.importCandles(symbol, req.body.candles);
+    const result = historicalDataStore.importCandles(symbol, body.candles);
     res.json({ success: true, result, nextStep: 'Validate candidate strategies for this pair.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -298,22 +301,24 @@ apiRouter.get('/strategies/performance', (_req: Request, res: Response) => {
 // Validate one generated candidate against its pair's uploaded historical candles.
 apiRouter.post('/strategies/validate', (req: Request, res: Response) => {
   try {
-    const gene = db.getSynthesizedStrategyById(String(req.body.geneId || ''));
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const gene = db.getSynthesizedStrategyById(String(body.geneId || ''));
     if (!gene) return res.status(404).json({ error: 'Strategy candidate not found.' });
-    const symbol = gene.symbol || FOREX_PAIRS.find(p => p.replace('/', '') === String(req.body.symbol || '').toUpperCase().replace('/', ''));
+    const symbol = gene.symbol || FOREX_PAIRS.find(p => p.replace('/', '') === String(body.symbol || '').toUpperCase().replace('/', ''));
     if (!symbol) return res.status(400).json({ error: 'The candidate has no currency pair. Supply a valid symbol.' });
     const candles = historicalDataStore.getCandles(symbol);
     const validated = researchEngine.validateSynthesizedStrategy({ ...gene, symbol }, candles);
     res.json({ success: true, gene: validated });
   } catch (err: any) {
-    res.status(409).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
 // Run a real 300-candidate symbolic search against imported M1 history.
 apiRouter.post('/strategies/search-batch', (req: Request, res: Response) => {
   try {
-    const rawSymbol = String(req.body.symbol || '').toUpperCase();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rawSymbol = String(body.symbol || '').toUpperCase();
     const symbol = FOREX_PAIRS.find(pair => pair.replace('/', '') === rawSymbol.replace('/', ''));
     if (!symbol) return res.status(400).json({ error: 'Choose a supported forex pair.' });
     const activeJob = [...strategySearchJobs.values()].find(job => job.status === 'RUNNING');
@@ -365,9 +370,10 @@ apiRouter.post('/strategies/search-batch', (req: Request, res: Response) => {
         .sort((a, b) =>
           Number(b.status === 'PAPER_TRADING') - Number(a.status === 'PAPER_TRADING') ||
           Number(!!b.backtestMetrics) - Number(!!a.backtestMetrics) ||
-          (b.discoveryMetrics?.validationExpectedValueUnits ?? b.backtestMetrics?.validationWinRate ?? 0) -
-            (a.discoveryMetrics?.validationExpectedValueUnits ?? a.backtestMetrics?.validationWinRate ?? 0) ||
-          (b.discoveryMetrics?.validationWinRate ?? 0) - (a.discoveryMetrics?.validationWinRate ?? 0)
+          (b.discoveryMetrics?.validationExpectedValueUnits ?? -Infinity) -
+            (a.discoveryMetrics?.validationExpectedValueUnits ?? -Infinity) ||
+          (b.backtestMetrics?.validationWinRate ?? b.discoveryMetrics?.validationWinRate ?? 0) -
+            (a.backtestMetrics?.validationWinRate ?? a.discoveryMetrics?.validationWinRate ?? 0)
         )
         .slice(0, 10)
         .map(gene => ({
@@ -531,7 +537,7 @@ apiRouter.post('/evolution/run', async (_req: Request, res: Response) => {
       cronState: db.getCronState(),
     });
   } catch (err: any) {
-    res.status(409).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1098,16 +1104,6 @@ apiRouter.get('/telegram/status', async (_req: Request, res: Response) => {
 });
 
 // POST /api/telegram/sync — Trigger getUpdates to auto-discover subscribers
-apiRouter.post('/api/telegram/sync', async (_req: Request, res: Response) => {
-  try {
-    const syncRes = await telegramService.syncSubscribersFromUpdates();
-    res.json(syncRes);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Also support without /api prefix for router mounting convenience
 apiRouter.post('/telegram/sync', async (_req: Request, res: Response) => {
   try {
     const syncRes = await telegramService.syncSubscribersFromUpdates();
@@ -1120,7 +1116,8 @@ apiRouter.post('/telegram/sync', async (_req: Request, res: Response) => {
 // POST /api/telegram/subscribers — Manually add a subscriber (Chat ID or Channel)
 apiRouter.post('/telegram/subscribers', (req: Request, res: Response) => {
   try {
-    const { id, name, username, type } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { id, name, username, type } = body;
     if (!id) {
       return res.status(400).json({ error: 'Subscriber chat id is required' });
     }
@@ -1136,7 +1133,7 @@ apiRouter.post('/telegram/subscribers', (req: Request, res: Response) => {
     db.addTelegramSubscriber({
       id,
       name: name || `Subscriber ${id}`,
-      username: username ? username.replace(/^@/, '') : undefined,
+      username: typeof username === 'string' && username.trim() ? username.replace(/^@/, '') : undefined,
       type: type || 'user',
       addedAt: nowIst,
     });
@@ -1171,14 +1168,17 @@ apiRouter.delete('/telegram/subscribers/:id', (req: Request, res: Response) => {
 // POST /api/telegram/settings — Update Telegram notification preferences
 apiRouter.post('/telegram/settings', (req: Request, res: Response) => {
   try {
-    const { enabled, botToken, notifyOnNewSignal, notifyOnSettlement, minConfidence } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const { enabled, botToken, notifyOnNewSignal, notifyOnSettlement, minConfidence } = body;
 
     const updates: any = {};
     if (typeof enabled === 'boolean') updates.enabled = enabled;
     if (typeof botToken === 'string' && botToken.trim()) updates.botToken = botToken.trim();
     if (typeof notifyOnNewSignal === 'boolean') updates.notifyOnNewSignal = notifyOnNewSignal;
     if (typeof notifyOnSettlement === 'boolean') updates.notifyOnSettlement = notifyOnSettlement;
-    if (typeof minConfidence === 'number') updates.minConfidence = Math.max(0.5, Math.min(0.99, minConfidence));
+    if (typeof minConfidence === 'number' && Number.isFinite(minConfidence)) {
+      updates.minConfidence = Math.max(0.5, Math.min(0.99, minConfidence));
+    }
 
     const updated = db.saveTelegramConfig(updates);
     res.json({
@@ -1290,10 +1290,11 @@ apiRouter.get('/bot-controls/pairs', (_req: Request, res: Response) => {
 // POST /api/bot-controls/pairs — Update backend-persisted manual pair selection
 apiRouter.post('/bot-controls/pairs', (req: Request, res: Response) => {
   try {
-    const rawPairs = Array.isArray(req.body?.allowedPairs)
-      ? req.body.allowedPairs
-      : Array.isArray(req.body?.pairs)
-      ? req.body.pairs
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rawPairs = Array.isArray(body.allowedPairs)
+      ? body.allowedPairs
+      : Array.isArray(body.pairs)
+      ? body.pairs
       : null;
     if (!rawPairs) {
       return res.status(400).json({ ok: false, error: 'Expected allowedPairs array.' });
@@ -1303,6 +1304,40 @@ apiRouter.post('/bot-controls/pairs', (req: Request, res: Response) => {
       ok: true,
       pairs: savedPairs,
       tradingMode: autonomousScheduler.getTradingMode(),
+      universe: autonomousScheduler.getActiveTradingUniverse(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/bot-controls — Fetch persisted runtime risk/execution controls enforced by scheduler
+apiRouter.get('/bot-controls', (_req: Request, res: Response) => {
+  res.json({
+    ok: true,
+    controls: db.getBotRuntimeControls(),
+    manualPairs: db.getManualPairs(),
+  });
+});
+
+// POST /api/bot-controls — Persist and apply manual risk/killswitch controls on backend
+apiRouter.post('/bot-controls', (req: Request, res: Response) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const saved = db.saveBotRuntimeControls({
+      globalKillSwitch: typeof body.globalKillSwitch === 'boolean' ? body.globalKillSwitch : undefined,
+      enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
+      minConfidence: typeof body.minConfidence === 'number' ? body.minConfidence : undefined,
+      maxConcurrentTrades: typeof body.maxConcurrentTrades === 'number' ? body.maxConcurrentTrades : undefined,
+      dynamicSpreadGate: typeof body.dynamicSpreadGate === 'boolean' ? body.dynamicSpreadGate : undefined,
+      maxSpreadPips: typeof body.maxSpreadPips === 'number' ? body.maxSpreadPips : undefined,
+      tradingSessions: Array.isArray(body.tradingSessions) ? body.tradingSessions : undefined,
+    });
+    const manualPairs = Array.isArray(body.allowedPairs) ? db.saveManualPairs(body.allowedPairs) : db.getManualPairs();
+    return res.json({
+      ok: true,
+      controls: saved,
+      manualPairs,
       universe: autonomousScheduler.getActiveTradingUniverse(),
     });
   } catch (err: any) {

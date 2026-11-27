@@ -235,17 +235,20 @@ export class TelegramService {
       };
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 7000);
-
       const res = await fetch(this.getApiUrl('getMe'), {
         signal: controller.signal,
       });
-      clearTimeout(timeoutId);
 
-      const data = await res.json();
-      if (data.ok && data.result) {
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        return { ok: false, error: `Telegram API returned HTTP ${res.status} (${res.statusText || 'non-JSON response'})` };
+      }
+      if (res.ok && data?.ok && data.result) {
         this.cachedBotInfo = {
           id: data.result.id,
           username: data.result.username || '',
@@ -260,7 +263,7 @@ export class TelegramService {
 
         return { ok: true, bot: this.cachedBotInfo };
       }
-      const rawErr = data.description || 'Failed to authenticate Telegram bot token';
+      const rawErr = data?.description || `HTTP ${res.status}`;
       return {
         ok: false,
         error: rawErr === 'Not Found'
@@ -269,6 +272,8 @@ export class TelegramService {
       };
     } catch (err: any) {
       return { ok: false, error: err.name === 'AbortError' ? 'Telegram API request timed out' : err.message };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -293,25 +298,34 @@ export class TelegramService {
     }
 
     this.isSyncing = true;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
-
       const queryUrl = this.lastUpdateOffset > 0
         ? `${this.getApiUrl('getUpdates')}?offset=${this.lastUpdateOffset + 1}&limit=100`
         : `${this.getApiUrl('getUpdates')}?limit=100`;
 
       const res = await fetch(queryUrl, { signal: controller.signal });
-      clearTimeout(timeoutId);
 
-      const data = await res.json();
-      if (!data.ok || !Array.isArray(data.result)) {
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
         return {
           success: false,
           discoveredCount: 0,
           totalSubscribers: db.getTelegramConfig().subscribers.length,
           subscribers: db.getTelegramConfig().subscribers,
-          error: data.description || 'Could not fetch updates from Telegram',
+          error: `Telegram getUpdates returned HTTP ${res.status}`,
+        };
+      }
+      if (!res.ok || !data?.ok || !Array.isArray(data.result)) {
+        return {
+          success: false,
+          discoveredCount: 0,
+          totalSubscribers: db.getTelegramConfig().subscribers.length,
+          subscribers: db.getTelegramConfig().subscribers,
+          error: data?.description || `Could not fetch updates from Telegram (HTTP ${res.status})`,
         };
       }
 
@@ -377,6 +391,7 @@ export class TelegramService {
         error: err.name === 'AbortError' ? 'Sync request timed out' : err.message,
       };
     } finally {
+      clearTimeout(timeoutId);
       this.isSyncing = false;
     }
   }
@@ -385,10 +400,9 @@ export class TelegramService {
    * Send arbitrary HTML message to a specific Telegram chat ID
    */
   public async sendMessage(chatId: string | number, htmlMessage: string): Promise<{ ok: boolean; error?: string }> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 7000);
-
       const res = await fetch(this.getApiUrl('sendMessage'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -400,15 +414,21 @@ export class TelegramService {
         }),
         signal: controller.signal,
       });
-      clearTimeout(timeoutId);
 
-      const data = await res.json();
-      if (!data.ok) {
-        return { ok: false, error: data.description || `HTTP ${res.status}` };
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        return { ok: false, error: `HTTP ${res.status}` };
+      }
+      if (!res.ok || !data?.ok) {
+        return { ok: false, error: data?.description || `HTTP ${res.status}` };
       }
       return { ok: true };
     } catch (err: any) {
       return { ok: false, error: err.name === 'AbortError' ? 'Delivery timed out' : err.message };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -446,8 +466,13 @@ export class TelegramService {
    * Format and send an institutional trading signal alert
    */
   public async sendSignalAlert(signal: ResearchSignal): Promise<TelegramDispatchResult[]> {
-    // Fail-closed broker eligibility check: never dispatch new alerts for legacy or ineligible pairs.
-    if (!isValidBrokerEligibilitySnapshot(signal.brokerEligibility, signal.symbol)) {
+    // Fail-closed broker eligibility check: allow Olymp-verified signals or explicit Manual/All-29 authorized signals.
+    const hasOlympEligibility = isValidBrokerEligibilitySnapshot(signal.brokerEligibility, signal.symbol);
+    const hasManualOverride =
+      signal.manualPairAuthorization?.mode === 'MANUAL_ACTIVE' &&
+      signal.manualPairAuthorization.pair === signal.symbol &&
+      db.getAllowAllConfiguredPairs();
+    if (!hasOlympEligibility && !hasManualOverride) {
       console.warn(
         `[Telegram] Blocked dispatch for ${signal.symbol} (${signal.id}): missing or stale Olymp Trade eligibility snapshot.`
       );
@@ -660,10 +685,10 @@ export class TelegramService {
       }
 
       const deliveredCount = results.filter(r => r.success).length;
-      if (deliveredCount > 0) {
+      if (deliveredCount > 0 && !options?.targetChatId) {
         trade.telegramAuditSentAt = trade.telegramAuditSentAt || new Date().toISOString();
         db.updateSignal(trade);
-      } else if (!forceResend) {
+      } else if (deliveredCount === 0 && !forceResend) {
         // Release in-memory lock if zero subscribers or transient failure prevented delivery
         this.dispatchedAuditSignalIds.delete(trade.id);
       }

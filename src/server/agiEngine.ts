@@ -237,21 +237,24 @@ export class AgiSelfLearningEngine {
     };
 
     const arm = this.banditArms[strategyId];
-    if (arm && arm.status === 'THROTTLED') {
-      if (checkRecoveryProbe(arm.lastUpdated)) {
+    if (arm) {
+      if (arm.status === 'THROTTLED') {
+        if (checkRecoveryProbe(arm.lastUpdated)) {
+          return {
+            throttled: false,
+            recoveryProbe: true,
+            winRate: arm.currentWinRate,
+            sampleSize: arm.wins + arm.losses,
+          };
+        }
         return {
-          throttled: false,
-          recoveryProbe: true,
+          throttled: true,
           winRate: arm.currentWinRate,
           sampleSize: arm.wins + arm.losses,
+          reason: `Bandit Arm THROTTLED: ${arm.strategyName} is ${arm.wins}W-${arm.losses}L (${arm.currentWinRate.toFixed(1)}% WR < 55.6% break-even floor across ${arm.wins + arm.losses} settled trades).`,
         };
       }
-      return {
-        throttled: true,
-        winRate: arm.currentWinRate,
-        sampleSize: arm.wins + arm.losses,
-        reason: `Bandit Arm THROTTLED: ${arm.strategyName} is ${arm.wins}W-${arm.losses}L (${arm.currentWinRate.toFixed(1)}% WR < 55.6% break-even floor across ${arm.wins + arm.losses} settled trades).`,
-      };
+      return { throttled: false };
     }
 
     // Also verify directly against persisted strategyPerformance in case arm wasn't synced yet

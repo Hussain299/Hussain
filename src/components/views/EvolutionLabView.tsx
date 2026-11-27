@@ -54,6 +54,19 @@ export const EvolutionLabView: React.FC<EvolutionLabViewProps> = ({
   const [searchError, setSearchError] = React.useState('');
   const [historyImportBusy, setHistoryImportBusy] = React.useState(false);
   const [historyImportStatus, setHistoryImportStatus] = React.useState('');
+  const mountedRef = React.useRef(true);
+  const pollTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const formatIST = (timestampStr?: string) => {
     if (!timestampStr) return '--:--:-- IST';
@@ -151,28 +164,52 @@ export const EvolutionLabView: React.FC<EvolutionLabViewProps> = ({
         throw new Error(`Parsed ${candles.length.toLocaleString()} valid chronological candles; 30,000 required.`);
       }
 
-      setHistoryImportStatus(`Uploading ${candles.length.toLocaleString()} candles…`);
-      const response = await fetch('/api/research/candles/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol: searchPair, candles }),
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Import failed.');
-      setHistoryCounts(prev => ({ ...prev, [searchPair]: result.count || candles.length }));
-      setHistoryImportStatus(`Imported ${candles.length.toLocaleString()} candles for ${searchPair} into historical store.`);
+      const CHUNK_SIZE = 15_000;
+      let latestTotalStored = candles.length;
+      for (let offset = 0; offset < candles.length; offset += CHUNK_SIZE) {
+        const chunk = candles.slice(offset, offset + CHUNK_SIZE);
+        const uploadedEnd = Math.min(candles.length, offset + chunk.length);
+        if (mountedRef.current) {
+          setHistoryImportStatus(
+            `Uploading ${uploadedEnd.toLocaleString()} / ${candles.length.toLocaleString()} candles…`
+          );
+        }
+        const response = await fetch('/api/research/candles/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: searchPair, candles: chunk }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Import failed.');
+        if (typeof result.result?.totalStored === 'number') {
+          latestTotalStored = result.result.totalStored;
+        }
+      }
+      if (!mountedRef.current) return;
+      setHistoryCounts(prev => ({ ...prev, [searchPair]: latestTotalStored }));
+      setHistoryImportStatus(
+        `Imported ${candles.length.toLocaleString()} candles for ${searchPair} (${latestTotalStored.toLocaleString()} total stored).`
+      );
     } catch (error: any) {
-      setSearchError(error.message || 'CSV import failed.');
+      if (mountedRef.current) {
+        setSearchError(error.message || 'CSV import failed.');
+      }
     } finally {
-      setHistoryImportBusy(false);
+      if (mountedRef.current) {
+        setHistoryImportBusy(false);
+      }
     }
   };
 
   const runThreeHundredSearch = async () => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
     setIsSearchingBatch(true);
     setSearchError('');
     try {
-      const response = await fetch('/api/research/strategy-search/start', {
+      const response = await fetch('/api/strategies/search-batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: searchPair }),
@@ -182,20 +219,30 @@ export const EvolutionLabView: React.FC<EvolutionLabViewProps> = ({
 
       const jobId = data.jobId;
       const poll = async () => {
+        if (!mountedRef.current) return;
         try {
-          const statusRes = await fetch(`/api/research/strategy-search/status?jobId=${jobId}`);
+          const statusRes = await fetch(`/api/strategies/search-batch/${encodeURIComponent(jobId)}`);
           const statusData = await statusRes.json();
-          setSearchBatch(statusData.batch);
-          if (statusData.batch.status === 'RUNNING') {
-            setTimeout(poll, 1500);
+          if (!statusRes.ok) {
+            throw new Error(statusData?.error || 'Failed to poll strategy search status.');
+          }
+          if (!mountedRef.current) return;
+          setSearchBatch(statusData);
+          if (statusData.status === 'RUNNING') {
+            pollTimerRef.current = setTimeout(poll, 1500);
           } else {
+            if (statusData.status === 'FAILED' && statusData.error) {
+              setSearchError(statusData.error);
+            }
             setIsSearchingBatch(false);
           }
-        } catch {
+        } catch (err: any) {
+          if (!mountedRef.current) return;
+          setSearchError(err?.message || 'Failed to poll strategy search status.');
           setIsSearchingBatch(false);
         }
       };
-      setTimeout(poll, 1000);
+      pollTimerRef.current = setTimeout(poll, 1000);
     } catch (error: any) {
       setSearchError(error.message || 'Strategy search failed.');
       setIsSearchingBatch(false);

@@ -5,52 +5,81 @@ interface BeforeInstallPromptEvent extends Event {
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
 }
 
+let sharedDeferredPrompt: BeforeInstallPromptEvent | null = null;
+let sharedIsInstalled = false;
+const promptSubscribers = new Set<() => void>();
+let listenersAttached = false;
+
+function notifyPromptSubscribers() {
+  promptSubscribers.forEach(cb => cb());
+}
+
+function ensureInstallListeners() {
+  if (listenersAttached || typeof window === 'undefined') return;
+  listenersAttached = true;
+  sharedIsInstalled =
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+
+  window.addEventListener('beforeinstallprompt', (e: Event) => {
+    e.preventDefault();
+    sharedDeferredPrompt = e as BeforeInstallPromptEvent;
+    notifyPromptSubscribers();
+  });
+
+  window.addEventListener('appinstalled', () => {
+    sharedIsInstalled = true;
+    sharedDeferredPrompt = null;
+    notifyPromptSubscribers();
+  });
+}
+
 export function usePWAInstall() {
-  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
-  const [isInstalled, setIsInstalled] = useState(false);
+  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(() => {
+    ensureInstallListeners();
+    return sharedDeferredPrompt;
+  });
+  const [isInstalled, setIsInstalled] = useState(() => {
+    ensureInstallListeners();
+    return sharedIsInstalled;
+  });
   const [isIOS, setIsIOS] = useState(false);
 
   useEffect(() => {
-    // Detect standalone mode (already installed or running as PWA)
-    const isStandalone =
-      window.matchMedia('(display-mode: standalone)').matches ||
-      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
-    setIsInstalled(isStandalone);
+    ensureInstallListeners();
+    const sync = () => {
+      setDeferredPrompt(sharedDeferredPrompt);
+      setIsInstalled(sharedIsInstalled);
+    };
+    sync();
+    promptSubscribers.add(sync);
 
     // Detect iOS devices
     const userAgent = window.navigator.userAgent.toLowerCase();
-    const isIOSDevice = /iphone|ipad|ipod/.test(userAgent);
-    setIsIOS(isIOSDevice);
-
-    const handleBeforeInstallPrompt = (e: Event) => {
-      e.preventDefault();
-      setDeferredPrompt(e as BeforeInstallPromptEvent);
-    };
-
-    const handleAppInstalled = () => {
-      setIsInstalled(true);
-      setDeferredPrompt(null);
-    };
-
-    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
-    window.addEventListener('appinstalled', handleAppInstalled);
+    setIsIOS(/iphone|ipad|ipod/.test(userAgent));
 
     return () => {
-      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
-      window.removeEventListener('appinstalled', handleAppInstalled);
+      promptSubscribers.delete(sync);
     };
   }, []);
 
   const install = async () => {
-    if (!deferredPrompt) return false;
-    await deferredPrompt.prompt();
-    const { outcome } = await deferredPrompt.userChoice;
-    if (outcome === 'accepted') {
-      setIsInstalled(true);
-      setDeferredPrompt(null);
-      return true;
+    const promptEvent = sharedDeferredPrompt || deferredPrompt;
+    if (!promptEvent) return false;
+    sharedDeferredPrompt = null;
+    notifyPromptSubscribers();
+    try {
+      await promptEvent.prompt();
+      const { outcome } = await promptEvent.userChoice;
+      if (outcome === 'accepted') {
+        sharedIsInstalled = true;
+        notifyPromptSubscribers();
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
     }
-    return false;
   };
 
   return {

@@ -310,7 +310,7 @@ export class BehaviouralEngine {
         },
         {
           metricName: 'Range Compression at Boundary',
-          measuredValue: Number((currentRange / atr).toFixed(2)),
+          measuredValue: Number((currentRange / Math.max(0.00001, atr)).toFixed(2)),
           threshold: 0.7,
           interpretation: 'Range compression demonstrates heavy opposing liquidity clustering at previous pivot.',
         },
@@ -419,7 +419,7 @@ export class BehaviouralEngine {
       measurableEvidence: [
         {
           metricName: 'Candle Range to ATR Expansion',
-          measuredValue: Number((currentRange / atr).toFixed(2)),
+          measuredValue: Number((currentRange / Math.max(0.00001, atr)).toFixed(2)),
           threshold: 2.3,
           interpretation: 'Outlier candle range representing final climactic transfer from weak hands to strong hands.',
         },

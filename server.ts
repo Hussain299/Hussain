@@ -135,44 +135,55 @@ async function startServer() {
     outcomeRecovery.strategyOutcomesRecovered + ' strategy outcomes recovered.',
   );
 
+  let warmupTimer: NodeJS.Timeout | null = null;
+  let watchdogTimer: NodeJS.Timeout | null = null;
+
   // Open HTTP port immediately so health checks, /api/cron/tick, and Nginx proxy connections succeed right away
   app.listen(PORT, HOST, () => {
     console.log(`[SignalForge ML] Server running at http://${HOST}:${PORT} (${useProdStatic ? 'production-dist' : 'vite-dev'})`);
 
     // Defer background scheduler startup slightly so initial cold-start page loads get instant priority
-    setTimeout(() => {
+    warmupTimer = setTimeout(() => {
       autonomousScheduler.start();
       selfHealingSupervisor.runDiagnosticAndRepair();
     }, 3000);
 
     // Continuous autonomous self-healing & scheduler watchdog (every 60s)
-    setInterval(() => {
+    watchdogTimer = setInterval(() => {
       try {
         selfHealingSupervisor.runDiagnosticAndRepair();
         if (!autonomousScheduler.isRunning()) {
           console.warn('[Watchdog] autonomousScheduler was idle! Auto-restarting background coordinator...');
           autonomousScheduler.start();
         }
-      } catch {
-        // Silently continue
+      } catch (err: any) {
+        console.error('[Watchdog] Diagnostic or scheduler recovery error:', err?.message || err);
       }
     }, 60 * 1000);
   });
+
+  const handleGracefulShutdown = async (signal: string) => {
+    console.log(`[SignalForge ML] Received ${signal}. Flushing database state gracefully...`);
+    try {
+      if (warmupTimer) {
+        clearTimeout(warmupTimer);
+        warmupTimer = null;
+      }
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
+      autonomousScheduler.stop();
+      await db.shutdownAsync();
+    } catch (err: any) {
+      console.error('[SignalForge ML] Shutdown flush error:', err?.message || err);
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => { void handleGracefulShutdown('SIGTERM'); });
+  process.on('SIGINT', () => { void handleGracefulShutdown('SIGINT'); });
 }
-
-const handleGracefulShutdown = (signal: string) => {
-  console.log(`[SignalForge ML] Received ${signal}. Flushing database state synchronously...`);
-  try {
-    autonomousScheduler.stop();
-    db.saveStateSync();
-  } catch (err: any) {
-    console.error('[SignalForge ML] Shutdown flush error:', err?.message || err);
-  }
-  process.exit(0);
-};
-
-process.on('SIGTERM', () => handleGracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => handleGracefulShutdown('SIGINT'));
 
 process.on('uncaughtException', (err: any) => {
   console.error('[SignalForge ML Server] Uncaught exception caught safely:', err?.message || err);

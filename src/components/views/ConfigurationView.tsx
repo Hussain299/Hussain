@@ -40,33 +40,52 @@ export const ConfigurationView: React.FC = () => {
     enabled: boolean;
   } | null>(null);
   const [isSyncingTelegram, setIsSyncingTelegram] = useState(false);
+  const [actionError, setActionError] = useState<string>('');
 
   const fetchTelegramStatus = () => {
     fetch('/api/telegram/status')
-      .then(res => res.json())
+      .then(async res => {
+        if (!res.ok) throw new Error(`Failed to fetch Telegram status (${res.status})`);
+        return res.json();
+      })
       .then(data => setTelegramStatus(data))
-      .catch(console.error);
+      .catch(err => {
+        console.error(err);
+        setActionError(err?.message || 'Failed to load Telegram status.');
+      });
   };
 
   useEffect(() => {
     fetch('/api/system/export-d1')
-      .then(res => res.json())
+      .then(async res => {
+        if (!res.ok) throw new Error(`Failed to load D1 export (${res.status})`);
+        return res.json();
+      })
       .then(data => {
         setD1Schema(data.schemaSql || '');
         setWranglerToml(data.wranglerToml || '');
       })
-      .catch(console.error);
+      .catch(err => {
+        console.error(err);
+        setActionError(err?.message || 'Failed to load export artifacts.');
+      });
 
     fetchTelegramStatus();
   }, []);
 
   const handleSyncTelegram = async () => {
     setIsSyncingTelegram(true);
+    setActionError('');
     try {
-      await fetch('/api/telegram/sync', { method: 'POST' });
+      const res = await fetch('/api/telegram/sync', { method: 'POST' });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `Telegram sync failed (${res.status})`);
+      }
       fetchTelegramStatus();
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
+      setActionError(e?.message || 'Telegram subscriber sync failed.');
     } finally {
       setIsSyncingTelegram(false);
     }
@@ -74,14 +93,17 @@ export const ConfigurationView: React.FC = () => {
 
   const handleRunTests = async () => {
     setIsRunningTests(true);
+    setActionError('');
     try {
       const res = await fetch('/api/test/run', { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        setTestResults(data);
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
+        throw new Error(data?.error || `Verification suite failed (${res.status})`);
       }
-    } catch (e) {
+      setTestResults(data);
+    } catch (e: any) {
       console.error('Failed to run verification tests:', e);
+      setActionError(e?.message || 'Failed to run automated verification tests.');
     } finally {
       setIsRunningTests(false);
     }
@@ -120,6 +142,12 @@ export const ConfigurationView: React.FC = () => {
           <span>{isRunningTests ? 'Running Assertions...' : 'Run Automated Test Suite'}</span>
         </button>
       </div>
+
+      {actionError && (
+        <div className="bg-[#B7797D]/15 border border-[#B7797D]/40 text-[#B7797D] rounded-lg px-4 py-2.5 text-xs font-mono">
+          {actionError}
+        </div>
+      )}
 
       {/* Local storage and feed requirements */}
       <div className="bg-[#222B36] border border-[#354251] rounded-lg p-4 font-mono text-xs space-y-2">

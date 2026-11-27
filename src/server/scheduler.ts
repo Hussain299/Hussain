@@ -133,12 +133,14 @@ export class AutonomousScheduler {
   private static readonly CYCLE_STALL_TIMEOUT_MS = 75_000;
   private static readonly SYMBOL_FETCH_TIMEOUT_MS = 9_500;
   private isRunningCycle = false;
+  private activeCycleToken = 0;
   private currentCycleStartedAtMs = 0;
   private expectedAdvanceTargetMs = 0;
   // Preserve exact/cron scan requests when a slower sensing cycle currently owns the scheduler.
   private pendingSignalScan = false;
   private autopilotTimer: NodeJS.Timeout | null = null;
   private advanceTimer: NodeJS.Timeout | null = null;
+  private warmupTimer: NodeJS.Timeout | null = null;
   private autopilotIntervalMs = 25 * 1000; // Poll configured pairs every 25 seconds (plus exact 3M advance timer)
   private currentGeneration = 1;
   private cycleCount = 0;
@@ -187,6 +189,7 @@ export class AutonomousScheduler {
       nowMs - this.currentCycleStartedAtMs >= AutonomousScheduler.CYCLE_STALL_TIMEOUT_MS
     ) {
       const stalledForMs = nowMs - this.currentCycleStartedAtMs;
+      this.activeCycleToken++;
       this.isRunningCycle = false;
       this.currentCycleStartedAtMs = 0;
       this.logMind(
@@ -404,13 +407,22 @@ export class AutonomousScheduler {
     this.expectedAdvanceTargetMs = target3mMs;
 
     this.advanceTimer = setTimeout(() => {
-      if (this.isRunning()) {
-        // Queue the scan before invoking the pulse: the current 29-pair sensing
-        // cycle may still be running, and executeAutopilotPulse must not drop it.
-        this.pendingSignalScan = true;
-        void this.executeAutopilotPulse('EXACT_3M_ADVANCE_TRIGGER');
-        this.scheduleNext3MinuteAdvancePulse();
+      if (!this.isRunning()) return;
+      const firedAt = Date.now();
+      if (firedAt < target3mMs - 20) {
+        this.advanceTimer = setTimeout(() => {
+          if (!this.isRunning()) return;
+          this.pendingSignalScan = true;
+          void this.executeAutopilotPulse('EXACT_3M_ADVANCE_TRIGGER');
+          this.scheduleNext3MinuteAdvancePulse();
+        }, Math.max(10, target3mMs - firedAt));
+        return;
       }
+      // Queue the scan before invoking the pulse: the current 29-pair sensing
+      // cycle may still be running, and executeAutopilotPulse must not drop it.
+      this.pendingSignalScan = true;
+      void this.executeAutopilotPulse('EXACT_3M_ADVANCE_TRIGGER');
+      this.scheduleNext3MinuteAdvancePulse();
     }, delayMs);
   }
 
@@ -442,8 +454,12 @@ export class AutonomousScheduler {
     );
 
     // Defer initial warm pulse briefly so cold-start HTTP/Vite traffic gets full priority
-    setTimeout(() => {
-      this.executeAutopilotPulse('WARMUP');
+    if (this.warmupTimer) clearTimeout(this.warmupTimer);
+    this.warmupTimer = setTimeout(() => {
+      this.warmupTimer = null;
+      if (this.isRunning()) {
+        void this.executeAutopilotPulse('WARMUP');
+      }
     }, 4000);
 
     // Continuous autonomous pulse every 25 seconds (exact 3M timer still fires at :02, :07, :12...)
@@ -456,6 +472,10 @@ export class AutonomousScheduler {
   }
 
   public stop() {
+    if (this.warmupTimer) {
+      clearTimeout(this.warmupTimer);
+      this.warmupTimer = null;
+    }
     if (this.autopilotTimer) {
       clearInterval(this.autopilotTimer);
       this.autopilotTimer = null;
@@ -592,6 +612,7 @@ export class AutonomousScheduler {
       };
     }
 
+    const cycleToken = ++this.activeCycleToken;
     this.isRunningCycle = true;
     const startTime = Date.now();
     this.currentCycleStartedAtMs = startTime;
@@ -647,9 +668,22 @@ export class AutonomousScheduler {
           );
         }
 
-        this.isRunningCycle = false;
+        const weekendDurationMs = Date.now() - startTime;
+        db.logCronRun(
+          weekendDurationMs,
+          'SUCCESS',
+          `Autopilot pulse #${this.cycleCount} (${triggerSource}) weekend pause in ${weekendDurationMs}ms (${weekendSwept.length} swept).`
+        );
+        if (
+          weekendSwept.length > 0 ||
+          triggerSource === 'EXTERNAL_24_5_CRON' ||
+          triggerSource === 'SERVICE_WORKER_BACKGROUND_PULSE'
+        ) {
+          await db.flushAsync();
+        }
+        this.pipelineCounters.successfulExecutions++;
         return {
-          durationMs: Date.now() - startTime,
+          durationMs: weekendDurationMs,
           pairsProcessed: 0,
           signalsCreated: 0,
           signalsUpdated: weekendSwept.length,
@@ -769,7 +803,12 @@ export class AutonomousScheduler {
               sig.id
             );
           } else if (sig.lifecycleState === 'CLOSED') {
-            const tradeExp = db.recordForwardObservation(sig);
+            let tradeExp: ResearchExperiment | null = null;
+            try {
+              tradeExp = db.recordForwardObservation(sig);
+            } catch (err: any) {
+              console.warn(`[Scheduler] Skipped forward observation recording for ${sig.id}:`, err?.message || err);
+            }
             db.recordStrategyOutcome(sig);
             db.updateBehaviouralMemoryOutcome(sig.id, sig.outcomeResult, sig.netReturnPips, sig.netReturnUnits);
 
@@ -806,7 +845,7 @@ export class AutonomousScheduler {
                 'EXECUTION',
                 `Position closed for ${sig.symbol} ${sig.direction} at ${sig.actualExitPrice}. Move: ${
                   dispPips > 0 ? '+' : ''
-                }${dispPips} pips | Net: ${dispUnits > 0 ? '+' : ''}${dispUnits.toFixed(2)} U (${sig.outcomeResult}). Recorded as a forward paper observation ${tradeExp.id}.`,
+                }${dispPips} pips | Net: ${dispUnits > 0 ? '+' : ''}${dispUnits.toFixed(2)} U (${sig.outcomeResult}).${tradeExp ? ` Recorded as a forward paper observation ${tradeExp.id}.` : ''}`,
                 sig.symbol,
                 sig.id
               );
@@ -889,15 +928,38 @@ export class AutonomousScheduler {
         }
       }
 
-      // Emit new setups when capacity permits (up to 6 concurrent in-flight slots)
-      if (shouldScanForSignals && inFlightTrades.length >= 6) {
+      const runtimeControls = db.getBotRuntimeControls();
+      const maxConcurrentLimit = runtimeControls.maxConcurrentTrades;
+      const sessionBlockedByControls =
+        Array.isArray(runtimeControls.tradingSessions) &&
+        runtimeControls.tradingSessions.length > 0 &&
+        !runtimeControls.tradingSessions.includes(activeSession.id);
+
+      // Emit new setups when capacity permits and runtime bot controls are active
+      if (shouldScanForSignals && (runtimeControls.globalKillSwitch || !runtimeControls.enabled)) {
         this.logMind(
           'AUDITOR',
-          `[SIGNAL DISCOVERY BLOCKED] All 6 in-flight slots are occupied; ${inFlightSymbols.size} currency pairs already have pending contracts.`
+          `[BOT CONTROLS HALTED] Signal discovery paused by Manual Bot Controls (${runtimeControls.globalKillSwitch ? 'Global Kill Switch active' : 'Bot disabled'}).`
+        );
+      } else if (shouldScanForSignals && sessionBlockedByControls) {
+        this.logMind(
+          'AUDITOR',
+          `[SESSION FILTER PAUSED] Active session ${activeSession.id} is excluded by Manual Bot Controls (${runtimeControls.tradingSessions.join(', ')}).`
+        );
+      } else if (shouldScanForSignals && inFlightTrades.length >= maxConcurrentLimit) {
+        this.logMind(
+          'AUDITOR',
+          `[SIGNAL DISCOVERY BLOCKED] All ${maxConcurrentLimit} in-flight slots are occupied; ${inFlightSymbols.size} currency pairs already have pending contracts.`
         );
       }
 
-      if (shouldScanForSignals && inFlightTrades.length < 6) {
+      if (
+        shouldScanForSignals &&
+        !runtimeControls.globalKillSwitch &&
+        runtimeControls.enabled &&
+        !sessionBlockedByControls &&
+        inFlightTrades.length < maxConcurrentLimit
+      ) {
         const universe = this.getActiveTradingUniverse();
         if ((universe.mode !== 'OLYMP_ACTIVE' && universe.mode !== 'MANUAL_ACTIVE') || universe.pairs.length === 0) {
           this.pipelineCounters.brokerEligibilityRejections++;
@@ -950,9 +1012,9 @@ export class AutonomousScheduler {
 
           const lastEma9 = ema9[ema9.length - 1];
           const lastEma21 = ema21[ema21.length - 1];
-          const prevEma9 = ema9[ema9.length - 2] || lastEma9;
-          const prevEma21 = ema21[ema21.length - 2] || lastEma21;
-          const lastRsi = rsi14[rsi14.length - 1] || 50;
+          const prevEma9 = ema9[ema9.length - 2] ?? lastEma9;
+          const prevEma21 = ema21[ema21.length - 2] ?? lastEma21;
+          const lastRsi = rsi14[rsi14.length - 1] ?? 50;
 
           // 20-period Moving Average and Extremes
           const recent20 = candles.slice(-20);
@@ -1050,6 +1112,7 @@ export class AutonomousScheduler {
             // D. Antidote Immune Resistance Adjustment
             const immuneCheck = agiSelfLearningEngine.evaluateAntidoteImmuneResistance(symbol, novelGeneCandidate.direction, c);
             let finalConviction = Number(((novelGeneCandidate.conviction * 0.6) + (netEval.conviction * 0.4)).toFixed(2));
+            const minNovelFloor = Math.max(0.72, runtimeControls.minConfidence);
             if (immuneCheck.resistanceApplied) {
               finalConviction = Number(Math.max(0.50, finalConviction - immuneCheck.dampingPenalty).toFixed(2));
               this.logMind(
@@ -1057,10 +1120,10 @@ export class AutonomousScheduler {
                 `🛡️ [IMMUNE RESISTANCE]: Applied antidote damping (-${immuneCheck.dampingPenalty}) against active loss pattern "${immuneCheck.antidoteName}". Adjusted conviction: ${finalConviction}.`,
                 symbol
               );
-              if (finalConviction < 0.72) {
-                this.pipelineCounters.pidRejections++;
-                continue; // Suppressed below actionable threshold
-              }
+            }
+            if (finalConviction < minNovelFloor) {
+              this.pipelineCounters.pidRejections++;
+              continue; // Suppressed below actionable / user-configured threshold
             }
 
             const authNow = this.authorizeCandidateForSignalCreation(symbol, Date.now());
@@ -1339,13 +1402,14 @@ export class AutonomousScheduler {
             const pidMinFloor = Number(
               Math.max(0.70, Math.min(0.775, 0.72 + agiState.adaptiveThresholdDelta * 0.35)).toFixed(3)
             );
+            const effectiveMinFloor = Number(Math.max(pidMinFloor, runtimeControls.minConfidence).toFixed(3));
             adaptedConfidence = Number(Math.max(0.50, Math.min(0.95, adaptedConfidence)).toFixed(2));
 
-            if (adaptedConfidence < pidMinFloor) {
+            if (adaptedConfidence < effectiveMinFloor) {
               this.pipelineCounters.pidRejections++;
               this.logMind(
                 'AUDITOR',
-                `[PID + IMMUNE GATE] Blocked ${symbol} ${candidate.direction} (${strategyId}): Adapted conviction ${(adaptedConfidence * 100).toFixed(1)}% < PID floor ${(pidMinFloor * 100).toFixed(1)}% (delta=${agiState.adaptiveThresholdDelta >= 0 ? '+' : ''}${agiState.adaptiveThresholdDelta}${immune.resistanceApplied ? `, Immune: ${immune.antidoteName}` : ''}).`,
+                `[PID + IMMUNE GATE] Blocked ${symbol} ${candidate.direction} (${strategyId}): Adapted conviction ${(adaptedConfidence * 100).toFixed(1)}% < floor ${(effectiveMinFloor * 100).toFixed(1)}% (delta=${agiState.adaptiveThresholdDelta >= 0 ? '+' : ''}${agiState.adaptiveThresholdDelta}${immune.resistanceApplied ? `, Immune: ${immune.antidoteName}` : ''}).`,
                 symbol
               );
               continue;
@@ -1452,7 +1516,7 @@ export class AutonomousScheduler {
         const freshPairs = FOREX_PAIRS.filter(pair => (candlesMap[pair]?.length || 0) >= 35).length;
         this.logMind(
           'AUDITOR',
-          `[SIGNAL DISCOVERY EMPTY] Fresh real-feed pairs with 35+ M1 candles: ${freshPairs}/${FOREX_PAIRS.length}; pending pairs: ${inFlightSymbols.size}; in-flight slots: ${inFlightTrades.length}/6. No setup passed the existing confluence/adaptive filters.`
+          `[SIGNAL DISCOVERY EMPTY] Fresh real-feed pairs with 35+ M1 candles: ${freshPairs}/${FOREX_PAIRS.length}; pending pairs: ${inFlightSymbols.size}; in-flight slots: ${inFlightTrades.length}/${maxConcurrentLimit}. No setup passed the existing confluence/adaptive filters.`
         );
       }
 
@@ -1490,7 +1554,7 @@ export class AutonomousScheduler {
               testPair
             );
           } catch (e: any) {
-            // Quiet skip
+            console.warn('[Scheduler] Walk-forward audit skipped:', e?.message || e);
           }
         }
       }
@@ -1579,8 +1643,10 @@ export class AutonomousScheduler {
         topExperiment: null,
       };
     } finally {
-      this.isRunningCycle = false;
-      this.currentCycleStartedAtMs = 0;
+      if (cycleToken === this.activeCycleToken) {
+        this.isRunningCycle = false;
+        this.currentCycleStartedAtMs = 0;
+      }
     }
   }
 

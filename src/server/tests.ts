@@ -2363,9 +2363,9 @@ export async function runAllVerificationTests(): Promise<{
     // 1. Overextended BUY setup with weak counterfactual survival & immune penalty must draw Contrarian + Red-Team challenges
     const fragileVec = [
       0.8, 1.5, 2.0, 2.5, 1.0,
-      0.55, 0.52, 0.05, 0.47, 0.5,
-      1.2, 1.8, 0.4, 0.72, 0.72,
-      0.92, 0.94, 1.2, 0.0,
+      0.55, 0.52, 0.35, 1.2, 0.85,
+      -0.4, 0.82, 0.82, 0.92, 0.94,
+      1.2, 0.5, 0.4, 0.1,
     ];
     const councilInit = createInitialAgentCouncilState();
     const fragileDebate = runMultiAgentDebate(
@@ -2416,9 +2416,9 @@ export async function runAllVerificationTests(): Promise<{
     // 2. Robust aligned BUY setup should defend counterfactual suite cleanly
     const strongVec = [
       1.6, 2.8, 3.6, 4.4, 1.0,
-      0.78, 0.06, 0.12, -0.06, 0.85,
-      1.35, 3.2, 1.4, 0.12, 0.12,
-      0.62, 0.58, 1.25, 0.0,
+      0.78, -0.18, 0.85, 1.15, 1.45,
+      -0.35, 0.18, 0.18, 0.58, 0.54,
+      1.25, 0.68, 0.65, 0.05,
     ];
     const strongDebate = runMultiAgentDebate(
       {
@@ -3048,10 +3048,10 @@ export async function runAllVerificationTests(): Promise<{
     const { autonomousScheduler } = await import('./scheduler.js');
     const { hasFreshRealProviderCandles, getFreshRealCandleWindow } = await import('./dataFeeds.js');
 
-    // 1. Verify companion v1.3.3 manifest, pair format support, and drawer/tab retention logic
+    // 1. Verify companion v1.3.4 manifest, pair format support, and drawer/tab retention logic
     const manifest = JSON.parse(fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/manifest.json'), 'utf-8'));
-    if (manifest.version !== '1.3.3') {
-      throw new Error(`Expected companion manifest version 1.3.3, got ${manifest.version}`);
+    if (manifest.version !== '1.3.4') {
+      throw new Error(`Expected companion manifest version 1.3.4, got ${manifest.version}`);
     }
     const companionSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/content/olymptrade.js'), 'utf-8');
     const swSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/service-worker.js'), 'utf-8');
@@ -3293,6 +3293,189 @@ export async function runAllVerificationTests(): Promise<{
       else process.env.SIGNALFORGE_TRADING_MODE = prevMode;
       db.saveManualPairs(prevManual);
       db.setAllowAllConfiguredPairs(false);
+    }
+  });
+
+  await runTest('ML', 'AGI Bandit Recovery, BotAuditor Recency & 19D Council Indexing Regression Checks', async () => {
+    const { AgiSelfLearningEngine } = await import('./agiEngine.js');
+    const { BotAuditor } = await import('./botAuditor.js');
+    const { runCounterfactualStressSuite, runMultiAgentDebate, MultiAgentCouncilEngine } = await import('./multiAgentCouncil.js');
+
+    // 1. Recovered ACTIVE_ARM must not be re-throttled by lifetime unweighted WR < 55.6%
+    const agi = new AgiSelfLearningEngine();
+    (agi as any).banditArms['test_strat_recover'] = {
+      strategyId: 'test_strat_recover',
+      alpha: 20,
+      beta: 4,
+      wins: 6,
+      losses: 6,
+      scored: 12,
+      currentWinRate: 50,
+      status: 'ACTIVE_ARM',
+      lastUpdatedAtIst: '00:00:00 IST',
+    };
+    const throttleRes = agi.isStrategyThrottled('test_strat_recover');
+    if (throttleRes.throttled) {
+      throw new Error(`Expected ACTIVE_ARM to bypass unweighted lifetime throttle, got throttled=true (${throttleRes.reason})`);
+    }
+
+    // 2. BotAuditor recency must inspect newest 8 trades (db order newest-first) and preserve 0 confidence in bin 0
+    const auditor = new BotAuditor();
+    const baseMs = Date.now() - 3_600_000;
+    const newestWinsNewestFirst: ResearchSignal[] = Array.from({ length: 12 }, (_, i) => ({
+      id: `audit_sig_${i}`,
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      strategyId: 'strat_a',
+      ruleFamily: 'momentum_5',
+      modelVersion: 'vTest',
+      lifecycleState: 'CLOSED',
+      outcomeResult: i < 8 ? 'WIN' : 'LOSS',
+      confidence: i === 0 ? 0 : 0.78,
+      expiryMinutes: 5,
+      payoutPct: 82,
+      payoutSource: 'ASSUMED_MINIMUM',
+      triggerPrice: 1.08,
+      actualEntryPrice: 1.08,
+      actualExitPrice: i < 8 ? 1.081 : 1.079,
+      predictionTimeUtc: new Date(baseMs - i * 60_000).toISOString(),
+      predictionTimeIst: '10:00:00 IST',
+      signalCandleTime: new Date(baseMs - i * 60_000).toISOString(),
+      signalCandleTimeIst: '10:00:00 IST',
+      candleOpenTimeUtc: new Date(baseMs - i * 60_000).toISOString(),
+      candleOpenTimeIst: '10:00:00 IST',
+      candleOpenTimeMs: baseMs - i * 60_000,
+      entryWindowStartUtc: new Date(baseMs - i * 60_000).toISOString(),
+      entryWindowEndUtc: new Date(baseMs - i * 60_000 + 60_000).toISOString(),
+      notes: '',
+      marketRegime: 'TRENDING',
+      sessionId: 'LONDON',
+    } as unknown as ResearchSignal));
+
+    const health = auditor.auditBotHealth(newestWinsNewestFirst, []);
+    if (health.recencyBiasIndex.streakType !== 'WIN' || health.recencyBiasIndex.streakLength !== 8) {
+      throw new Error(`Expected newest 8 wins -> WIN streak 8, got ${JSON.stringify(health.recencyBiasIndex)}`);
+    }
+    const zeroBin = health.confidenceCalibration.calibrationBins[0];
+    if (!zeroBin || zeroBin.tradeCount < 1) {
+      throw new Error(`Expected confidence=0 trade in lowest calibration bin[0], got ${JSON.stringify(health.confidenceCalibration.calibrationBins)}`);
+    }
+
+    // 3. Multi-agent debate & counterfactual stress suite unpack canonical 19D vector safely
+    const testCandles = makeM1TestCandles('EUR/USD', 45);
+    const vec = agi.extractFeatureVector(testCandles[testCandles.length - 1], testCandles);
+    const stress = runCounterfactualStressSuite(vec, 'BUY', 0.55, 25, () => ({ probabilityUp: 0.65 }));
+    if (stress.scenariosTested !== 5 || !Number.isFinite(stress.survivalRate)) {
+      throw new Error(`Expected 5-scenario stress suite result: ${JSON.stringify(stress)}`);
+    }
+    const councilEngine = new MultiAgentCouncilEngine();
+    const debate = runMultiAgentDebate(
+      {
+        symbol: 'EUR/USD',
+        direction: 'BUY',
+        ruleFamily: 'momentum_5',
+        payoutPct: 82,
+        marketFeatureVector: vec,
+        regime: agi.classifyMarketRegime('EUR/USD', testCandles),
+        mlpUpProbability: 0.65,
+        mlpStepCount: 25,
+        linUcbV2Score: 0.72,
+        priorSettledRecords: [],
+      },
+      councilEngine.getState()
+    );
+    if (!debate || typeof debate.counterfactualSurvivalRate !== 'number' || debate.votes.length !== 5) {
+      throw new Error(`Expected valid 5-agent debate result from runMultiAgentDebate: ${JSON.stringify(debate)}`);
+    }
+  });
+
+  await runTest('SYSTEM', 'Runtime Bot Controls API, Signal Merge Preservation & Perf Dedupe Regression Checks', async () => {
+    const expressMod = await import('express');
+    const httpMod = await import('http');
+    const { apiRouter } = await import('./api.js');
+    const { mergeServerAndCloudSignals } = await import('../utils/signalMerge.js');
+    const { computeBotPerformance } = await import('../utils/botControls.js');
+
+    const prevControls = db.getBotRuntimeControls();
+    const app = expressMod.default();
+    app.use(expressMod.default.json());
+    app.use('/api', apiRouter);
+    const server = httpMod.createServer(app);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const addr = server.address() as { port: number };
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+      const saved = await fetch(`${baseUrl}/api/bot-controls`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          globalKillSwitch: true,
+          enabled: false,
+          minConfidence: 0.81,
+          maxConcurrentTrades: 4,
+          tradingSessions: ['LONDON'],
+        }),
+      }).then(r => r.json());
+      if (
+        !saved.ok ||
+        saved.controls.globalKillSwitch !== true ||
+        saved.controls.enabled !== false ||
+        saved.controls.minConfidence !== 0.81 ||
+        saved.controls.maxConcurrentTrades !== 4
+      ) {
+        throw new Error(`Expected persisted /api/bot-controls update, got ${JSON.stringify(saved)}`);
+      }
+      const fetched = await fetch(`${baseUrl}/api/bot-controls`).then(r => r.json());
+      if (!fetched.ok || fetched.controls.minConfidence !== 0.81) {
+        throw new Error(`Expected GET /api/bot-controls to return persisted config: ${JSON.stringify(fetched)}`);
+      }
+    } finally {
+      db.saveBotRuntimeControls(prevControls);
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+
+    // mergeServerAndCloudSignals must preserve richer live server metadata when lifecycle is identical
+    const richServerSig = {
+      id: 'sig_merge_1',
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      lifecycleState: 'CLOSED',
+      outcomeResult: 'WIN',
+      predictionTimeUtc: new Date().toISOString(),
+      actualEntryPrice: 1.08,
+      actualExitPrice: 1.081,
+      actualExitTimeUtc: new Date().toISOString(),
+      payoutPct: 84,
+      netReturnUnits: 0.84,
+      strategyName: 'ServerStrategyRich',
+    } as unknown as ResearchSignal;
+    const strippedCloudSig = {
+      id: 'sig_merge_1',
+      symbol: 'EUR/USD',
+      direction: 'BUY',
+      lifecycleState: 'CLOSED',
+      outcomeResult: 'WIN',
+      predictionTimeUtc: richServerSig.predictionTimeUtc,
+    } as unknown as ResearchSignal;
+    const merged = mergeServerAndCloudSignals([richServerSig], [strippedCloudSig], true, true);
+    if (merged.length !== 1 || merged[0].strategyName !== 'ServerStrategyRich' || merged[0].payoutPct !== 84) {
+      throw new Error(`Expected server signal metadata preserved in merge: ${JSON.stringify(merged)}`);
+    }
+
+    // computeBotPerformance deduplicates identical signal IDs
+    const dupPerf = computeBotPerformance([richServerSig, richServerSig]);
+    if (dupPerf.wins !== 1 || dupPerf.completedTrades !== 1) {
+      throw new Error(`Expected computeBotPerformance to deduplicate signals by id, got ${JSON.stringify(dupPerf)}`);
+    }
+
+    // recalculateShadowComparison must compute honest empirical ablation & preserve 0 netReturnUnits (no hardcoded fake promotion)
+    const comp = db.recalculateShadowComparison();
+    if (
+      !Array.isArray(comp.ablationTests) ||
+      comp.ablationTests.some(t => t.sampleSize === 14 && comp.totalEvaluations === 0) ||
+      (comp.baselineTradesCount === 0 && (comp.brierScoreBaseline !== 0 || comp.brierScoreShadow !== 0))
+    ) {
+      throw new Error(`Expected non-fabricated empirical shadowComparison metrics, got ${JSON.stringify(comp)}`);
     }
   });
 

@@ -361,6 +361,12 @@ export interface ResearchSignal {
   telegramAuditSentAt?: string;
   /** Auditable Olymp Trade eligibility snapshot verified at signal creation time (absent on legacy pre-filter signals). */
   brokerEligibility?: BrokerEligibilitySnapshot;
+  /** Present when explicitly created in AI Studio Manual Pairs preview or All-29 Pair override mode. */
+  manualPairAuthorization?: {
+    mode: 'MANUAL_ACTIVE';
+    pair: ForexSymbol;
+    verifiedAtUtc: string;
+  };
   /** Market regime observed strictly at prediction time. */
   predictionMarketRegime?: 'TRENDING' | 'MEAN_REVERTING' | 'RANDOM_WALK_CHOP' | 'UNKNOWN';
   /** Frozen shadow candidate evaluation at signal creation (never alters live selection until promoted). */

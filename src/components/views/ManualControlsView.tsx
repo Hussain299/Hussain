@@ -37,83 +37,131 @@ export const ManualControlsView: React.FC<ManualControlsViewProps> = ({ onContro
   const [controls, setControls] = useState<ManualControlsState>(loadManualControls());
   const [savedFeedback, setSavedFeedback] = useState(false);
   const [resetFeedback, setResetFeedback] = useState(false);
+  const [saveError, setSaveError] = useState('');
   const [serverTradingMode, setServerTradingMode] = useState<'MANUAL_PAIRS' | 'OLYMP_TRADE' | null>(null);
 
   useEffect(() => {
     let active = true;
-    fetch('/api/bot-controls/pairs')
-      .then(res => (res.ok ? res.json() : null))
-      .then(data => {
-        if (!active || !data) return;
-        if (data.tradingMode === 'MANUAL_PAIRS' || data.tradingMode === 'OLYMP_TRADE') {
-          setServerTradingMode(data.tradingMode);
-        }
-        if (data.tradingMode === 'MANUAL_PAIRS' && Array.isArray(data.pairs)) {
-          const validPairs = data.pairs.filter((p: unknown): p is ForexSymbol =>
-            typeof p === 'string' && FOREX_PAIRS.includes(p as ForexSymbol)
-          );
-          setControls(prev => {
-            const next: ManualControlsState = {
-              ...prev,
-              bot: {
-                ...prev.bot,
-                allowedPairs: validPairs,
-              },
-            };
-            saveManualControls(next);
-            return next;
-          });
-        }
-      })
-      .catch(() => {});
+    Promise.all([
+      fetch('/api/bot-controls/pairs').then(res => (res.ok ? res.json() : null)).catch(() => null),
+      fetch('/api/bot-controls').then(res => (res.ok ? res.json() : null)).catch(() => null),
+    ]).then(([pairsData, ctrlData]) => {
+      if (!active) return;
+      if (pairsData?.tradingMode === 'MANUAL_PAIRS' || pairsData?.tradingMode === 'OLYMP_TRADE') {
+        setServerTradingMode(pairsData.tradingMode);
+      }
+      const validPairs =
+        pairsData?.tradingMode === 'MANUAL_PAIRS' && Array.isArray(pairsData.pairs)
+          ? pairsData.pairs.filter((p: unknown): p is ForexSymbol =>
+              typeof p === 'string' && FOREX_PAIRS.includes(p as ForexSymbol)
+            )
+          : null;
+      const runtime = ctrlData?.controls;
+      if (!validPairs && !runtime) return;
+
+      setControls(prev => {
+        const next: ManualControlsState = {
+          ...prev,
+          globalKillSwitch:
+            typeof runtime?.globalKillSwitch === 'boolean' ? runtime.globalKillSwitch : prev.globalKillSwitch,
+          bot: {
+            ...prev.bot,
+            enabled: typeof runtime?.enabled === 'boolean' ? runtime.enabled : prev.bot.enabled,
+            minConfidence: typeof runtime?.minConfidence === 'number' ? runtime.minConfidence : prev.bot.minConfidence,
+            maxConcurrentTrades:
+              typeof runtime?.maxConcurrentTrades === 'number'
+                ? runtime.maxConcurrentTrades
+                : prev.bot.maxConcurrentTrades,
+            dynamicSpreadGate:
+              typeof runtime?.dynamicSpreadGate === 'boolean'
+                ? runtime.dynamicSpreadGate
+                : prev.bot.dynamicSpreadGate,
+            maxSpreadPips: typeof runtime?.maxSpreadPips === 'number' ? runtime.maxSpreadPips : prev.bot.maxSpreadPips,
+            tradingSessions:
+              Array.isArray(runtime?.tradingSessions) && runtime.tradingSessions.length > 0
+                ? runtime.tradingSessions
+                : prev.bot.tradingSessions,
+            allowedPairs: validPairs ?? prev.bot.allowedPairs,
+          },
+        };
+        saveManualControls(next);
+        return next;
+      });
+    });
     return () => {
       active = false;
     };
   }, []);
 
-  const syncManualPairsToServer = async (allowedPairs: ForexSymbol[]) => {
-    try {
-      await fetch('/api/bot-controls/pairs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ allowedPairs }),
-      });
-    } catch (e) {
-      console.warn('Failed to sync manual pairs to backend:', e);
+  const syncBotControlsToServer = async (state: ManualControlsState) => {
+    const res = await fetch('/api/bot-controls', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        globalKillSwitch: state.globalKillSwitch,
+        enabled: state.bot.enabled,
+        minConfidence: state.bot.minConfidence,
+        maxConcurrentTrades: state.bot.maxConcurrentTrades,
+        dynamicSpreadGate: state.bot.dynamicSpreadGate,
+        maxSpreadPips: state.bot.maxSpreadPips,
+        tradingSessions: state.bot.tradingSessions,
+        allowedPairs: state.bot.allowedPairs,
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Backend control sync failed (${res.status})`);
+    }
+  };
+
+  const syncTelegramToServer = async (state: ManualControlsState) => {
+    const res = await fetch('/api/telegram/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: state.telegramBroadcast,
+        minConfidence: state.telegramMinConfidence,
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `Telegram preference sync failed (${res.status})`);
     }
   };
 
   const handleSave = async () => {
+    setSaveError('');
     saveManualControls(controls);
-    setSavedFeedback(true);
-    setTimeout(() => setSavedFeedback(false), 2500);
 
-    await Promise.all([
-      syncManualPairsToServer(controls.bot.allowedPairs),
-      // Sync telegram threshold to backend
-      fetch('/api/telegram/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          enabled: controls.telegramBroadcast,
-          minConfidence: controls.telegramMinConfidence,
-        }),
-      }).catch(e => {
-        console.warn('Failed to sync telegram settings to backend:', e);
-      }),
-    ]);
-
-    if (onControlsUpdated) onControlsUpdated();
+    try {
+      await Promise.all([
+        syncBotControlsToServer(controls),
+        syncTelegramToServer(controls),
+      ]);
+      setSavedFeedback(true);
+      setTimeout(() => setSavedFeedback(false), 2500);
+      if (onControlsUpdated) onControlsUpdated();
+    } catch (e: any) {
+      setSaveError(e?.message || 'Failed to sync controls to backend.');
+    }
   };
 
   const handleResetDefaults = async () => {
+    setSaveError('');
     const defaults = getDefaultManualControls();
     setControls(defaults);
     saveManualControls(defaults);
-    await syncManualPairsToServer(defaults.bot.allowedPairs);
-    setResetFeedback(true);
-    setTimeout(() => setResetFeedback(false), 2500);
-    if (onControlsUpdated) onControlsUpdated();
+    try {
+      await Promise.all([
+        syncBotControlsToServer(defaults),
+        syncTelegramToServer(defaults),
+      ]);
+      setResetFeedback(true);
+      setTimeout(() => setResetFeedback(false), 2500);
+      if (onControlsUpdated) onControlsUpdated();
+    } catch (e: any) {
+      setSaveError(e?.message || 'Failed to sync default controls to backend.');
+    }
   };
 
   const togglePair = (pair: ForexSymbol) => {
@@ -194,6 +242,11 @@ export const ManualControlsView: React.FC<ManualControlsViewProps> = ({ onContro
           </div>
 
           <div className="flex items-center gap-3">
+            {saveError && (
+              <span className="text-xs text-[#B7797D] font-bold">
+                {saveError}
+              </span>
+            )}
             {savedFeedback && (
               <span className="flex items-center gap-1.5 text-xs text-[#72A98B] font-bold animate-in fade-in">
                 <CheckCircle2 className="w-3.5 h-3.5" />

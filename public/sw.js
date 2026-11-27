@@ -162,19 +162,15 @@ async function executeBackgroundPulse(triggerSource) {
 
       // Check if any trade was settled in this pulse
       if (data.newlySettled && Array.isArray(data.newlySettled) && data.newlySettled.length > 0) {
-        for (const trade of data.newlySettled) {
-          showSettlementNotification(trade);
-        }
+        await Promise.allSettled(data.newlySettled.map(trade => showSettlementNotification(trade)));
       }
 
       // Check if any fresh high-confidence signal was emitted
       if (data.newlyEmitted && Array.isArray(data.newlyEmitted) && data.newlyEmitted.length > 0) {
-        for (const sig of data.newlyEmitted) {
-          showSignalNotification(sig);
-        }
+        await Promise.allSettled(data.newlyEmitted.map(sig => showSignalNotification(sig)));
       }
 
-      broadcastToClients({
+      await broadcastToClients({
         type: 'BACKGROUND_PULSE_SUCCESS',
         triggerSource,
         timestamp: lastPulseTimestamp,
@@ -196,7 +192,7 @@ async function executeBackgroundPulse(triggerSource) {
 // 6. SYSTEM NOTIFICATIONS
 // ---------------------------------------------------------------------------
 function showSettlementNotification(trade) {
-  if (!self.Notification || Notification.permission !== 'granted') return;
+  if (!self.Notification || Notification.permission !== 'granted') return Promise.resolve();
 
   const isWin = trade.outcomeResult === 'WIN';
   const title = isWin
@@ -205,7 +201,7 @@ function showSettlementNotification(trade) {
 
   const body = `${trade.direction} 5M Contract Settled: ${trade.outcomeResult} (${isWin ? '+' : ''}${trade.netReturnUnits} U, ${trade.grossReturnPips} pips)`;
 
-  self.registration.showNotification(title, {
+  return self.registration.showNotification(title, {
     body,
     icon: '/pwa-192x192.png',
     badge: '/pwa-192x192.png',
@@ -216,12 +212,12 @@ function showSettlementNotification(trade) {
 }
 
 function showSignalNotification(signal) {
-  if (!self.Notification || Notification.permission !== 'granted') return;
+  if (!self.Notification || Notification.permission !== 'granted') return Promise.resolve();
 
   const title = `⚡ SignalForge Alert: ${signal.symbol} ${signal.direction}`;
   const body = `Causal setup verified with ${(signal.confidence * 100).toFixed(0)}% confidence at ${signal.triggerPrice}`;
 
-  self.registration.showNotification(title, {
+  return self.registration.showNotification(title, {
     body,
     icon: '/pwa-192x192.png',
     badge: '/pwa-192x192.png',
@@ -271,17 +267,20 @@ self.addEventListener('message', (event) => {
   }
 
   if (data.type === 'FORCE_BACKGROUND_PULSE') {
-    executeBackgroundPulse('MANUAL_CLIENT_TRIGGER').then(() => {
+    const task = executeBackgroundPulse('MANUAL_CLIENT_TRIGGER').then(() => {
       event.source?.postMessage({
         type: 'FORCE_PULSE_ACK',
         timestamp: new Date().toISOString()
       });
     });
+    if (typeof event.waitUntil === 'function') {
+      event.waitUntil(task);
+    }
   }
 });
 
 function broadcastToClients(message) {
-  self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+  return self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
     clients.forEach((client) => client.postMessage(message));
   });
 }

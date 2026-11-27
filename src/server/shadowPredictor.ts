@@ -271,12 +271,19 @@ export function evaluateShadowCandidate(
   }
 
   // 8. Regime and severe behavioural trap penalty
+  const isMeanReversionStrategy =
+    input.ruleFamily === 'mean_reversion_20' || input.ruleFamily === 'wick_reversal';
+  const isTrendStrategy =
+    input.ruleFamily === 'momentum_5' ||
+    input.ruleFamily === 'range_breakout' ||
+    input.ruleFamily === 'volatility_squeeze' ||
+    input.ruleFamily === 'order_flow_imbalance';
   const regimePenalty =
     input.regime?.regimeType === 'RANDOM_WALK_CHOP'
       ? -0.18
       : input.regime &&
-          ((input.ruleFamily === 'mean_reversion' && input.regime.regimeType === 'TRENDING') ||
-            (input.ruleFamily === 'trend_follow' && input.regime.regimeType === 'MEAN_REVERTING'))
+          ((isMeanReversionStrategy && input.regime.regimeType === 'TRENDING') ||
+            (isTrendStrategy && input.regime.regimeType === 'MEAN_REVERTING'))
         ? -0.12
         : 0;
   const trapPenalty =
@@ -379,9 +386,13 @@ export function evaluateShadowCandidate(
     shouldAbstain: abstentionReasons.length > 0,
     abstentionReasons,
     linUcbV2Score:
-      typeof input.linUcbV2Score === 'number' ? round(input.linUcbV2Score, 4) : 0,
+      typeof input.linUcbV2Score === 'number' && Number.isFinite(input.linUcbV2Score)
+        ? round(input.linUcbV2Score, 4)
+        : 0,
     ftrlProbability:
-      typeof input.ftrlProbability === 'number' ? round(input.ftrlProbability, 4) : 0.5,
+      typeof input.ftrlProbability === 'number' && Number.isFinite(input.ftrlProbability)
+        ? round(input.ftrlProbability, 4)
+        : 0.5,
     mlpDirectionalProbability:
       mlpActive && typeof input.mlpUpProbability === 'number'
         ? round(

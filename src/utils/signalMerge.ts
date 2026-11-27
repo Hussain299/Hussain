@@ -70,9 +70,18 @@ export function mergeServerAndCloudSignals(
   for (const ss of serverSignals) {
     if (!ss?.id) continue;
     const existing = merged.get(ss.id);
-    if (existing && isSettledImmutable(existing)) {
+    if (existing && isSettledImmutable(existing) && !isSettledImmutable(ss)) {
+      // Cloud holds settled immutable outcome while server copy has not settled yet: keep cloud settlement with rich server metadata
       merged.set(ss.id, {
+        ...ss,
         ...existing,
+        brokerEligibility: ss.brokerEligibility || existing.brokerEligibility,
+        manualPairAuthorization: ss.manualPairAuthorization || existing.manualPairAuthorization,
+        agentDebate: ss.agentDebate || existing.agentDebate,
+        institutionalRisk: ss.institutionalRisk || existing.institutionalRisk,
+        shadowCandidate: ss.shadowCandidate || existing.shadowCandidate,
+        trainingAudit: ss.trainingAudit || existing.trainingAudit,
+        notes: ss.notes || existing.notes,
         lifecycleHistory:
           ss.lifecycleHistory && ss.lifecycleHistory.length > 0
             ? ss.lifecycleHistory
