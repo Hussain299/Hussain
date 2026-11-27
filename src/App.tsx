@@ -63,20 +63,40 @@ export default function App() {
     } catch {}
   }, []);
 
-  // Forward sanitized read-only Olymp Trade companion snapshots to the scheduler while app is open
+  // Forward sanitized read-only Olymp Trade companion snapshots & restore Allow-All preference across container restarts
   useEffect(() => {
     const syncBridgeToServer = async () => {
       try {
+        const allowPref = typeof window !== 'undefined' && localStorage.getItem('signalforge_allow_all_pairs') === 'true';
         const status = await requestOlympTradeBridgeStatus('GET_STATUS');
-        if (!status.extensionInstalled) return;
-        const res = await fetch('/api/broker/olymptrade/snapshot', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(status),
-        });
-        if (res.ok) {
-          const universe = await res.json();
-          if (universe?.mode) setBrokerStatus(universe);
+        if (status.extensionInstalled && (status.instruments.length > 0 || status.sessionState === 'LOGIN_REQUIRED' || !status.platformTabOpen)) {
+          const res = await fetch('/api/broker/olymptrade/snapshot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(status),
+          });
+          if (res.ok) {
+            const universe = await res.json();
+            if (universe?.mode) setBrokerStatus(universe);
+            if (allowPref && universe?.tradingMode === 'OLYMP_TRADE' && !universe?.allowAllPairs) {
+              const restored = await fetch('/api/broker/olymptrade/policy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ allowAllPairs: true }),
+              }).then(r => (r.ok ? r.json() : null)).catch(() => null);
+              if (restored?.mode) setBrokerStatus(restored);
+            }
+          }
+        } else if (allowPref) {
+          const curStatus = await fetch('/api/broker/olymptrade/status').then(r => (r.ok ? r.json() : null)).catch(() => null);
+          if (curStatus?.tradingMode === 'OLYMP_TRADE' && !curStatus?.allowAllPairs) {
+            const restored = await fetch('/api/broker/olymptrade/policy', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ allowAllPairs: true }),
+            }).then(r => (r.ok ? r.json() : null)).catch(() => null);
+            if (restored?.mode) setBrokerStatus(restored);
+          }
         }
       } catch {
         // Non-fatal: scheduler fails closed when Olymp Trade snapshot is absent/stale

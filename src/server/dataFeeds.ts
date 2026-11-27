@@ -208,6 +208,8 @@ export class DataFeedEngine {
             });
           }
         }
+      } else {
+        await res.body?.cancel().catch(() => {});
       }
     } catch (err: any) {
       db.updateFeedHealth({
@@ -262,6 +264,8 @@ export class DataFeedEngine {
               });
             }
           }
+        } else {
+          await res.body?.cancel().catch(() => {});
         }
       } catch (err: any) {
         db.updateFeedHealth({
@@ -316,6 +320,8 @@ export class DataFeedEngine {
               });
             }
           }
+        } else {
+          await res.body?.cancel().catch(() => {});
         }
       } catch (err: any) {
         db.updateFeedHealth({

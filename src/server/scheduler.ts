@@ -175,7 +175,25 @@ export class AutonomousScheduler {
 
   public updateOlympTradeSnapshot(rawStatus: unknown): ActiveTradingUniverse {
     const sanitized = sanitizeOlympTradeBridgeStatus(rawStatus);
-    this.latestOlympTradeStatus = sanitized.extensionInstalled ? sanitized : null;
+    if (!sanitized.extensionInstalled) {
+      this.latestOlympTradeStatus = null;
+      return this.getActiveTradingUniverse();
+    }
+    // Preserve fresh cached instruments across transient background WAITING_FOR_MARKET_DATA frames
+    if (
+      sanitized.platformTabOpen &&
+      sanitized.sessionState === 'WAITING_FOR_MARKET_DATA' &&
+      sanitized.instruments.length === 0 &&
+      this.latestOlympTradeStatus &&
+      this.latestOlympTradeStatus.connected &&
+      this.latestOlympTradeStatus.instruments.length > 0
+    ) {
+      const prevCapMs = this.latestOlympTradeStatus.capturedAt ? Date.parse(this.latestOlympTradeStatus.capturedAt) : 0;
+      if (Number.isFinite(prevCapMs) && Date.now() - prevCapMs <= 45_000) {
+        return this.getActiveTradingUniverse();
+      }
+    }
+    this.latestOlympTradeStatus = sanitized;
     return this.getActiveTradingUniverse();
   }
 

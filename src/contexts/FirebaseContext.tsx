@@ -291,31 +291,38 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async currentUser => {
       const nextUid = currentUser?.uid || null;
-      if (activeUidRef.current !== nextUid) {
+      const uidChanged = activeUidRef.current !== nextUid;
+      if (uidChanged) {
         activeUidRef.current = nextUid;
         setCloudSignals([]);
         setCloudLedgerReady(false);
         cloudMapRef.current.clear();
         syncedStateFingerprintsRef.current.clear();
         lastHydratedKeyRef.current = '';
+        profileReadyRef.current = false;
+        setProfileReady(false);
       }
 
       setUser(currentUser);
       setAuthReady(true);
-      profileReadyRef.current = false;
-      setProfileReady(false);
 
       if (!currentUser) {
+        profileReadyRef.current = false;
+        setProfileReady(false);
         setCloudStatusMessage(null);
         return;
       }
 
       if (!currentUser.emailVerified) {
+        profileReadyRef.current = false;
+        setProfileReady(false);
         setCloudStatusMessage('Please verify your Google account email to enable cloud ledger sync.');
         return;
       }
 
-      await ensureUserProfile(currentUser);
+      if (!profileReadyRef.current) {
+        await ensureUserProfile(currentUser);
+      }
     });
 
     return () => unsub();

@@ -422,7 +422,7 @@ export class ReverseEngineeringEngine {
       fs.mkdirSync(dir, { recursive: true });
     }
     this.state.lastUpdatedUtc = new Date().toISOString();
-    const payload = JSON.stringify(this.state, null, 2);
+    const payload = JSON.stringify(this.state);
     const tmpPath = `${dbPath}.${process.pid}.tmp`;
     fs.writeFileSync(tmpPath, payload, 'utf-8');
     try {

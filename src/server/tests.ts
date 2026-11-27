@@ -3048,10 +3048,10 @@ export async function runAllVerificationTests(): Promise<{
     const { autonomousScheduler } = await import('./scheduler.js');
     const { hasFreshRealProviderCandles, getFreshRealCandleWindow } = await import('./dataFeeds.js');
 
-    // 1. Verify companion v1.3.4 manifest, pair format support, and drawer/tab retention logic
+    // 1. Verify companion v1.3.5 manifest, pair format support, and drawer/tab retention logic
     const manifest = JSON.parse(fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/manifest.json'), 'utf-8'));
-    if (manifest.version !== '1.3.4') {
-      throw new Error(`Expected companion manifest version 1.3.4, got ${manifest.version}`);
+    if (manifest.version !== '1.3.5') {
+      throw new Error(`Expected companion manifest version 1.3.5, got ${manifest.version}`);
     }
     const companionSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/content/olymptrade.js'), 'utf-8');
     const swSrc = fsMod.default.readFileSync(pathMod.default.resolve(process.cwd(), 'browser-companion/olymptrade/service-worker.js'), 'utf-8');
@@ -3060,9 +3060,40 @@ export async function runAllVerificationTests(): Promise<{
       !companionSrc.includes('[/⁄\\-_]') ||
       !companionSrc.includes('if (!force && document.hidden) return;') ||
       !companionSrc.includes('uniquePercentages') ||
-      !swSrc.includes('CATALOG_STORAGE_KEY')
+      !swSrc.includes('CATALOG_STORAGE_KEY') ||
+      !swSrc.includes('mergeWithPersistentCatalog')
     ) {
       throw new Error('Companion script missing drawer retention, multi-separator normalization, tab-switch guard, or persistent catalog');
+    }
+
+    // 1b. Verify transient WAITING_FOR_MARKET_DATA empty snapshot does not wipe fresh READY instruments
+    const preservedReady = autonomousScheduler.updateOlympTradeSnapshot({
+      extensionInstalled: true,
+      extensionVersion: '1.3.5',
+      connected: true,
+      platformTabOpen: true,
+      sessionState: 'READY',
+      capturedAt: new Date().toISOString(),
+      instruments: [
+        { pair: 'EUR/USD', payoutPct: 85, availability: 'AVAILABLE', evidence: 'HIGH' },
+      ],
+    });
+    const afterTransientEmpty = autonomousScheduler.updateOlympTradeSnapshot({
+      extensionInstalled: true,
+      extensionVersion: '1.3.5',
+      connected: false,
+      platformTabOpen: true,
+      sessionState: 'WAITING_FOR_MARKET_DATA',
+      capturedAt: new Date().toISOString(),
+      instruments: [],
+    });
+    if (
+      preservedReady.instruments.length !== 1 ||
+      afterTransientEmpty.instruments.length !== 1 ||
+      !afterTransientEmpty.connected ||
+      afterTransientEmpty.sessionState !== 'READY'
+    ) {
+      throw new Error(`Expected transient WAITING_FOR_MARKET_DATA snapshot to preserve fresh READY instruments: ${JSON.stringify({ preservedReady, afterTransientEmpty })}`);
     }
 
     // 2. Verify synthetic fallback candles never pass real-market freshness checks

@@ -83,7 +83,12 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
     try {
       const result = await requestOlympTradeBridgeStatus(forceScan ? 'REFRESH' : 'GET_STATUS');
       setStatus(result);
-      if (result.extensionInstalled) {
+      const isTransientEmpty =
+        result.extensionInstalled &&
+        result.platformTabOpen &&
+        result.sessionState === 'WAITING_FOR_MARKET_DATA' &&
+        result.instruments.length === 0;
+      if (result.extensionInstalled && !isTransientEmpty) {
         const res = await fetch('/api/broker/olymptrade/snapshot', {
           method: 'POST',
           cache: 'no-store',
@@ -96,7 +101,7 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
       } else {
         const res = await fetch('/api/broker/olymptrade/status', {
           cache: 'no-store',
-          headers: { 'Cache-Control': 'no-cache' },
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
         }).catch(() => null);
         if (res && res.ok) {
           setServerUniverse(await res.json());
@@ -110,6 +115,9 @@ export const BrokerConnectionView: React.FC<BrokerConnectionViewProps> = ({ init
   const toggleAllowAllPairs = useCallback(async (nextAllow: boolean) => {
     setTogglingPolicy(true);
     try {
+      try {
+        localStorage.setItem('signalforge_allow_all_pairs', String(nextAllow));
+      } catch {}
       const res = await fetch('/api/broker/olymptrade/policy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

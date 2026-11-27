@@ -154,22 +154,41 @@ async function mergeWithPersistentCatalog(snapshot) {
     await chrome.storage.local.remove(CATALOG_STORAGE_KEY);
     return snapshot;
   }
-  if (snapshot.sessionState !== 'READY') {
-    return snapshot;
-  }
 
   const stored = await chrome.storage.local.get(CATALOG_STORAGE_KEY);
   const existing = stored[CATALOG_STORAGE_KEY];
-  const entries =
-    existing && existing.tabId === snapshot.tabId && existing.entries && typeof existing.entries === 'object'
+  const sameOrAnyEntries =
+    existing &&
+    existing.entries &&
+    typeof existing.entries === 'object' &&
+    (existing.tabId === snapshot.tabId || existing.entries)
       ? { ...existing.entries }
       : {};
 
-  for (const [pair, item] of Object.entries(entries)) {
+  for (const [pair, item] of Object.entries(sameOrAnyEntries)) {
     if (!item || typeof item.seenAt !== 'number' || nowMs - item.seenAt > CATALOG_RETENTION_MS) {
-      delete entries[pair];
+      delete sameOrAnyEntries[pair];
     }
   }
+
+  // If the Olymp Trade tab is transiently throttled/loading (0 visible instruments),
+  // retain unexpired cached market catalog entries instead of blanking out the snapshot.
+  if (snapshot.sessionState !== 'READY' || snapshot.instruments.length === 0) {
+    const restored = Object.values(sameOrAnyEntries)
+      .map(entry => entry && entry.row)
+      .filter(Boolean)
+      .sort((a, b) => a.pair.localeCompare(b.pair));
+    if (restored.length > 0) {
+      return {
+        ...snapshot,
+        sessionState: 'READY',
+        instruments: restored,
+      };
+    }
+    return snapshot;
+  }
+
+  const entries = sameOrAnyEntries;
 
   const hasMarketListScan =
     snapshot.instruments.length > 10 ||
