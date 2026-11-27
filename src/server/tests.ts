@@ -3479,6 +3479,139 @@ export async function runAllVerificationTests(): Promise<{
     }
   });
 
+  await runTest('ML', 'Isolated Self-Reverse-Engineering Experiment: Zero Leakage, 4-Way OOS Comparison & <30% Validation', async () => {
+    const fsMod = await import('fs');
+    const osMod = await import('os');
+    const pathMod = await import('path');
+    const expressMod = await import('express');
+    const httpMod = await import('http');
+    const { apiRouter } = await import('./api.js');
+    const { ReverseEngineeringEngine } = await import('./reverseEngineeringEngine.js');
+
+    const tmpDir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'sf-rev-test-'));
+    const revDbPath = pathMod.join(tmpDir, 'reverse_exp.db.json');
+    try {
+      const engine = new ReverseEngineeringEngine(revDbPath);
+      const startMs = Date.now() - 160 * 300_000;
+
+      // Build 120 strictly chronological SignalForge decision snapshots mixing:
+      // - order_flow_imbalance / TRENDING setups (~80% baseline WR -> target for inversion to ~20%)
+      // - range_breakout / RANDOM_WALK_CHOP setups (~20% baseline WR -> target for keeping same-side at ~20%)
+      // Overall Original baseline ~= 50%, Simple Inversion ~= 50%, while Self-Reverse-Engineered learns BOTH pockets and achieves < 30% OOS!
+      const snapshots = Array.from({ length: 120 }, (_, i) => {
+        const isHighAccPocket = i % 2 === 0;
+        const tsMs = startMs + i * 300_000;
+        const origWon = isHighAccPocket ? (i % 10 !== 8) : (i % 10 === 9);
+        const dir: 'BUY' | 'SELL' = i % 4 < 2 ? 'BUY' : 'SELL';
+        const entryPrice = 1.1;
+        const exitPrice =
+          (dir === 'BUY' && origWon) || (dir === 'SELL' && !origWon) ? 1.101 : 1.099;
+        const vec = new Array(19).fill(0);
+        vec[0] = isHighAccPocket ? 0.8 : -0.7;
+        vec[9] = isHighAccPocket ? 1.2 : -1.1;
+        vec[11] = isHighAccPocket ? 0.15 : 0.78;
+        return {
+          id: `rev_snap_${i}`,
+          sourceKind: 'SETTLED_SIGNAL' as const,
+          symbol: (isHighAccPocket ? 'EUR/USD' : 'GBP/USD') as ForexSymbol,
+          expiryMinutes: isHighAccPocket ? 30 : 20,
+          timestampUtc: new Date(tsMs).toISOString(),
+          entryTimeUtc: new Date(tsMs + 180_000).toISOString(),
+          exitTimeUtc: new Date(tsMs + 180_000 + (isHighAccPocket ? 30 : 20) * 60_000).toISOString(),
+          originalPrediction: dir,
+          actualOutcome: origWon ? ('WIN' as const) : ('LOSS' as const),
+          entryPrice,
+          exitPrice,
+          payoutPct: 82,
+          confidence: isHighAccPocket ? 0.84 : 0.74,
+          ruleFamily: isHighAccPocket ? 'order_flow_imbalance' : 'range_breakout',
+          strategyId: isHighAccPocket ? 'stacked:order_flow_imbalance:30' : 'stacked:range_breakout:20',
+          confluenceItems: ['EMA 9/21'],
+          confluenceScore: 3,
+          marketRegime: (isHighAccPocket ? 'TRENDING' : 'RANDOM_WALK_CHOP') as 'TRENDING' | 'RANDOM_WALK_CHOP',
+          featureVector: vec,
+          hasValidFeatures: true,
+          indicatorSummary: {
+            emaSpread: vec[9],
+            rsi14: 50 + vec[11] * 50,
+            wickImbalance: 0,
+            deviationPips: 0,
+            bodyRatio: 0.65,
+            pos34: 0.5,
+            volRatio: 1.0,
+          },
+        };
+      });
+
+      const run1 = engine.runExperiment({ customSnapshots: snapshots });
+      const unseen = run1.unseenFourWayComparison;
+      if (
+        run1.sampleSufficiency === 'INSUFFICIENT_SAMPLE' ||
+        unseen.autonomousReverseEngineered.accuracyPct === null ||
+        unseen.autonomousReverseEngineered.accuracyPct >= 30 ||
+        unseen.simpleInversion.accuracyPct === null ||
+        unseen.autonomousReverseEngineered.accuracyPct >= unseen.simpleInversion.accuracyPct ||
+        !run1.promotionDecision.promoted ||
+        !unseen.autonomousReverseEngineered.wilson95CiPct ||
+        run1.walkForwardFolds.length === 0
+      ) {
+        throw new Error(`Expected promoted <30% OOS reverse-engineered candidate beating simple inversion: ${JSON.stringify({
+          verdict: run1.promotionDecision,
+          unseenOrig: unseen.original.accuracyPct,
+          unseenInv: unseen.simpleInversion.accuracyPct,
+          unseenAuto: unseen.autonomousReverseEngineered.accuracyPct,
+          unseenRand: unseen.randomBaseline.accuracyPct,
+        })}`);
+      }
+
+      // Zero future-data leakage check: flipping unseenTest outcomes must NOT change Train analysis or Frozen candidate
+      const mutated = snapshots.map((s, idx) =>
+        idx >= 95
+          ? {
+              ...s,
+              actualOutcome: s.actualOutcome === 'WIN' ? ('LOSS' as const) : ('WIN' as const),
+              exitPrice: s.exitPrice === 1.101 ? 1.099 : 1.101,
+            }
+          : s
+      );
+      const run2 = engine.runExperiment({ customSnapshots: mutated });
+      if (
+        run2.frozenCandidate?.candidateId !== run1.frozenCandidate?.candidateId ||
+        JSON.stringify(run2.frozenCandidate?.featureWeights) !== JSON.stringify(run1.frozenCandidate?.featureWeights)
+      ) {
+        throw new Error('Leakage detected: mutating unseenTest labels altered frozen candidate selection or weights!');
+      }
+
+      // Isolated persistence & API endpoint check
+      if (!fsMod.existsSync(revDbPath)) {
+        throw new Error(`Expected isolated reverse DB written at ${revDbPath}`);
+      }
+      const stepRun = engine.stepContinuousSelfAnalysis();
+      if (!stepRun || engine.getState().continuousCyclesRun < 1) {
+        throw new Error('Expected continuous self-analysis step to increment cycle history');
+      }
+
+      const app = expressMod.default();
+      app.use(expressMod.default.json());
+      app.use('/api', apiRouter);
+      const server = httpMod.createServer(app);
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const addr = server.address() as { port: number };
+        const stateRes = await fetch(`http://127.0.0.1:${addr.port}/api/reverse-engineering/state`).then(r => r.json());
+        if (!stateRes.ok || !stateRes.state) {
+          throw new Error(`Expected /api/reverse-engineering/state ok=true: ${JSON.stringify(stateRes)}`);
+        }
+      } finally {
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    } finally {
+      try {
+        fsMod.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
   // Purge test signals so they never appear on the user's trading terminal
   db.purgeTestSignals();
 

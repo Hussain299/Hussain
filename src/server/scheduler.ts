@@ -26,6 +26,7 @@ import { behaviouralEngine } from './behaviouralEngine.js';
 import { botAuditor } from './botAuditor.js';
 import { telegramService } from './telegramService.js';
 import { quantMicrostructure } from './quantMicrostructure.js';
+import { reverseEngineeringEngine } from './reverseEngineeringEngine.js';
 import {
   ActiveTradingUniverse,
   authorizeSignalWithBrokerSnapshot,
@@ -856,6 +857,48 @@ export class AutonomousScheduler {
               db.saveBotHealthState(updatedBotHealth);
             } catch (err: any) {
               console.error('[Scheduler] Bot health audit error:', err.message);
+            }
+
+            // Isolated shadow-only continuous reverse-engineering update (separate DB; never touches production model)
+            if (!sig.ruleFamily?.startsWith('test_') && sig.actualEntryPrice && sig.actualExitPrice) {
+              try {
+                const vec = Array.isArray(sig.marketFeatureVector) && sig.marketFeatureVector.length === 19
+                  ? sig.marketFeatureVector
+                  : new Array(19).fill(0);
+                reverseEngineeringEngine.stepContinuousSelfAnalysis({
+                  id: `rsnap_sig_${sig.id}`,
+                  sourceKind: 'SETTLED_SIGNAL',
+                  symbol: sig.symbol,
+                  expiryMinutes: sig.expiryMinutes || 5,
+                  timestampUtc: sig.predictionTimeUtc,
+                  entryTimeUtc: sig.actualEntryTimeUtc || sig.candleOpenTimeUtc || sig.predictionTimeUtc,
+                  exitTimeUtc: sig.actualExitTimeUtc || sig.plannedExitTimeUtc || sig.predictionTimeUtc,
+                  originalPrediction: sig.direction,
+                  actualOutcome: sig.outcomeResult as 'WIN' | 'LOSS' | 'SCRATCH',
+                  entryPrice: sig.actualEntryPrice,
+                  exitPrice: sig.actualExitPrice,
+                  payoutPct: sig.payoutPct ?? 80,
+                  confidence: sig.confidence ?? 0.72,
+                  ruleFamily: sig.ruleFamily || 'unknown',
+                  strategyId: sig.strategyId || `rule:${sig.ruleFamily || 'unknown'}`,
+                  confluenceItems: Array.isArray(sig.confluenceStrategies) ? sig.confluenceStrategies : [],
+                  confluenceScore: sig.confluenceScore || 2,
+                  marketRegime: sig.predictionMarketRegime || 'UNKNOWN',
+                  featureVector: vec,
+                  hasValidFeatures: Array.isArray(sig.marketFeatureVector) && sig.marketFeatureVector.length === 19 && sig.marketFeatureVector.every(Number.isFinite),
+                  indicatorSummary: {
+                    emaSpread: vec[9] || 0,
+                    rsi14: 50 + (vec[11] || 0) * 50,
+                    wickImbalance: vec[6] || 0,
+                    deviationPips: vec[3] || 0,
+                    bodyRatio: vec[5] || 0,
+                    pos34: vec[14] || 0,
+                    volRatio: vec[15] || 0,
+                  },
+                });
+              } catch {
+                // Non-fatal: isolated experiment never interrupts production scheduling
+              }
             }
 
             // Dispatch verified Win / Loss Audit Report to Telegram bot subscribers (awaited before pulse returns)

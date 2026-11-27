@@ -4,7 +4,9 @@ import path from 'path';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'signalforge-verify-'));
 const isolatedDbPath = path.join(tempDir, 'signalforge.db.json');
+const isolatedReverseDbPath = path.join(tempDir, 'reverse_engineering_experiment.db.json');
 process.env.SIGNALFORGE_DB_PATH = isolatedDbPath;
+process.env.SIGNALFORGE_REVERSE_DB_PATH = isolatedReverseDbPath;
 // Verify strict production Olymp Trade fail-closed gating by default; dedicated tests toggle MANUAL_PAIRS explicitly.
 process.env.SIGNALFORGE_TRADING_MODE = process.env.SIGNALFORGE_TRADING_MODE || 'OLYMP_TRADE';
 

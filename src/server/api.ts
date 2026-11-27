@@ -31,6 +31,7 @@ import {
   evaluatePromotionReadiness,
 } from './portfolioRiskEngine.js';
 import { selfHealingSupervisor } from './selfHealingSupervisor.js';
+import { reverseEngineeringEngine } from './reverseEngineeringEngine.js';
 
 interface StrategySearchJob {
   jobId: string;
@@ -1339,6 +1340,51 @@ apiRouter.post('/bot-controls', (req: Request, res: Response) => {
       controls: saved,
       manualPairs,
       universe: autonomousScheduler.getActiveTradingUniverse(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// =========================================================================
+// ISOLATED SELF-REVERSE-ENGINEERING EXPERIMENT ENDPOINTS (SHADOW-ONLY)
+// =========================================================================
+
+apiRouter.get('/reverse-engineering/state', (_req: Request, res: Response) => {
+  try {
+    return res.json({
+      ok: true,
+      state: reverseEngineeringEngine.getState(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+apiRouter.post('/reverse-engineering/run', (req: Request, res: Response) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const run = reverseEngineeringEngine.runExperiment({
+      includeRealSettled: body.includeRealSettled !== false,
+      includeHistoricalReplay: body.includeHistoricalReplay !== false,
+    });
+    return res.json({
+      ok: true,
+      run,
+      state: reverseEngineeringEngine.getState(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+apiRouter.post('/reverse-engineering/step', (_req: Request, res: Response) => {
+  try {
+    const run = reverseEngineeringEngine.stepContinuousSelfAnalysis();
+    return res.json({
+      ok: true,
+      run,
+      state: reverseEngineeringEngine.getState(),
     });
   } catch (err: any) {
     return res.status(500).json({ ok: false, error: err.message });

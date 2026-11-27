@@ -28,7 +28,7 @@ interface BrainViewProps {
   onRefresh?: () => void;
 }
 
-type BrainTab = 'neural' | 'council' | 'agi' | 'behavioural' | 'trinity' | 'strategies';
+type BrainTab = 'neural' | 'council' | 'agi' | 'behavioural' | 'trinity' | 'strategies' | 'reverse_lab';
 
 export const BrainView: React.FC<BrainViewProps> = () => {
   const [activeTab, setActiveTab] = useState<BrainTab>('neural');
@@ -41,6 +41,9 @@ export const BrainView: React.FC<BrainViewProps> = () => {
   const [strategies, setStrategies] = useState<SynthesizedStrategyGene[]>([]);
   const [botHealth, setBotHealth] = useState<any>(null);
   const [shadowComparison, setShadowComparison] = useState<any>(null);
+  const [reverseState, setReverseState] = useState<any>(null);
+  const [reverseRunning, setReverseRunning] = useState(false);
+  const [reverseError, setReverseError] = useState('');
   const [councilData, setCouncilData] = useState<{
     council: any;
     benchmark: any;
@@ -62,7 +65,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
   const fetchBrainData = async () => {
     setIsLoading(true);
     try {
-      const [telRes, wtRes, agiRes, diagRes, autRes, revRes, stratRes, councilRes, auditorRes, shadowCompRes] = await Promise.all([
+      const [telRes, wtRes, agiRes, diagRes, autRes, revRes, stratRes, councilRes, auditorRes, shadowCompRes, reverseRes] = await Promise.all([
         fetch('/api/online-model/telemetry').then(r => r.json()).catch(() => ({ telemetry: null })),
         fetch('/api/online-model/weights').then(r => r.json()).catch(() => ({ weights: null })),
         fetch('/api/agi/state').then(r => r.json()).catch(() => ({ agi: null })),
@@ -73,6 +76,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
         fetch('/api/agi/council').then(r => r.json()).catch(() => null),
         fetch('/api/behavioural/bot-auditor').then(r => r.json()).catch(() => null),
         fetch('/api/behavioural/shadow-comparison').then(r => r.json()).catch(() => null),
+        fetch('/api/reverse-engineering/state').then(r => r.json()).catch(() => null),
       ]);
 
       if (telRes?.telemetry) setTelemetry(telRes.telemetry);
@@ -85,10 +89,33 @@ export const BrainView: React.FC<BrainViewProps> = () => {
       if (councilRes?.council) setCouncilData(councilRes);
       if (auditorRes?.botHealth) setBotHealth(auditorRes.botHealth);
       if (shadowCompRes?.comparison) setShadowComparison(shadowCompRes.comparison);
+      if (reverseRes?.state) setReverseState(reverseRes.state);
     } catch (err) {
       console.error('Failed to sync brain telemetry:', err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleRunReverseExperiment = async (mode: 'run' | 'step') => {
+    setReverseRunning(true);
+    setReverseError('');
+    try {
+      const endpoint = mode === 'step' ? '/api/reverse-engineering/step' : '/api/reverse-engineering/run';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ includeRealSettled: true, includeHistoricalReplay: true }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || `Reverse-engineering ${mode} failed (${res.status})`);
+      }
+      if (data.state) setReverseState(data.state);
+    } catch (err: any) {
+      setReverseError(err?.message || 'Reverse-engineering request failed.');
+    } finally {
+      setReverseRunning(false);
     }
   };
 
@@ -118,6 +145,7 @@ export const BrainView: React.FC<BrainViewProps> = () => {
                 { id: 'council', label: 'Adversarial Debate Arena', icon: Sparkles },
                 { id: 'agi', label: 'AGI Self-Learning & Autopsies', icon: Microscope },
                 { id: 'behavioural', label: 'Market Psychology', icon: Brain },
+                { id: 'reverse_lab', label: 'Reverse-Eng Lab (<30%)', icon: AlertTriangle },
                 { id: 'trinity', label: 'Trinity Agents', icon: Users },
                 { id: 'strategies', label: 'Discovered Strategies', icon: Dna },
               ].map(tab => {
@@ -746,6 +774,192 @@ export const BrainView: React.FC<BrainViewProps> = () => {
                   </div>
                 ))}
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================= */}
+        {/* MODULE 6: ISOLATED SELF-REVERSE-ENGINEERING LAB (<30%)   */}
+        {/* ========================================================= */}
+        {activeTab === 'reverse_lab' && (
+          <div className="space-y-6 font-mono text-xs animate-in fade-in duration-150">
+            <div className="bg-[#161F2B] border border-[#243040] rounded-xl p-5 sm:p-6 shadow-lg space-y-5">
+              <div className="flex flex-wrap items-center justify-between pb-3 border-b border-[#243040] gap-3">
+                <div>
+                  <h2 className="text-base font-bold text-[#E8E5DE] tracking-tight flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-[#C4A574]" />
+                    <span>Isolated Self-Reverse-Engineering Experiment (&lt;30% OOS Target)</span>
+                  </h2>
+                  <p className="text-xs text-[#AAB4BF] mt-0.5">
+                    Shadow-only experiment stored separately in data/reverse_engineering_experiment.db.json. Original SignalForge models and database remain untouched.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => handleRunReverseExperiment('run')}
+                    disabled={reverseRunning}
+                    className="px-3 py-1.5 rounded bg-[#C4A574] hover:bg-[#C4A574]/90 text-[#121820] font-bold cursor-pointer disabled:opacity-50"
+                  >
+                    {reverseRunning ? 'Evaluating...' : 'Run Walk-Forward Experiment'}
+                  </button>
+                  <button
+                    onClick={() => handleRunReverseExperiment('step')}
+                    disabled={reverseRunning}
+                    className="px-3 py-1.5 rounded bg-[#121820] hover:bg-[#243040] border border-[#243040] text-[#E8E5DE] font-semibold cursor-pointer disabled:opacity-50"
+                  >
+                    Re-Eval Continuous Step
+                  </button>
+                </div>
+              </div>
+
+              {reverseError && (
+                <div className="p-3 rounded bg-[#B7797D]/15 border border-[#B7797D]/40 text-[#B7797D]">
+                  {reverseError}
+                </div>
+              )}
+
+              {(() => {
+                const latest = reverseState?.experiments?.[0] || null;
+                if (!latest) {
+                  return (
+                    <div className="p-6 rounded-xl bg-[#121820] border border-[#243040] text-center text-[#AAB4BF] space-y-2">
+                      <div>No isolated reverse-engineering run executed yet.</div>
+                      <div>Click &quot;Run Walk-Forward Experiment&quot; to inspect baseline accuracy, discover failure patterns on Train only, freeze on Validation, and compare all 4 models on Unseen OOS.</div>
+                    </div>
+                  );
+                }
+
+                const unseen = latest.unseenFourWayComparison;
+                const fourModels = [
+                  unseen.original,
+                  unseen.simpleInversion,
+                  unseen.autonomousReverseEngineered,
+                  unseen.randomBaseline,
+                ];
+
+                return (
+                  <div className="space-y-5">
+                    {/* Verdict & Dataset Split Summary */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                      <div className="p-3.5 rounded-lg bg-[#121820] border border-[#243040]">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block">Promotion Verdict</span>
+                        <div className={`text-sm font-black mt-1 ${latest.promotionDecision.promoted ? 'text-[#72A98B]' : 'text-[#C4A574]'}`}>
+                          {latest.promotionDecision.verdict}
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] block mt-1">Sufficiency: {latest.sampleSufficiency}</span>
+                      </div>
+                      <div className="p-3.5 rounded-lg bg-[#121820] border border-[#243040]">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block">Verified Baseline (All)</span>
+                        <div className="text-lg font-black text-[#E8E5DE] mt-1">
+                          {latest.verifiedBaselineAll.accuracyPct !== null ? `${latest.verifiedBaselineAll.accuracyPct}%` : '—'}
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] block mt-1">
+                          {latest.verifiedBaselineAll.wins}W–{latest.verifiedBaselineAll.losses}L (n={latest.verifiedBaselineAll.scored})
+                        </span>
+                      </div>
+                      <div className="p-3.5 rounded-lg bg-[#121820] border border-[#243040]">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block">Chronological Split</span>
+                        <div className="text-sm font-bold text-[#E8E5DE] mt-1">
+                          Train {latest.datasetCounts.trainCount} / Val {latest.datasetCounts.validationCount} / Unseen {latest.datasetCounts.unseenTestCount}
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] block mt-1">
+                          Source: {latest.dataSourceMode} · 19D Vecs: {latest.datasetCounts.with19DFeatures}
+                        </span>
+                      </div>
+                      <div className="p-3.5 rounded-lg bg-[#121820] border border-[#243040]">
+                        <span className="text-[10px] text-[#AAB4BF] uppercase block">Frozen Candidate</span>
+                        <div className="text-sm font-bold text-[#6C9D91] mt-1 truncate">
+                          {latest.frozenCandidate?.name || 'None'}
+                        </div>
+                        <span className="text-[10px] text-[#AAB4BF] block mt-1">
+                          Val WR: {latest.frozenCandidate?.validationAccuracyPct ?? '—'}% · Tested: {latest.candidatesEvaluatedCount}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="p-3 rounded-lg bg-[#121820] border border-[#243040] text-[11px] text-[#AAB4BF]">
+                      {latest.promotionDecision.rationale}
+                    </div>
+
+                    {/* Unseen OOS 4-Way Comparison Table */}
+                    <div className="overflow-x-auto border border-[#243040] rounded-xl bg-[#121820]">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-[#243040] text-[#AAB4BF] text-[10px] uppercase">
+                            <th className="py-2.5 px-4">Unseen OOS Model (Identical Setups)</th>
+                            <th className="py-2.5 px-3">Scored (W–L–S)</th>
+                            <th className="py-2.5 px-3">Accuracy %</th>
+                            <th className="py-2.5 px-3">Wilson 95% CI</th>
+                            <th className="py-2.5 px-3 text-right">vs Random (50%)</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {fourModels.map((m: any) => (
+                            <tr key={m.modelKey} className="border-b border-[#243040]/50">
+                              <td className="py-2.5 px-4 font-bold text-[#E8E5DE]">{m.modelLabel}</td>
+                              <td className="py-2.5 px-3 text-[#AAB4BF]">
+                                {m.scored} ({m.wins}W–{m.losses}L–{m.scratches}S)
+                              </td>
+                              <td className={`py-2.5 px-3 font-black ${
+                                m.modelKey === 'AUTONOMOUS_REVERSE_ENGINEERED' && m.accuracyPct !== null && m.accuracyPct < 30
+                                  ? 'text-[#72A98B]'
+                                  : 'text-[#E8E5DE]'
+                              }`}>
+                                {m.accuracyPct !== null ? `${m.accuracyPct}%` : '—'}
+                              </td>
+                              <td className="py-2.5 px-3 text-[#AAB4BF]">
+                                {m.wilson95CiPct ? `[${m.wilson95CiPct[0]}%, ${m.wilson95CiPct[1]}%]` : '—'}
+                              </td>
+                              <td className="py-2.5 px-3 text-right text-[#C4A574]">
+                                {m.comparisonVsRandomDeltaPct !== null ? `${m.comparisonVsRandomDeltaPct >= 0 ? '+' : ''}${m.comparisonVsRandomDeltaPct}%` : '—'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Train Failure Patterns & Walk-Forward Folds */}
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                      <div className="p-4 rounded-xl bg-[#121820] border border-[#243040] space-y-2">
+                        <span className="text-[11px] font-bold text-[#E8E5DE] uppercase block">
+                          Train-Only Discovered Pattern Pockets (n={latest.failureAnalysis?.trainSampleCount ?? 0})
+                        </span>
+                        <div className="space-y-1 max-h-48 overflow-y-auto text-[11px]">
+                          {(latest.failureAnalysis?.patternPockets || []).slice(0, 10).map((p: any, idx: number) => (
+                            <div key={`${p.dimension}_${p.key}_${idx}`} className="flex items-center justify-between py-1 border-b border-[#243040]/40">
+                              <span className="text-[#E8E5DE]">{p.dimension}: {p.key} ({p.count})</span>
+                              <span className={p.patternRole === 'TOXIC_FAILURE_KEEP_TARGET' ? 'text-[#B7797D]' : p.patternRole === 'HIGH_ACCURACY_INVERT_TARGET' ? 'text-[#72A98B]' : 'text-[#AAB4BF]'}>
+                                {p.accuracyPct}% ({p.patternRole})
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="p-4 rounded-xl bg-[#121820] border border-[#243040] space-y-2">
+                        <span className="text-[11px] font-bold text-[#E8E5DE] uppercase block">
+                          Walk-Forward Folds &amp; Top Divergent Features
+                        </span>
+                        {Array.isArray(latest.walkForwardFolds) && latest.walkForwardFolds.length > 0 ? (
+                          <div className="space-y-1 text-[11px]">
+                            {latest.walkForwardFolds.map((f: any) => (
+                              <div key={f.foldIndex} className="flex items-center justify-between py-1 border-b border-[#243040]/40">
+                                <span className="text-[#AAB4BF]">Fold #{f.foldIndex} (n={f.testSize})</span>
+                                <span className="text-[#E8E5DE]">
+                                  Orig {f.originalAccPct ?? '—'}% · Inv {f.inversionAccPct ?? '—'}% · <strong className="text-[#72A98B]">Auto {f.autonomousAccPct ?? '—'}%</strong> · Rand {f.randomAccPct ?? '—'}%
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-[#AAB4BF]">More settled setups needed for multi-fold walk-forward evaluation (&gt;=24 snapshots).</div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
         )}
